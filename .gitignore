@@ -1,1 +1,77 @@
-/target
+# ---------------------------------------------------------------------
+# Rust / Cargo build artifacts
+# ---------------------------------------------------------------------
+/target/
+/dist/
+**/*.rs.bk
+*.pdb
+
+# ---------------------------------------------------------------------
+# Compiled binaries (in case the binary is copied out of target/ for
+# distribution, smoke testing, or local benchmarks)
+# ---------------------------------------------------------------------
+/file_system_a_star
+/file_system_a_star.exe
+*.exe
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.o
+*.rlib
+
+# ---------------------------------------------------------------------
+# Generated outputs from the tool itself (--dot writes to project root
+# by default; rendered images and intermediate DOT files don't belong
+# in version control).
+# ---------------------------------------------------------------------
+/file_system_map.dot
+/file_system_map.png
+*.dot.png
+
+# ---------------------------------------------------------------------
+# Editor and IDE state
+# ---------------------------------------------------------------------
+.vscode/
+.idea/
+.fleet/
+.zed/
+.helix/
+.vs/
+*.swp
+*.swo
+*.swn
+*~
+.#*
+
+# ---------------------------------------------------------------------
+# rust-analyzer / tooling
+# ---------------------------------------------------------------------
+rust-project.json
+
+# ---------------------------------------------------------------------
+# Operating system metadata
+# ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------
+# Logs, coverage, profiling
+# ---------------------------------------------------------------------
+*.log
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ---------------------------------------------------------------------
+# Local environment / secrets (never commit these)
+# ---------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
