@@ -151,7 +151,10 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("file_system_a_star {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "file_system_a_star {} — UnityAILab (contact@unityailab.com)",
+                    env!("CARGO_PKG_VERSION")
+                );
                 std::process::exit(0);
             }
             other => {
@@ -166,12 +169,18 @@ fn parse_args() -> Args {
 
 fn print_help() {
     println!(
-        r#"File System A* Pathfinding Visualizer (Rust)
+        r#"file_system_a_star — Parallel filesystem analysis & A* pathfinder
+v{} — UnityAILab — contact@unityailab.com
 
-Shows your folders/files as an **ASCII/Unicode tree** + finds the optimal
+Shows your folders/files as an ASCII/Unicode tree + finds the optimal
 navigation path using A* (with efficiency stats vs blind search).
+Outputs human-readable trees, Graphviz DOT, or JSON (see docs/schema.json).
 
-Usage: file_system_a_star [OPTIONS]
+Usage: file_system_a_star [OPTIONS]"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        r#"
 
 Options:
   -r, --root <PATH>          Root directory to scan (default: .)
@@ -215,6 +224,9 @@ Examples:
 
 The main output is a clean tree view with the A* path highlighted.
 Status messages go to stderr, data goes to stdout — the binary is pipeable.
+
+UnityAILab is a sovereign, independent team. Not affiliated with Unity
+Technologies or the Unity game engine. See NOTICE for details.
 "#
     );
 }

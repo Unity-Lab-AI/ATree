@@ -1,13 +1,27 @@
 # file_system_a_star
 
-A fast filesystem scanner and A\*-pathfinder, written in Rust. Walks a directory tree in parallel, builds a graph, and finds optimal navigation paths through it. Outputs human-readable trees, Graphviz DOT, or structured JSON for inter-process integration.
+**Version 0.6 ALPHA** — by [UnityAILab](#team) — released 2026-05-04
+
+A production-grade parallel filesystem analysis and A\*-pathfinding library, written in Rust. Walks a directory tree using lock-free work-stealing concurrency, builds a graph, finds optimal navigation paths between any two nodes, and emits human-readable trees, Graphviz DOT, or a deterministic JSON document for inter-process integration with consumers in any language.
+
+## Description
+
+`file_system_a_star` performs high-throughput parallel directory enumeration and computes shortest paths across the resulting graph using the A\* algorithm with an admissible depth-difference heuristic. It is engineered for production environments: memory-aware resource defaults, sanitized output (no terminal-injection through hostile filenames), zero `unsafe` code, deterministic JSON keyed for diff-friendliness, and a stable JSON Schema (v1) for downstream tooling.
+
+### Use cases
+
+- **AI-agent infrastructure** — rapid project-context indexing for code-aware LLM applications, retrieval-augmented generation pipelines, and knowledge-base construction
+- **Build and deployment tooling** — dependency-relationship mapping, incremental-build optimization, and deployment artifact auditing
+- **Filesystem auditing and forensics** — structural analysis across millions of files, security investigations, change detection
+- **Visualization** — terminal-rendered trees for development, Graphviz DOT for documentation, JSON for programmatic consumers
+- **Inter-process integration** — emit structured filesystem snapshots from one process and consume them in any language with a JSON parser (Node.js, Python, Go, etc.)
 
 ## What it does
 
 - **Scans** a directory tree using a lock-free work-stealing parallel walker (`crossbeam-deque`).
 - **Builds a graph**: nodes are folders/files, edges are parent↔child relationships.
 - **Pathfinds** between two nodes using A\* with a depth-difference heuristic. Reports A\*'s expansion count vs blind BFS as an efficiency comparison.
-- **Renders** the result as a colored Unicode/ASCII tree, a Graphviz DOT file, or a JSON document.
+- **Renders** the result as a colored Unicode/ASCII tree, a Graphviz DOT file, or a JSON document conforming to [`docs/schema.json`](docs/schema.json).
 
 ## Why use it
 
@@ -164,6 +178,24 @@ Release profile uses LTO + single codegen unit + `panic = "abort"` for maximum r
 - `crossbeam-deque` — lock-free work-stealing queues
 - `serde` + `serde_json` — JSON output
 
+## Team
+
+`file_system_a_star` is developed by **UnityAILab**, a sovereign, independent research and engineering team:
+
+- **Sponge** — `sponge@unityailab.com`
+- **Alfreddo**
+- **Gee**
+- **Red**
+
+Contact: `contact@unityailab.com`
+
+### Notice
+
+UnityAILab is not affiliated with, endorsed by, or connected in any way to Unity Technologies, Unity Software Inc., the Unity game engine, or any of their subsidiaries, products, or trademarks. The "Unity" in our name refers to the unity of the AI and systems-research disciplines we pursue. See [NOTICE](NOTICE) for the full disclaimer.
+
 ## License
 
-MIT — see [LICENSE](LICENSE). You may use, modify, and redistribute this software freely, including in derivative works, provided the original copyright notice and attribution to the author (sponge \<sponge@unityailab.com>) are retained.
+MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE). You may use, modify, and redistribute this software freely, including in derivative works, provided that:
+
+1. The original copyright notice and the contents of `LICENSE` and `NOTICE` are retained.
+2. Attribution to **UnityAILab** and its contributors (Sponge, Alfreddo, Gee, Red) is preserved in derivative works.

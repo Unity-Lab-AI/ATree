@@ -1,9 +1,15 @@
 [package]
 name = "file_system_a_star"
-version = "0.1.0"
+version = "0.6.0-alpha"
 edition = "2021"
-description = "Parallel file-system A* pathfinder: work-stealing scan, FxHash, mimalloc"
-authors = ["sponge <sponge@unityailab.com>"]
+description = "Production-grade parallel filesystem analysis and A* pathfinder. Lock-free work-stealing scan, JSON output for inter-process integration, used in AI-agent indexing and large-scale auditing."
+authors = [
+    "UnityAILab <contact@unityailab.com>",
+    "Sponge <sponge@unityailab.com>",
+    "Alfreddo",
+    "Gee",
+    "Red",
+]
 license = "MIT"
 readme = "README.md"
 

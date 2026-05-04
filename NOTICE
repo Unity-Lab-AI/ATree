@@ -1,0 +1,37 @@
+file_system_a_star
+Copyright (c) 2026 UnityAILab
+
+Authored and maintained by:
+    Sponge   <sponge@unityailab.com>
+    Alfreddo
+    Gee
+    Red
+
+Contact: contact@unityailab.com
+
+------------------------------------------------------------------------
+Trademark and Affiliation Notice
+------------------------------------------------------------------------
+
+UnityAILab is a sovereign, independent research and engineering team. The
+"Unity" in our name refers to the unity of the artificial-intelligence and
+systems-research disciplines we pursue.
+
+UnityAILab is not affiliated with, endorsed by, sponsored by, or connected
+in any way to Unity Technologies, Unity Software Inc., the Unity game
+engine, or any of their subsidiaries, products, services, or trademarks.
+All references to "Unity" within this project, its source, its
+documentation, and its related materials refer exclusively to UnityAILab.
+
+All third-party trademarks referenced are the property of their respective
+owners.
+
+------------------------------------------------------------------------
+Attribution Requirement
+------------------------------------------------------------------------
+
+This software is distributed under the MIT License (see LICENSE). In
+addition to the standard MIT terms, derivative works are required to
+preserve attribution to UnityAILab and its named contributors. The
+contents of this NOTICE file should be retained alongside the LICENSE
+file in any redistribution.
