@@ -256,6 +256,18 @@ cargo doc --open           # generate and view rustdoc for the library
 
 The release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, and `strip = true` for maximum runtime performance at the cost of slightly slower builds.
 
+### Multi-platform release artifacts
+
+To produce binaries for every supported platform (Linux glibc, Linux musl static, Windows x86_64, macOS Apple Silicon, macOS Intel), use the bundled build script:
+
+```bash
+scripts/build_release.sh                # all host-buildable targets
+scripts/build_release.sh linux-musl     # one specific target
+scripts/build_release.sh --help         # full target list
+```
+
+Cross-compilation prerequisites and per-platform instructions are documented in [BUILD.md](BUILD.md).
+
 ## Dependencies
 
 | Crate              | Purpose                                                              |
