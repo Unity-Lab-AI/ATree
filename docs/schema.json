@@ -1,0 +1,205 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/file_system_a_star/schema/v1.json",
+  "title": "JsonReport",
+  "description": "Output schema for `file_system_a_star --json`. Pin schema_version to detect breaking format changes.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "version",
+    "root",
+    "root_name",
+    "elapsed_ms",
+    "threads",
+    "options",
+    "stats",
+    "truncated",
+    "depths",
+    "nodes",
+    "edges",
+    "path"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Format version. Pin this in your consumer; only bumps on breaking changes.",
+      "type": "integer",
+      "const": 1
+    },
+    "version": {
+      "description": "Binary version (CARGO_PKG_VERSION). Bumps more often than schema_version.",
+      "type": "string"
+    },
+    "root": {
+      "description": "Absolute path that was scanned (canonicalized when possible).",
+      "type": "string"
+    },
+    "root_name": {
+      "description": "Display name of the root directory; also the key for the root node in `nodes`/`edges`.",
+      "type": "string"
+    },
+    "elapsed_ms": {
+      "description": "Total wall-clock time of the scan, in milliseconds.",
+      "type": "number",
+      "minimum": 0
+    },
+    "threads": {
+      "description": "Resolved worker thread count used for the parallel scan.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_depth", "max_nodes", "include_files", "tree_mode"],
+      "properties": {
+        "max_depth": {
+          "description": "Depth cap. `null` means unbounded (--no-limit).",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "max_nodes": {
+          "description": "Node cap. `null` means unbounded (--no-limit). May reflect the memory soft-cap when --no-limit was used without --no-mem-cap.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "include_files": { "type": "boolean" },
+        "tree_mode": {
+          "description": "True when --tree (skip per-file stat) was used. Implies size=0, mode=0, is_exec=false on file nodes.",
+          "type": "boolean"
+        }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_nodes",
+        "folders",
+        "files",
+        "symlinks",
+        "executables",
+        "hidden",
+        "total_size_bytes"
+      ],
+      "properties": {
+        "total_nodes": { "type": "integer", "minimum": 0 },
+        "folders": { "type": "integer", "minimum": 0 },
+        "files": { "type": "integer", "minimum": 0 },
+        "symlinks": { "type": "integer", "minimum": 0 },
+        "executables": { "type": "integer", "minimum": 0 },
+        "hidden": { "type": "integer", "minimum": 0 },
+        "total_size_bytes": {
+          "description": "Sum of `size` over all nodes. Always 0 in tree_mode. Fits safely in JS Number for any realistic filesystem (<= 2^53 = ~9 PB).",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "truncated": {
+      "description": "True when the scan stopped early because max_nodes was reached.",
+      "type": "boolean"
+    },
+    "depths": {
+      "description": "BFS depth from root for every node. Keys are node IDs (path strings).",
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "nodes": {
+      "description": "Map of node ID to its metadata. Keys are forward-slash-separated relative paths from root (or `root_name` for the root itself).",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/NodeMeta" }
+    },
+    "edges": {
+      "description": "Adjacency list. Keys are node IDs; values are arrays of neighbor node IDs (undirected: each edge appears in both directions).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "path": {
+      "description": "A* result. `null` when start equals goal or no path was requested.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/PathReport" }
+      ]
+    }
+  },
+  "definitions": {
+    "NodeMeta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "is_dir",
+        "is_symlink",
+        "is_hidden",
+        "is_exec",
+        "mode",
+        "size",
+        "name"
+      ],
+      "properties": {
+        "is_dir": { "type": "boolean" },
+        "is_symlink": { "type": "boolean" },
+        "is_hidden": {
+          "description": "True when the leaf name starts with `.`.",
+          "type": "boolean"
+        },
+        "is_exec": {
+          "description": "True when any execute bit is set (Unix). Always false in tree_mode and on non-Unix platforms.",
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "Unix permission bits (st_mode & 0o7777). 0 in tree_mode and on non-Unix.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "size": {
+          "description": "File size in bytes. 0 for directories and in tree_mode.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "name": {
+          "description": "Leaf name only (not the full path). Sanitized: control characters are replaced with '?'.",
+          "type": "string"
+        }
+      }
+    },
+    "PathReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "goal",
+        "hops",
+        "nodes",
+        "astar_expanded",
+        "bfs_expanded",
+        "efficiency_pct"
+      ],
+      "properties": {
+        "start": { "type": "string" },
+        "goal": { "type": "string" },
+        "hops": {
+          "description": "Number of edges in the path (= nodes.length - 1).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "nodes": {
+          "description": "Path nodes in order from start to goal, inclusive.",
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "astar_expanded": { "type": "integer", "minimum": 0 },
+        "bfs_expanded": { "type": "integer", "minimum": 0 },
+        "efficiency_pct": {
+          "description": "100 * (1 - astar_expanded / bfs_expanded). 0.0 when bfs_expanded is 0.",
+          "type": "number"
+        }
+      }
+    }
+  }
+}
