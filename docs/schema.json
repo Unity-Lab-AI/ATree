@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/file_system_a_star/schema/v1.json",
+  "$id": "https://github.com/atree/schema/v1.json",
   "title": "JsonReport",
-  "description": "Output schema for `file_system_a_star --json`. Pin schema_version to detect breaking format changes.",
+  "description": "Output schema for `atree --json`. Pin schema_version to detect breaking format changes.",
   "type": "object",
   "required": [
     "schema_version",

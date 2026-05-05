@@ -1,4 +1,4 @@
-# file_system_a_star
+# atree
 
 > Production-grade parallel filesystem analysis and A\* pathfinding, written in Rust.
 
@@ -10,7 +10,7 @@
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
 
-`file_system_a_star` performs high-throughput parallel directory enumeration and computes shortest paths across the resulting graph using the A\* algorithm with an admissible depth-difference heuristic. It is available both as a Rust library and as a single-binary CLI with structured JSON output for integration with consumers in any language.
+`atree` performs high-throughput parallel directory enumeration and computes shortest paths across the resulting graph using the A\* algorithm with an admissible depth-difference heuristic. It is available both as a Rust library and as a single-binary CLI with structured JSON output for integration with consumers in any language.
 
 ## Contents
 
@@ -60,9 +60,9 @@ The tool walks a directory tree using a lock-free work-stealing parallel scanner
 
 ```bash
 git clone <repository-url>
-cd file_system_a_star
+cd atree
 cargo build --release
-# binary: ./target/release/file_system_a_star
+# binary: ./target/release/atree
 ```
 
 A `cargo install` workflow will be supported once the project is published to crates.io.
@@ -73,24 +73,24 @@ A `cargo install` workflow will be supported once the project is published to cr
 
 ```bash
 # Tree overview at depth 3 of the current directory
-./target/release/file_system_a_star -L 3
+./target/release/atree -L 3
 
 # Scan everything fast (no caps, files included, skip per-file stat)
-./target/release/file_system_a_star --path /home/me --tree --no-limit --files
+./target/release/atree --path /home/me --tree --no-limit --files
 
 # Run A* between two nodes; emit JSON to stdout, status to stderr
-./target/release/file_system_a_star --dir . --from src --to Cargo.toml --files --json > report.json
+./target/release/atree --dir . --from src --to Cargo.toml --files --json > report.json
 
 # Plain text suitable for piping
-./target/release/file_system_a_star --dir . --no-color > tree.txt
+./target/release/atree --dir . --no-color > tree.txt
 ```
 
-Run `file_system_a_star --help` for the full flag list, including aliases (`-r`/`--root`/`--path`/`--dir`/`--directory`, `-L`/`--maxdepth`/`--depth`, `--from`/`--to`, `--jobs`/`--workers`, `--fast`/`--no-stat`, and others).
+Run `atree --help` for the full flag list, including aliases (`-r`/`--root`/`--path`/`--dir`/`--directory`, `-L`/`--maxdepth`/`--depth`, `--from`/`--to`, `--jobs`/`--workers`, `--fast`/`--no-stat`, and others).
 
 ### Rust library
 
 ```rust
-use file_system_a_star::{
+use atree::{
     astar, build_graph, compute_depths, half_cores, ScanOptions,
 };
 use std::path::PathBuf;
@@ -177,7 +177,7 @@ const schema = require('./docs/schema.json');
 const validate = new Ajv().compile(schema);
 
 const report = JSON.parse(execFileSync(
-  'file_system_a_star',
+  'atree',
   ['--root', '/project', '--tree', '--no-limit', '--json']
 ));
 if (!validate(report)) throw new Error(JSON.stringify(validate.errors));
@@ -190,7 +190,7 @@ import json, subprocess, jsonschema
 
 schema = json.load(open('docs/schema.json'))
 report = json.loads(subprocess.check_output([
-    'file_system_a_star', '--root', project_path,
+    'atree', '--root', project_path,
     '--tree', '--no-limit', '--json',
 ]))
 jsonschema.validate(report, schema)
@@ -249,7 +249,7 @@ The entire scan-time hot path is `unsafe`-free Rust over `std::fs` syscalls.
 ## Building and testing
 
 ```bash
-cargo build --release      # binary at target/release/file_system_a_star
+cargo build --release      # binary at target/release/atree
 cargo test --release       # all unit + integration tests
 cargo doc --open           # generate and view rustdoc for the library
 ```
@@ -282,7 +282,7 @@ Cross-compilation prerequisites and per-platform instructions are documented in 
 
 ### Team
 
-`file_system_a_star` is developed by **UnityAILab**, a sovereign, independent research and engineering team:
+`atree` is developed by **UnityAILab**, a sovereign, independent research and engineering team:
 
 - **Sponge** — `sponge@unityailab.com`
 - **Alfreddo**

@@ -10,8 +10,8 @@
 # Compiled binaries (in case the binary is copied out of target/ for
 # distribution, smoke testing, or local benchmarks)
 # ---------------------------------------------------------------------
-/file_system_a_star
-/file_system_a_star.exe
+/atree
+/atree.exe
 *.exe
 *.so
 *.dylib
@@ -26,8 +26,8 @@
 # by default; rendered images and intermediate DOT files don't belong
 # in version control).
 # ---------------------------------------------------------------------
-/file_system_map.dot
-/file_system_map.png
+/atree_map.dot
+/atree_map.png
 *.dot.png
 
 # ---------------------------------------------------------------------
@@ -75,3 +75,4 @@ perf.data.old
 .env
 .env.local
 .env.*.local
+.claude/

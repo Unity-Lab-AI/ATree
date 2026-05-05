@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `file_system_a_star` are documented here. The project
+All notable changes to `atree` are documented here. The project
 follows semantic versioning; the JSON output format is independently versioned
 via the `schema_version` field (currently `1`).
 

@@ -1,4 +1,4 @@
-//! File-system A* pathfinding library.
+//! `atree` — File-system A* pathfinding library.
 //!
 //! Public API:
 //! - [`build_graph`] — parallel work-stealing directory scan
@@ -104,6 +104,11 @@ pub struct JsonOptions {
 /// (renamed fields, removed fields, changed types). Consumers should pin this
 /// number; behavior-preserving changes do **not** bump it.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The full JSON Schema (Draft 7) for `--json` output, embedded at compile time.
+/// Source of truth is `docs/schema.json`; this constant guarantees the binary
+/// can always emit its own schema with no co-located files.
+pub const SCHEMA_JSON: &str = include_str!("../docs/schema.json");
 
 /// Top-level JSON output schema. Use [`build_json_report`] to construct.
 ///
@@ -409,6 +414,23 @@ fn process_dir(
 /// `ScanResult.truncated = true`.
 pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
     let root = opts.root.canonicalize().unwrap_or_else(|_| opts.root.clone());
+
+    // Validate the root before scanning. A nonexistent or non-directory path
+    // would otherwise produce a single-node "scan" with the literal path as a
+    // fake folder, which silently masks user typos in scripts.
+    let root_meta = fs::metadata(&root).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("root path '{}' is unreadable: {}", opts.root.display(), e),
+        )
+    })?;
+    if !root_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("root path '{}' is not a directory", opts.root.display()),
+        ));
+    }
+
     let root_name_raw = root
         .file_name()
         .and_then(|s| s.to_str())
@@ -1024,7 +1046,7 @@ mod tests {
     #[test]
     fn build_graph_tempdir_integration() {
         let tmp = std::env::temp_dir().join(format!(
-            "fsa_star_test_{}_{}",
+            "atree_test_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1068,7 +1090,7 @@ mod tests {
         // back into the same typed structs. Proves the schema is consistent
         // for any external consumer using a strongly-typed JSON parser.
         let tmp = std::env::temp_dir().join(format!(
-            "fsa_star_json_{}_{}",
+            "atree_json_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1115,9 +1137,72 @@ mod tests {
     }
 
     #[test]
+    fn embedded_schema_is_valid_json() {
+        // Catches a malformed docs/schema.json at build time of the test suite,
+        // so --print-schema and any consumer reading SCHEMA_JSON never sees
+        // garbage shipped from a typo.
+        let v: serde_json::Value =
+            serde_json::from_str(SCHEMA_JSON).expect("embedded schema parses");
+        assert_eq!(v["$schema"], "http://json-schema.org/draft-07/schema#");
+        assert_eq!(v["properties"]["schema_version"]["const"], SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn build_graph_rejects_nonexistent_root() {
+        let bogus = std::env::temp_dir().join(format!(
+            "atree_does_not_exist_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let opts = ScanOptions {
+            root: bogus,
+            max_depth: 4,
+            max_nodes: 10,
+            include_files: false,
+            threads: 1,
+            tree_mode: false,
+        };
+        let err = match build_graph(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail on nonexistent root"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn build_graph_rejects_file_as_root() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_file_root_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&tmp, b"i am a file").unwrap();
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 4,
+            max_nodes: 10,
+            include_files: false,
+            threads: 1,
+            tree_mode: false,
+        };
+        let err = match build_graph(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("must fail when root is a file"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
     fn build_graph_respects_max_nodes() {
         let tmp = std::env::temp_dir().join(format!(
-            "fsa_star_cap_{}_{}",
+            "atree_cap_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

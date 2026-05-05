@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "atree"
+version = "0.6.0-alpha"
+dependencies = [
+ "crossbeam-deque",
+ "mimalloc",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -36,17 +47,6 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
-
-[[package]]
-name = "file_system_a_star"
-version = "0.6.0-alpha"
-dependencies = [
- "crossbeam-deque",
- "mimalloc",
- "rustc-hash",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "find-msvc-tools"

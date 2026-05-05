@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Build release artifacts for one or all supported platforms.
-# Outputs go to ./dist/file_system_a_star-<version>-<target><ext>
+# Outputs go to ./dist/atree-<version>-<target><ext>
 #
 # Usage:
 #   scripts/build_release.sh [target]
@@ -88,8 +88,8 @@ build_target() {
         xwin)     XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --target "$target" ;;
     esac
 
-    local src="target/$target/release/file_system_a_star$ext"
-    local dst="$DIST/file_system_a_star-${VERSION}-${target}${ext}"
+    local src="target/$target/release/atree$ext"
+    local dst="$DIST/atree-${VERSION}-${target}${ext}"
     cp "$src" "$dst"
 
     # Strip ELF binaries (Mach-O / PE are already stripped by the release profile).

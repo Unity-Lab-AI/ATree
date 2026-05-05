@@ -1,4 +1,4 @@
-# Building `file_system_a_star`
+# Building `atree`
 
 This document explains how to build release artifacts for every supported platform. The simplest path is `scripts/build_release.sh`, which handles target installation, cross-compilers, and stripping.
 
@@ -37,9 +37,9 @@ scripts/build_release.sh macos-arm
 Artifacts land in `./dist/` with versioned names:
 
 ```
-file_system_a_star-0.6.0-alpha-x86_64-unknown-linux-gnu
-file_system_a_star-0.6.0-alpha-x86_64-unknown-linux-musl
-file_system_a_star-0.6.0-alpha-x86_64-pc-windows-msvc.exe
+atree-0.6.0-alpha-x86_64-unknown-linux-gnu
+atree-0.6.0-alpha-x86_64-unknown-linux-musl
+atree-0.6.0-alpha-x86_64-pc-windows-msvc.exe
 ```
 
 ## Prerequisites
@@ -128,20 +128,20 @@ After building, the artifact in `dist/` should:
 
 ```bash
 # Linux GNU — dynamically linked
-file dist/file_system_a_star-*-x86_64-unknown-linux-gnu
+file dist/atree-*-x86_64-unknown-linux-gnu
 # expect: ELF 64-bit LSB ... dynamically linked ... stripped
 
 # Linux musl — statically linked, runs anywhere
-file dist/file_system_a_star-*-x86_64-unknown-linux-musl
+file dist/atree-*-x86_64-unknown-linux-musl
 # expect: ELF 64-bit LSB ... statically linked ... stripped
 
 # Windows
-file dist/file_system_a_star-*-windows-msvc.exe
+file dist/atree-*-windows-msvc.exe
 # expect: PE32+ executable for MS Windows ... x86-64
 
 # Smoke-test (host-runnable artifacts only)
-./dist/file_system_a_star-*-x86_64-unknown-linux-gnu --version
-# expect: file_system_a_star 0.6.0-alpha — UnityAILab (contact@unityailab.com)
+./dist/atree-*-x86_64-unknown-linux-gnu --version
+# expect: atree 0.6.0-alpha — UnityAILab (contact@unityailab.com)
 ```
 
 Generate SHA-256 checksums for distribution:

@@ -1,4 +1,4 @@
-//! `file_system_a_star` CLI binary. The actual library lives in `lib.rs`.
+//! `atree` CLI binary. The actual library lives in `lib.rs`.
 //!
 //! Output convention: status messages → stderr, data → stdout. This makes
 //! the binary pipe-friendly and `--json` mode emit clean JSON to stdout.
@@ -7,10 +7,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use file_system_a_star::{
+use atree::{
     all_cores, astar, available_memory_bytes, bfs_expanded, build_graph,
     build_json_report, build_path_report, compute_depths, estimated_node_cap_for_half_memory,
-    generate_dot, half_cores, human_size, print_tree, NodeMeta, ScanOptions,
+    generate_dot, half_cores, human_size, print_tree, NodeMeta, ScanOptions, SCHEMA_JSON,
 };
 use rustc_hash::FxHashSet;
 
@@ -47,6 +47,7 @@ struct Args {
     no_limit: bool,
     no_mem_cap: bool,
     json: bool,
+    print_schema: bool,
 }
 
 impl Default for Args {
@@ -66,6 +67,7 @@ impl Default for Args {
             no_limit: false,
             no_mem_cap: false,
             json: false,
+            print_schema: false,
         }
     }
 }
@@ -146,13 +148,14 @@ fn parse_args() -> Args {
             "--no-limit" | "--unlimited" | "--no-cap" => args.no_limit = true,
             "--no-mem-cap" | "--hard" => args.no_mem_cap = true,
             "--json" => args.json = true,
+            "--print-schema" | "--schema" => args.print_schema = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
             }
             "--version" | "-V" => {
                 println!(
-                    "file_system_a_star {} — UnityAILab (contact@unityailab.com)",
+                    "atree {} — UnityAILab (contact@unityailab.com)",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -169,14 +172,15 @@ fn parse_args() -> Args {
 
 fn print_help() {
     println!(
-        r#"file_system_a_star — Parallel filesystem analysis & A* pathfinder
+        r#"atree — Parallel filesystem analysis & A* pathfinder
 v{} — UnityAILab — contact@unityailab.com
 
 Shows your folders/files as an ASCII/Unicode tree + finds the optimal
 navigation path using A* (with efficiency stats vs blind search).
-Outputs human-readable trees, Graphviz DOT, or JSON (see docs/schema.json).
+Outputs human-readable trees, Graphviz DOT, or JSON.
+The full JSON Schema (Draft 7) is bundled — run `atree --print-schema`.
 
-Usage: file_system_a_star [OPTIONS]"#,
+Usage: atree [OPTIONS]"#,
         env!("CARGO_PKG_VERSION")
     );
     println!(
@@ -198,6 +202,7 @@ Options:
       --no-limit             Remove --max-depth and --max-nodes caps (scan everything)
       --no-mem-cap           With --no-limit, disable the ~half-RAM safety cap
       --json                 Emit a JSON report on stdout (status still goes to stderr)
+      --print-schema         Print the bundled JSON Schema (Draft 7) on stdout and exit
   -h, --help                 Show this help
   -V, --version              Print version and exit
 
@@ -217,10 +222,10 @@ Aliases (familiar names from find/tree/du also work):
   --no-mem-cap        --hard
 
 Examples:
-  file_system_a_star --root /home/user --max-depth 3
-  file_system_a_star -r . -s src -g Cargo.toml -f
-  file_system_a_star --path /usr -L 5 --files --fast --no-limit
-  file_system_a_star --dir ~/code --jobs all --tree --json > report.json
+  atree --root /home/user --max-depth 3
+  atree -r . -s src -g Cargo.toml -f
+  atree --path /usr -L 5 --files --fast --no-limit
+  atree --dir ~/code --jobs all --tree --json > report.json
 
 The main output is a clean tree view with the A* path highlighted.
 Status messages go to stderr, data goes to stdout — the binary is pipeable.
@@ -265,6 +270,19 @@ fn resolve_caps(args: &Args) -> (usize, usize, bool) {
 
 fn main() {
     let args = parse_args();
+
+    // Handled before any scan work so the schema can be retrieved with no
+    // filesystem access at all.
+    if args.print_schema {
+        let stdout = io::stdout();
+        let mut h = stdout.lock();
+        let _ = h.write_all(SCHEMA_JSON.as_bytes());
+        if !SCHEMA_JSON.ends_with('\n') {
+            let _ = writeln!(h);
+        }
+        return;
+    }
+
     let start_time = Instant::now();
     let threads = resolve_threads(&args.threads);
     let (max_depth, max_nodes, mem_capped) = resolve_caps(&args);
@@ -437,7 +455,7 @@ fn main() {
     );
 
     if args.dot {
-        let dot_file = "file_system_map.dot";
+        let dot_file = "atree_map.dot";
         if let Err(e) = generate_dot(
             &scan.adj,
             &scan.meta,
@@ -449,7 +467,7 @@ fn main() {
             eprintln!("[WARN] Could not write DOT file: {}", e);
         } else {
             eprintln!("[OK] Graphviz DOT file written: {}", dot_file);
-            eprintln!("     Render it with:  dot -Tpng {} -o file_system_map.png", dot_file);
+            eprintln!("     Render it with:  dot -Tpng {} -o atree_map.png", dot_file);
         }
     }
 
@@ -460,7 +478,7 @@ fn main() {
 /// Returns `(start, goal, Option<(path, astar_expanded, bfs_expanded)>)`.
 fn compute_path(
     args: &Args,
-    scan: &file_system_a_star::ScanResult,
+    scan: &atree::ScanResult,
 ) -> (String, String, Option<(Vec<String>, usize, usize)>) {
     let mut start = args.start.clone().unwrap_or_else(|| scan.root_name.clone());
     if !scan.adj.contains_key(&start) {
@@ -530,7 +548,7 @@ fn compute_path(
     }
 }
 
-fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, stats: &file_system_a_star::Stats) {
+fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, stats: &atree::Stats) {
     let stderr = io::stderr();
     let mut out = stderr.lock();
     let box_top = if args.ascii { "+--[ SUMMARY ]--" } else { "┌──[ SUMMARY ]──" };

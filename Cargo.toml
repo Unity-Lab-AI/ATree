@@ -1,5 +1,5 @@
 [package]
-name = "file_system_a_star"
+name = "atree"
 version = "0.6.0-alpha"
 edition = "2021"
 description = "Production-grade parallel filesystem analysis and A* pathfinder. Lock-free work-stealing scan, JSON output for inter-process integration, used in AI-agent indexing and large-scale auditing."
@@ -21,11 +21,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lib]
-name = "file_system_a_star"
+name = "atree"
 path = "src/lib.rs"
 
 [[bin]]
-name = "file_system_a_star"
+name = "atree"
 path = "src/main.rs"
 
 [profile.release]
