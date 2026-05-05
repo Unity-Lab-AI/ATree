@@ -83,9 +83,12 @@ A `cargo install` workflow will be supported once the project is published to cr
 
 # Plain text suitable for piping
 ./target/release/atree --dir . --no-color > tree.txt
+
+# Print the bundled JSON Schema (Draft 7) — no scan, no filesystem access
+./target/release/atree --print-schema > schema.json
 ```
 
-Run `atree --help` for the full flag list, including aliases (`-r`/`--root`/`--path`/`--dir`/`--directory`, `-L`/`--maxdepth`/`--depth`, `--from`/`--to`, `--jobs`/`--workers`, `--fast`/`--no-stat`, and others).
+Run `atree --help` for the full flag list, including aliases (`-r`/`--root`/`--path`/`--dir`/`--directory`, `-L`/`--maxdepth`/`--depth`, `--from`/`--to`, `--jobs`/`--workers`, `--fast`/`--no-stat`, `--print-schema`/`--schema`, and others).
 
 ### Rust library
 
@@ -122,7 +125,7 @@ The full public API is documented in `src/lib.rs`. Run `cargo doc --open` for br
 
 ### Schema
 
-The complete machine-readable JSON Schema (Draft 7) is in [`docs/schema.json`](docs/schema.json) and validates every document produced by the binary.
+The complete machine-readable JSON Schema (Draft 7) is in [`docs/schema.json`](docs/schema.json) and validates every document produced by the binary. The same schema is embedded in the binary at compile time and can be retrieved with no filesystem scan via `atree --print-schema` — useful for consumers that want a self-contained pipeline without shipping the source repo alongside the binary.
 
 Top-level structure:
 
@@ -173,7 +176,9 @@ Consumers should pin `schema_version` and treat `version` as informational. With
 ```js
 const { execFileSync } = require('child_process');
 const Ajv = require('ajv');
-const schema = require('./docs/schema.json');
+
+// Pull the schema straight from the binary — no source-repo file needed.
+const schema = JSON.parse(execFileSync('atree', ['--print-schema']));
 const validate = new Ajv().compile(schema);
 
 const report = JSON.parse(execFileSync(
@@ -188,7 +193,7 @@ if (report.schema_version !== 1) throw new Error('incompatible schema');
 ```python
 import json, subprocess, jsonschema
 
-schema = json.load(open('docs/schema.json'))
+schema = json.loads(subprocess.check_output(['atree', '--print-schema']))
 report = json.loads(subprocess.check_output([
     'atree', '--root', project_path,
     '--tree', '--no-limit', '--json',
@@ -232,6 +237,7 @@ The entire scan-time hot path is `unsafe`-free Rust over `std::fs` syscalls.
 ## Security
 
 - **Filename sanitization** — control characters (including ANSI escape sequences) in filenames are replaced with `?` at scan time before being stored or rendered. Hostile filenames cannot inject terminal escapes into output, JSON consumers, or DOT renderers.
+- **Strict root validation** — `--root` paths that don't exist (or aren't directories) are rejected with explicit `NotFound` / `InvalidInput` errors before any scan work begins, instead of silently producing a single-node fake-folder result that could mask scripting typos.
 - **No `unsafe` code** in this crate.
 - **No panics** in normal operation. Metadata-read failures and unreadable directory entries are skipped rather than propagated.
 - **Iterative scan** — recursion is replaced by an explicit work queue, so deeply nested directories cannot overflow the stack.
