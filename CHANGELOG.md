@@ -1,3 +1,10 @@
+## [0.7.0-alpha] - 2026-05-12
+### Added
+- **Native Semantic Engine**: Integrated Tree-sitter for parallel symbol extraction.
+- **Multi-language Support**: 16 language providers implemented in Rust.
+- **--semantic flag**: CLI and JSON output support for code intelligence.
+- **Modular Architecture**: Restructured project into modular logic layers.
+
 # Changelog
 
 All notable changes to `atree` are documented here. The project
