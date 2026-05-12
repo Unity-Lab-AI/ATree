@@ -1,17 +1,25 @@
-//! `atree` — File-system A* pathfinding library.
-//!
-//! Public API:
-//! - [`build_graph`] — parallel work-stealing directory scan
-//! - [`astar`], [`compute_depths`], [`bfs_expanded`] — graph algorithms
-//! - [`print_tree`], [`generate_dot`] — rendering
-//! - [`JsonReport`], [`PathReport`], [`Stats`] — serializable output for IPC
-//!
-//! Resource helpers: [`half_cores`], [`all_cores`], [`available_memory_bytes`],
-//! [`estimated_node_cap_for_half_memory`].
-//!
-//! Filenames are sanitized at scan time: any control character (including ANSI
-//! escape sequences) is replaced with `?` before being stored in [`NodeMeta`].
-//! This prevents terminal-injection attacks via malicious filenames.
+use crate::lang::get_provider_for_extension;
+use crate::semantic::ParsedFile;
+use crate::syntax::SyntaxEngine;
+pub mod lang;
+pub mod syntax;
+pub mod semantic;
+pub mod resolver;
+pub mod graph;
+/// `atree` — File-system A* pathfinding library.
+///
+/// Public API:
+/// - [`build_graph`] — parallel work-stealing directory scan
+/// - [`astar`], [`compute_depths`], [`bfs_expanded`] — graph algorithms
+/// - [`print_tree`], [`generate_dot`] — rendering
+/// - [`JsonReport`], [`PathReport`], [`Stats`] — serializable output for IPC
+///
+/// Resource helpers: [`half_cores`], [`all_cores`], [`available_memory_bytes`],
+/// [`estimated_node_cap_for_half_memory`].
+///
+/// Filenames are sanitized at scan time: any control character (including ANSI
+/// escape sequences) is replaced with `?` before being stored in [`NodeMeta`].
+/// This prevents terminal-injection attacks via malicious filenames.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
@@ -60,6 +68,7 @@ pub struct Stats {
 /// Caller-supplied scan configuration. Threads must be pre-resolved (no `0 = auto`).
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
+    pub semantic: bool,
     pub root: PathBuf,
     pub max_depth: usize,
     pub max_nodes: usize,
@@ -70,6 +79,7 @@ pub struct ScanOptions {
 
 /// Result of a successful [`build_graph`] call.
 pub struct ScanResult {
+    pub parsed_files: Vec<crate::semantic::ParsedFile>,
     pub adj: FxHashMap<String, Vec<String>>,
     pub root_name: String,
     pub meta: FxHashMap<String, NodeMeta>,
@@ -94,6 +104,7 @@ pub struct PathReport {
 /// `None` for a depth/node cap means the scan was unbounded.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonOptions {
+    pub semantic: bool,
     pub max_depth: Option<usize>,
     pub max_nodes: Option<usize>,
     pub include_files: bool,
@@ -104,6 +115,7 @@ pub struct JsonOptions {
 /// (renamed fields, removed fields, changed types). Consumers should pin this
 /// number; behavior-preserving changes do **not** bump it.
 pub const SCHEMA_VERSION: u32 = 1;
+pub const JSON_SCHEMA: &str = include_str!("../docs/schema.json");
 
 /// The full JSON Schema (Draft 7) for `--json` output, embedded at compile time.
 /// Source of truth is `docs/schema.json`; this constant guarantees the binary
@@ -117,6 +129,7 @@ pub const SCHEMA_JSON: &str = include_str!("../docs/schema.json");
 /// version (changes more often, doesn't necessarily mean schema changed).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonReport {
+    pub semantic: Option<Vec<ParsedFile>>,
     pub schema_version: u32,
     pub version: String,
     pub root: String,
@@ -253,6 +266,7 @@ type Job = (PathBuf, String, usize);
 
 #[derive(Default)]
 struct LocalAccum {
+    pub parsed_files: Vec<crate::semantic::ParsedFile>,
     adj: FxHashMap<String, Vec<String>>,
     meta: FxHashMap<String, NodeMeta>,
 }
@@ -298,24 +312,22 @@ fn reserve_slot(node_count: &AtomicUsize, max_nodes: usize) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn process_dir(
-    path: &Path,
+    dir_path: &Path,
     rel: &str,
     depth: usize,
-    max_depth: usize,
-    max_nodes: usize,
-    include_files: bool,
-    tree_mode: bool,
+    opts: &ScanOptions,
     root_name: &str,
     local: &mut LocalAccum,
     node_count: &AtomicUsize,
     queue: &Worker<Job>,
     pending: &AtomicUsize,
+    syntax: &mut SyntaxEngine,
 ) {
-    if depth >= max_depth || node_count.load(Ordering::Relaxed) >= max_nodes {
+    if depth >= opts.max_depth || node_count.load(Ordering::Relaxed) >= opts.max_nodes {
         return;
     }
 
-    let mut entries: Vec<DirEntry> = match fs::read_dir(path) {
+    let mut entries: Vec<DirEntry> = match fs::read_dir(dir_path) {
         Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
         Err(_) => return,
     };
@@ -327,7 +339,6 @@ fn process_dir(
     for entry in entries {
         let entry_path = entry.path();
         let raw_name = entry.file_name().to_string_lossy().to_string();
-        // Sanitize at scan time so display, JSON, and DOT all see safe names.
         let name_str = sanitize_name(&raw_name);
 
         let Some(ft) = entry.file_type().ok().or_else(|| {
@@ -336,18 +347,18 @@ fn process_dir(
             continue;
         };
         let is_symlink = ft.is_symlink();
-        let is_dir = if is_symlink && !tree_mode {
+        let is_dir = if is_symlink && !opts.tree_mode {
             fs::metadata(&entry_path).map(|m| m.is_dir()).unwrap_or(false)
         } else {
             ft.is_dir()
         };
         let is_hidden = name_str.starts_with('.');
 
-        if !include_files && !is_dir && !is_symlink {
+        if !opts.include_files && !is_dir && !is_symlink {
             continue;
         }
 
-        if !reserve_slot(node_count, max_nodes) {
+        if !reserve_slot(node_count, opts.max_nodes) {
             break;
         }
 
@@ -357,7 +368,7 @@ fn process_dir(
             format!("{}/{}", rel, name_str)
         };
 
-        let (is_dir_final, is_exec, size, mode) = if tree_mode {
+        let (is_dir_final, is_exec, size, mode) = if opts.tree_mode {
             (is_dir && !is_symlink, false, 0, 0)
         } else if is_symlink {
             match fs::metadata(&entry_path) {
@@ -388,6 +399,18 @@ fn process_dir(
         local.adj.entry(child_rel.clone()).or_default().push(rel.to_string());
         children.push(child_rel.clone());
 
+        if opts.semantic && !is_dir_final && !is_symlink {
+            if let Some(ext) = Path::new(&child_rel).extension().and_then(|s| s.to_str()) {
+                if let Some(provider) = get_provider_for_extension(ext) {
+                    if let Ok(content) = fs::read_to_string(&entry_path) {
+                        let captures = syntax.extract_captures(provider, &content);
+                        let parsed = ParsedFile::from_captures(&child_rel, provider.id(), captures);
+                        local.parsed_files.push(parsed);
+                    }
+                }
+            }
+        }
+
         if is_dir && !is_symlink {
             subdirs.push((entry_path, child_rel, depth + 1));
         }
@@ -401,8 +424,7 @@ fn process_dir(
         pending.fetch_add(1, Ordering::Release);
         queue.push(j);
     }
-}
-
+    }
 // =====================================================================
 // Public scan function
 // =====================================================================
@@ -467,7 +489,9 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 let pending_ref = &pending;
                 let node_count_ref = &node_count;
                 let root_name_ref = &root_name;
+                let opts_ref = &opts;
                 scope.spawn(move || {
+                    let mut syntax = SyntaxEngine::new();
                     let mut local = LocalAccum::default();
                     let hint = (max_nodes.min(1 << 18) / n).max(16);
                     local.adj.reserve(hint);
@@ -496,11 +520,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                             continue;
                         };
 
-                        process_dir(
-                            &job.0, &job.1, job.2, max_depth, max_nodes, include_files,
-                            tree_mode, root_name_ref, &mut local, node_count_ref,
-                            &my_queue, pending_ref,
-                        );
+                        process_dir(&job.0, &job.1, job.2, opts_ref, root_name_ref, &mut local, node_count_ref, &my_queue, pending_ref, &mut syntax);
                         pending_ref.fetch_sub(1, Ordering::Release);
                     }
                 })
@@ -531,11 +551,11 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
         },
     );
 
-    for local in locals {
-        for (k, v) in local.meta {
+    for local in &locals {
+        for (k, v) in local.meta.clone() {
             meta.insert(k, v);
         }
-        for (k, v) in local.adj {
+        for (k, v) in local.adj.clone() {
             match adj.entry(k) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(v);
@@ -569,7 +589,12 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
 
     let truncated = final_count >= max_nodes;
 
+    let mut parsed_files = Vec::new();
+    for local in &locals {
+        parsed_files.extend(local.parsed_files.clone());
+    }
     Ok(ScanResult {
+        parsed_files,
         adj,
         root_name,
         meta,
@@ -936,6 +961,7 @@ pub fn build_json_report(
     let depths_map: BTreeMap<String, i32> =
         depths.iter().map(|(k, v)| (k.clone(), *v)).collect();
     JsonReport {
+        semantic: if options.semantic { Some(scan.parsed_files.clone()) } else { None },
         schema_version: SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: options.root.display().to_string(),
@@ -947,6 +973,7 @@ pub fn build_json_report(
             max_nodes: cap_or_none(options.max_nodes),
             include_files: options.include_files,
             tree_mode: options.tree_mode,
+                semantic: options.semantic,
         },
         stats: scan.stats.clone(),
         truncated: scan.truncated,
