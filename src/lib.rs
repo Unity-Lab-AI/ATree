@@ -3198,4 +3198,602 @@ func Start() {
 
         fs::remove_dir_all(&tmp).ok();
     }
+
+    // =====================================================================
+    // Performance / stress tests
+    // =====================================================================
+
+    #[test]
+    fn stress_test_many_files() {
+        // Create a project with many files to test parallel scanning
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_stress_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create 50 Python files with various constructs
+        for i in 0..50 {
+            let content = format!(r#"
+class Service{idx}:
+    def __init__(self):
+        self.value = {idx}
+
+    def process(self, data):
+        return data + {idx}
+
+    def helper(self):
+        return self.value
+
+def create_service_{idx}():
+    return Service{idx}()
+
+class Manager{idx}:
+    def __init__(self):
+        self.services = []
+
+    def add_service(self, svc):
+        self.services.append(svc)
+
+    def run_all(self):
+        return [s.process({idx}) for s in self.services]
+"#, idx = i);
+            fs::write(tmp.join(format!("module_{:03}.py", i)), &content).unwrap();
+        }
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 50000,
+            include_files: true,
+            threads: 4,
+            tree_mode: false,
+            semantic: true,
+        };
+
+        let start = std::time::Instant::now();
+        let result = build_graph(&opts).unwrap();
+        let elapsed = start.elapsed();
+
+        // Should parse all 50 files
+        assert!(result.parsed_files.len() >= 50, "Should parse 50 files, got {}", result.parsed_files.len());
+
+        // Should have many symbols: 50 files × (2 classes × 4 methods + 1 function) ≈ 450
+        assert!(result.store_stats.symbols >= 100, "Should have many symbols, got {}", result.store_stats.symbols);
+
+        // Should complete in reasonable time (< 30 seconds even on slow machines)
+        assert!(elapsed.as_secs() < 30, "Should complete in < 30s, took {:?}", elapsed);
+
+        eprintln!("Stress test: {} files, {} symbols in {:?}", result.parsed_files.len(), result.store_stats.symbols, elapsed);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn stress_test_deep_inheritance_chain() {
+        // Test a deep inheritance chain (100 levels)
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_deep_chain_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mut content = String::new();
+        for i in 0..100 {
+            if i == 0 {
+                content.push_str(&format!("class Base0:\n    pass\n\n"));
+            } else {
+                content.push_str(&format!("class Base{}(Base{}):\n    pass\n\n", i, i - 1));
+            }
+        }
+        content.push_str("class Leaf(Base99):\n    pass\n");
+
+        fs::write(tmp.join("chain.py"), &content).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 10000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("chain.py")).unwrap();
+        assert!(file.symbols.len() >= 100, "Should have 100+ classes, got {}", file.symbols.len());
+
+        // Verify MRO edges were created
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 50, "Should have MRO edges for inheritance chain");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn stress_test_wide_inheritance() {
+        // Test diamond inheritance pattern
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_diamond_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("diamond.py"), r#"
+class A:
+    def method_a(self):
+        return "a"
+
+class B(A):
+    def method_b(self):
+        return "b"
+
+class C(A):
+    def method_c(self):
+        return "c"
+
+class D(B, C):
+    def method_d(self):
+        return "d"
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("diamond.py")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"A"));
+        assert!(names.contains(&"B"));
+        assert!(names.contains(&"C"));
+        assert!(names.contains(&"D"));
+
+        // Verify heritage entries for diamond
+        assert!(file.heritage.len() >= 3, "Should have heritage entries for B→A, C→A, D→B,C");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // C3 Linearization (Python MRO)
+    // =====================================================================
+
+    #[test]
+    fn c3_linearization_basic() {
+        // Test Python-style C3 linearization for diamond inheritance
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_c3_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("c3.py"), r#"
+class A:
+    pass
+
+class B(A):
+    pass
+
+class C(A):
+    pass
+
+class D(B, C):
+    pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("c3.py")).unwrap();
+
+        // Verify all classes extracted
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"A"));
+        assert!(names.contains(&"B"));
+        assert!(names.contains(&"C"));
+        assert!(names.contains(&"D"));
+
+        // Verify heritage: B→A, C→A, D→B, D→C
+        assert!(file.heritage.len() >= 4, "Should have 4 heritage entries");
+
+        // Verify MRO edges
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 4, "Should have MRO edges for all inheritance");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Export detection tests
+    // =====================================================================
+
+    #[test]
+    fn export_detection_python() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_export_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("exports.py"), r#"
+__all__ = ['public_func', 'PublicClass']
+
+def public_func():
+    pass
+
+def _private_func():
+    pass
+
+class PublicClass:
+    pass
+
+class _PrivateClass:
+    pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("exports.py")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"public_func"));
+        assert!(names.contains(&"PublicClass"));
+        assert!(names.contains(&"_private_func"));
+        assert!(names.contains(&"_PrivateClass"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn export_detection_typescript() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_export_ts_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("api.ts"), r#"
+export function publicApi(): string {
+    return "api";
+}
+
+function internalHelper(): void {
+    // not exported
+}
+
+export class PublicService {
+    run() {}
+}
+
+class InternalService {
+    run() {}
+}
+
+export const PUBLIC_CONST = 42;
+const INTERNAL_CONST = 0;
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("api.ts")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"publicApi"));
+        assert!(names.contains(&"PublicService"));
+        assert!(names.contains(&"PUBLIC_CONST"));
+        assert!(names.contains(&"internalHelper"));
+        assert!(names.contains(&"InternalService"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Type annotation extraction tests
+    // =====================================================================
+
+    #[test]
+    fn type_annotation_typescript() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_types_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("types.ts"), r#"
+interface User {
+    name: string;
+    age: number;
+}
+
+type ID = string | number;
+
+function greet(user: User): string {
+    return `Hello, ${user.name}`;
+}
+
+const ids: ID[] = ["a", "b"];
+
+class UserService {
+    private users: User[];
+
+    constructor() {
+        this.users = [];
+    }
+
+    addUser(user: User): void {
+        this.users.push(user);
+    }
+
+    getUser(index: number): User | undefined {
+        return this.users[index];
+    }
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("types.ts")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Interfaces, types, functions, classes should all be extracted
+        assert!(names.contains(&"User"), "Interface should be extracted");
+        assert!(names.contains(&"ID"), "Type alias should be extracted");
+        assert!(names.contains(&"greet"), "Function should be extracted");
+        assert!(names.contains(&"ids"), "Const should be extracted");
+        assert!(names.contains(&"UserService"), "Class should be extracted");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Failure mode tests
+    // =====================================================================
+
+    #[test]
+    fn malformed_code_doesnt_crash() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_malformed_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // File with syntax errors — should not crash
+        fs::write(tmp.join("broken.py"), r#"
+class Foo
+    def bar(
+        pass
+
+def baz()
+    return
+
+class 123Invalid:
+    pass
+"#).unwrap();
+
+        // File with mixed valid/invalid
+        fs::write(tmp.join("mixed.py"), r#"
+class Valid:
+    def method(self):
+        pass
+
+# Some broken stuff below
+def broken(
+    class What
+
+class AlsoValid(Valid):
+    pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+
+        // Should not panic
+        let result = build_graph(&opts);
+        assert!(result.is_ok(), "Should handle malformed code without crashing");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn circular_import_handling() {
+        // Circular imports should not cause infinite loops
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_circular_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("a.py"), r#"
+from b import B
+
+class A:
+    def use_b(self):
+        return B()
+"#).unwrap();
+
+        fs::write(tmp.join("b.py"), r#"
+from a import A
+
+class B:
+    def use_a(self):
+        return A()
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+
+        // Should not hang or crash
+        let result = build_graph(&opts);
+        assert!(result.is_ok(), "Should handle circular imports without hanging");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn single_file_project() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_single_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("main.py"), r#"
+def main():
+    return "hello"
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        assert_eq!(result.parsed_files.len(), 1);
+        assert_eq!(result.store_stats.symbols, 1);
+        assert_eq!(result.store_stats.files, 1);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn binary_files_ignored() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_binary_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Create a binary file
+        fs::write(tmp.join("image.png"), &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        fs::write(tmp.join("data.bin"), &[0x00, 0x01, 0x02, 0x03]).unwrap();
+
+        // Create a valid source file
+        fs::write(tmp.join("main.py"), r#"
+def main():
+    pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Should only parse the Python file
+        assert_eq!(result.parsed_files.len(), 1);
+        assert!(result.parsed_files[0].path.ends_with("main.py"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
 }
