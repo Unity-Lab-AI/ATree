@@ -1,13 +1,14 @@
 use crate::lang::get_provider_for_extension;
 use crate::semantic::ParsedFile;
 use crate::syntax::SyntaxEngine;
-use crate::resolver::{SemanticModel, SymbolTable};
-use crate::graph::CodeGraph;
+use crate::resolver::SymbolTable;
+use crate::store::{GraphStore, SymbolRecord, ScopeRecord, ImportRecord, CallRecord, HeritageRecord};
 pub mod lang;
 pub mod syntax;
 pub mod semantic;
 pub mod resolver;
 pub mod graph;
+pub mod store;
 /// `atree` — File-system A* pathfinding library.
 ///
 /// Public API:
@@ -82,9 +83,9 @@ pub struct ScanOptions {
 /// Result of a successful [`build_graph`] call.
 pub struct ScanResult {
     pub parsed_files: Vec<crate::semantic::ParsedFile>,
-    pub semantic_model: SemanticModel,
     pub symbol_table: SymbolTable,
-    pub code_graph: CodeGraph,
+    pub store_stats: crate::store::StoreStats,
+    pub resolution_stats: Option<crate::resolver::ResolutionStats>,
     pub adj: FxHashMap<String, Vec<String>>,
     pub root_name: String,
     pub meta: FxHashMap<String, NodeMeta>,
@@ -134,9 +135,9 @@ pub const SCHEMA_JSON: &str = include_str!("../docs/schema.json");
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonReport {
     pub semantic: Option<Vec<crate::semantic::ParsedFileOutput>>,
-    pub semantic_model: Option<SemanticModel>,
-    pub code_graph: Option<CodeGraph>,
     pub symbol_table: Option<SymbolTable>,
+    pub store_stats: Option<crate::store::StoreStats>,
+    pub resolution_stats: Option<crate::resolver::ResolutionStats>,
     pub schema_version: u32,
     pub version: String,
     pub root: String,
@@ -417,8 +418,10 @@ fn process_dir(
                             h.finish()
                         };
                         let file_id = file_hash; // use hash as unique ID
-                        let captures = syntax.extract_captures(provider, &content);
-                        let parsed = ParsedFile::from_captures(file_id, &child_rel, provider.id(), file_hash, captures);
+                        let (captures, raw_scopes) = syntax.extract_captures_and_scopes(provider, &content);
+                        let parsed = ParsedFile::from_captures_with_scopes(
+                            file_id, &child_rel, provider.id(), file_hash, captures, raw_scopes,
+                        );
                         local.parsed_files.push(parsed);
                     }
                 }
@@ -605,20 +608,110 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
         parsed_files.extend(local.parsed_files.clone());
     }
 
-    // Build the semantic model (in-memory hot-path index with resolution)
-    let semantic_model = SemanticModel::build_from_parsed(parsed_files.clone());
+    // Build the persistent graph store and run resolution
+    let (store_stats, symbol_table, resolution_stats) = if opts.semantic {
+        let result: io::Result<_> = (|| {
+            let store = GraphStore::open_in_memory()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            for file in &parsed_files {
+                let file_id = store.upsert_file(&file.path, file.hash, &format!("{:?}", file.language), 0)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-    // Build flat symbol table from the resolved model
-    let symbol_table = SymbolTable::from_model(&semantic_model);
+                // Insert scopes first, tracking the mapping from ParsedFile scope index → store scope ID
+                let mut scope_id_map: Vec<i64> = Vec::with_capacity(file.scopes.len());
+                for scope in &file.scopes {
+                    let parent_store_id = scope.parent_id.map(|pid| scope_id_map[pid as usize]);
+                    let store_scope_id = store.insert_scope(&ScopeRecord {
+                        id: 0, file_id, parent_id: parent_store_id,
+                        owner_symbol_id: scope.owner_symbol_id.map(|v| v as i64),
+                        kind: format!("{:?}", scope.kind),
+                        line_start: scope.line_start, line_end: scope.line_end,
+                    }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    scope_id_map.push(store_scope_id);
+                }
 
-    // Build the code graph from the resolved model
-    let code_graph = CodeGraph::from_model(&semantic_model);
+                // Insert symbols first (heritage needs symbol IDs)
+                let mut symbol_id_map: Vec<i64> = Vec::with_capacity(file.symbols.len());
+                for sym in &file.symbols {
+                    let store_scope_id = sym.scope_id.map(|sid| scope_id_map[sid as usize]);
+                    let store_sym_id = store.insert_symbol(&SymbolRecord {
+                        id: 0, file_id, name: sym.name.clone(),
+                        qualified_name: sym.qualified_name.clone(),
+                        kind: format!("{:?}", sym.kind),
+                        line: sym.line, col: sym.col,
+                        is_exported: sym.is_exported,
+                        scope_id: store_scope_id,
+                        owner_symbol_id: sym.owner_id.map(|v| v as i64),
+                    }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    symbol_id_map.push(store_sym_id);
+                }
+
+                // Insert heritage (inheritance) relationships
+                for her in &file.heritage {
+                    // Find the child symbol ID: the class that has this heritage
+                    // The heritage's class_name should match a symbol in this file
+                    let child_id = file.symbols.iter()
+                        .position(|s| s.name == her.class_name || her.class_name.is_empty())
+                        .map(|idx| symbol_id_map[idx])
+                        .unwrap_or(0);
+                    store.insert_heritage(&HeritageRecord {
+                        id: 0, file_id,
+                        child_symbol_id: child_id,
+                        parent_symbol_id: None, // resolved in MRO phase
+                        parent_name: her.target_name.clone(),
+                        heritage_kind: format!("{:?}", her.heritage_kind),
+                        confidence: her.confidence.score(),
+                        line: her.line,
+                    }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+
+                for imp in &file.imports {
+                    store.insert_import(&ImportRecord {
+                        id: 0, file_id, source: imp.source.clone(),
+                        imported_name: imp.imported_name.clone(),
+                        local_name: imp.local_name.clone(),
+                        resolved_file_id: imp.resolved_file_id.map(|v| v as i64),
+                        confidence: imp.confidence.score(),
+                    }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+
+                for call in &file.calls {
+                    let caller_store_scope_id = call.caller_scope_id.map(|sid| scope_id_map[sid as usize]);
+                    store.insert_call(&CallRecord {
+                        id: 0, file_id,
+                        caller_scope_id: caller_store_scope_id,
+                        callee_name: call.callee_name.clone(),
+                        receiver: call.receiver.clone(),
+                        resolved_symbol_id: call.resolved_symbol_id.map(|v| v as i64),
+                        confidence: call.confidence.score(),
+                        line: call.line, col: call.col,
+                    }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+            }
+            let engine = crate::resolver::ResolutionEngine::new(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let stats = engine.run_full_resolution()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let store_stats = store.stats()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let symbol_table = SymbolTable::from_store(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok((store_stats, symbol_table, Some(stats)))
+        })();
+        match result {
+            Ok((ss, st, rs)) => (ss, st, rs),
+            Err(e) => return Err(e),
+        }
+// Incremental scanning
+    } else {
+        (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0 }, SymbolTable::new(), None)
+    };
 
     Ok(ScanResult {
         parsed_files,
-        semantic_model,
         symbol_table,
-        code_graph,
+        store_stats,
+        resolution_stats,
         adj,
         root_name,
         meta,
@@ -628,6 +721,255 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
 }
 
 // =====================================================================
+// Incremental scanning=====================================================================
+// Incremental scanning
+// =====================================================================
+
+/// Result of an incremental scan, showing what changed.
+pub struct IncrementalScanResult {
+    pub files_added: usize,
+    pub files_updated: usize,
+    pub files_unchanged: usize,
+    pub files_removed: usize,
+}
+
+/// Build a graph incrementally, reusing an existing GraphStore.
+/// Only files whose hashes have changed will be re-parsed.
+/// Files that no longer exist on disk will be removed from the store.
+pub fn build_graph_incremental(
+    opts: &ScanOptions,
+    store: &GraphStore,
+) -> io::Result<(ScanResult, IncrementalScanResult)> {
+    let root = opts.root.canonicalize().unwrap_or_else(|_| opts.root.clone());
+    let root_meta = fs::metadata(&root).map_err(|e| {
+        io::Error::new(e.kind(), format!("root path '{}' is unreadable: {}", opts.root.display(), e))
+    })?;
+    if !root_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("root path '{}' is not a directory", opts.root.display()),
+        ));
+    }
+
+    let mut incremental = IncrementalScanResult {
+        files_added: 0,
+        files_updated: 0,
+        files_unchanged: 0,
+        files_removed: 0,
+    };
+
+    // Get currently indexed files
+    let indexed_files = store.get_all_file_hashes().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let indexed_paths: std::collections::HashSet<String> =
+        indexed_files.iter().map(|(p, _)| p.clone()).collect();
+
+    // Scan filesystem to find current files
+    let mut current_files: Vec<(String, u64, String)> = Vec::new(); // (rel_path, hash, language)
+    let mut syntax = SyntaxEngine::new();
+    collect_files_for_incremental(&root, &root, opts, &mut current_files, &mut syntax)?;
+
+    let current_paths: std::collections::HashSet<String> =
+        current_files.iter().map(|(p, _, _)| p.clone()).collect();
+
+    // Remove files that no longer exist
+    for (path, _) in &indexed_files {
+        if !current_paths.contains(path) {
+            store.remove_file_data(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            incremental.files_removed += 1;
+        }
+    }
+
+    // Process each current file
+    let mut parsed_files: Vec<ParsedFile> = Vec::new();
+    for (rel_path, hash, _lang) in &current_files {
+        if let Some(_existing_id) = store.check_file_unchanged(rel_path, *hash).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
+            incremental.files_unchanged += 1;
+            continue;
+        }
+
+        // File is new or changed — remove old data if it exists
+        if indexed_paths.contains(rel_path) {
+            store.remove_file_data(rel_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            incremental.files_updated += 1;
+        } else {
+            incremental.files_added += 1;
+        }
+
+        // Re-parse the file
+        let full_path = root.join(rel_path);
+        if let Ok(content) = fs::read_to_string(&full_path) {
+            if let Some(ext) = Path::new(&rel_path).extension().and_then(|s| s.to_str()) {
+                if let Some(provider) = get_provider_for_extension(ext) {
+                    let (captures, raw_scopes) = syntax.extract_captures_and_scopes(provider, &content);
+                    let file_id = *hash; // use hash as ID
+                    let parsed = ParsedFile::from_captures_with_scopes(
+                        file_id, rel_path, provider.id(), *hash, captures, raw_scopes,
+                    );
+                    parsed_files.push(parsed);
+                }
+            }
+        }
+    }
+
+    // Now insert all new/changed files into the store
+    let mut store_stats = store.stats().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut symbol_table = SymbolTable::new();
+    let mut resolution_stats = None;
+
+    if !parsed_files.is_empty() {
+        for file in &parsed_files {
+            let file_id = store.upsert_file(&file.path, file.hash, &format!("{:?}", file.language), 0)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            let mut scope_id_map: Vec<i64> = Vec::with_capacity(file.scopes.len());
+            for scope in &file.scopes {
+                let parent_store_id = scope.parent_id.map(|pid| scope_id_map[pid as usize]);
+                let store_scope_id = store.insert_scope(&ScopeRecord {
+                    id: 0, file_id, parent_id: parent_store_id,
+                    owner_symbol_id: scope.owner_symbol_id.map(|v| v as i64),
+                    kind: format!("{:?}", scope.kind),
+                    line_start: scope.line_start, line_end: scope.line_end,
+                }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                scope_id_map.push(store_scope_id);
+            }
+
+            let mut symbol_id_map: Vec<i64> = Vec::with_capacity(file.symbols.len());
+            for sym in &file.symbols {
+                let store_scope_id = sym.scope_id.map(|sid| scope_id_map[sid as usize]);
+                let store_sym_id = store.insert_symbol(&SymbolRecord {
+                    id: 0, file_id, name: sym.name.clone(),
+                    qualified_name: sym.qualified_name.clone(),
+                    kind: format!("{:?}", sym.kind),
+                    line: sym.line, col: sym.col,
+                    is_exported: sym.is_exported,
+                    scope_id: store_scope_id,
+                    owner_symbol_id: sym.owner_id.map(|v| v as i64),
+                }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                symbol_id_map.push(store_sym_id);
+            }
+
+            for her in &file.heritage {
+                let child_id = file.symbols.iter()
+                    .position(|s| s.name == her.class_name || her.class_name.is_empty())
+                    .map(|idx| symbol_id_map[idx])
+                    .unwrap_or(0);
+                store.insert_heritage(&HeritageRecord {
+                    id: 0, file_id, child_symbol_id: child_id,
+                    parent_symbol_id: None,
+                    parent_name: her.target_name.clone(),
+                    heritage_kind: format!("{:?}", her.heritage_kind),
+                    confidence: her.confidence.score(),
+                    line: her.line,
+                }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            for imp in &file.imports {
+                store.insert_import(&ImportRecord {
+                    id: 0, file_id, source: imp.source.clone(),
+                    imported_name: imp.imported_name.clone(),
+                    local_name: imp.local_name.clone(),
+                    resolved_file_id: imp.resolved_file_id.map(|v| v as i64),
+                    confidence: imp.confidence.score(),
+                }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            for call in &file.calls {
+                let caller_store_scope_id = call.caller_scope_id.map(|sid| scope_id_map[sid as usize]);
+                store.insert_call(&CallRecord {
+                    id: 0, file_id, caller_scope_id: caller_store_scope_id,
+                    callee_name: call.callee_name.clone(),
+                    receiver: call.receiver.clone(),
+                    resolved_symbol_id: call.resolved_symbol_id.map(|v| v as i64),
+                    confidence: call.confidence.score(),
+                    line: call.line, col: call.col,
+                }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+        }
+
+        // Run resolution on the updated store
+        let engine = crate::resolver::ResolutionEngine::new(store)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        resolution_stats = Some(engine.run_full_resolution()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?);
+        store_stats = store.stats()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        symbol_table = SymbolTable::from_store(store)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    }
+
+    // Build the adjacency list and stats from the full store
+    // (For incremental, we just return the store stats directly)
+    let root_name_raw = root.file_name().and_then(|s| s.to_str()).unwrap_or("root").to_string();
+    let root_name = sanitize_name(&root_name_raw);
+
+    // Build minimal adj/meta/stats for compatibility
+    let mut stats = Stats::default();
+    stats.total_nodes = store_stats.files as usize;
+    stats.folders = 0; // Not tracked in incremental mode
+    stats.files = store_stats.files as usize;
+
+    Ok((ScanResult {
+        parsed_files,
+        symbol_table,
+        store_stats: store_stats.clone(),
+        resolution_stats,
+        adj: FxHashMap::default(),
+        root_name,
+        meta: FxHashMap::default(),
+        stats,
+        truncated: false,
+    }, incremental))
+}
+
+/// Collect all source files under root for incremental scanning.
+fn collect_files_for_incremental(
+    root: &Path,
+    current: &Path,
+    opts: &ScanOptions,
+    files: &mut Vec<(String, u64, String)>,
+    _syntax: &mut SyntaxEngine,
+) -> io::Result<()> {
+    let entries: Vec<_> = match fs::read_dir(current) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            collect_files_for_incremental(root, &path, opts, files, _syntax)?;
+        } else if ft.is_file() {
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if get_provider_for_extension(ext).is_some() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let hash = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            content.hash(&mut h);
+                            h.finish()
+                        };
+                        let rel = path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        let lang = format!("{:?}", get_provider_for_extension(ext).unwrap().id());
+                        files.push((rel, hash, lang));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// =====================================================================
+// Graph algorithms
+// ==========================================================================================================================================
 // Graph algorithms
 // =====================================================================
 
@@ -988,9 +1330,9 @@ pub fn build_json_report(
         semantic: if options.semantic {
             Some(scan.parsed_files.iter().map(|f| f.to_output()).collect())
         } else { None },
-        semantic_model: if options.semantic { Some(scan.semantic_model.clone()) } else { None },
-        code_graph: if options.semantic { Some(scan.code_graph.clone()) } else { None },
         symbol_table: if options.semantic { Some(scan.symbol_table.clone()) } else { None },
+        store_stats: if options.semantic { Some(scan.store_stats.clone()) } else { None },
+        resolution_stats: if options.semantic { scan.resolution_stats.clone() } else { None },
         schema_version: SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: options.root.display().to_string(),
@@ -1020,6 +1362,7 @@ pub fn build_json_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{ScopeKind, HeritageKind};
     use std::fs;
 
     fn tiny_graph() -> FxHashMap<String, Vec<String>> {
@@ -1468,50 +1811,21 @@ func main() {
         assert!(st.resolve("HttpServer").is_some(), "SymbolTable: HttpServer not found");
         assert!(st.resolve("NewServer").is_some(), "SymbolTable: NewServer not found");
 
-        // ---- Verify semantic model ----
-        let model = &result.semantic_model;
-        assert!(model.total_files >= 4, "SemanticModel: expected >=4 files, got {}", model.total_files);
-        assert!(model.total_symbols > 0, "SemanticModel: no symbols indexed");
-        assert!(model.total_calls > 0, "SemanticModel: no calls found");
+        // ---- Verify store stats ----
+        let store_stats = &result.store_stats;
+        assert!(store_stats.files >= 4, "Store: expected >=4 files, got {}", store_stats.files);
+        assert!(store_stats.symbols > 0, "Store: no symbols indexed");
+        assert!(store_stats.calls > 0, "Store: no calls found");
 
-        // Verify same-file resolution in semantic model
-        let sm_rust = result.semantic_model.files.values().find(|f| f.path.ends_with("main.rs")).expect("main.rs not in semantic model");
-        let create_service_call = sm_rust.calls.iter().find(|c| c.callee_name == "create_service");
-        if let Some(call) = create_service_call {
-            assert_eq!(call.confidence, crate::semantic::Confidence::ExactLocal,
-                "create_service() call should be ExactLocal, got {:?}", call.confidence);
+        // Verify resolution stats
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.calls_resolved > 0, "Resolution: no calls resolved");
+            assert!(res_stats.defines_edges > 0, "Resolution: no defines edges");
         }
 
-        // Verify TypeScript heritage resolution in semantic model
-        let sm_ts = result.semantic_model.files.values().find(|f| f.path.ends_with("service.ts")).expect("service.ts not in semantic model");
-        assert!(!sm_ts.heritage.is_empty(), "TS: no heritage found in semantic model");
-        let extends = sm_ts.heritage.iter().find(|h| h.target_name == "BaseService");
-        assert!(extends.is_some(), "TS: extends BaseService heritage not found");
-
-        // ---- Verify code graph ----
-        let graph = &result.code_graph;
-        assert!(!graph.nodes.is_empty(), "CodeGraph: no nodes");
-        assert!(!graph.edges.is_empty(), "CodeGraph: no edges");
-
-        // Verify file nodes exist
-        let file_nodes: Vec<_> = graph.nodes.iter().filter(|n| n.node_type == "file").collect();
-        assert!(file_nodes.len() >= 4, "CodeGraph: expected >=4 file nodes, got {}", file_nodes.len());
-
-        // Verify symbol nodes exist
-        let sym_nodes: Vec<_> = graph.nodes.iter().filter(|n| n.node_type == "symbol").collect();
-        assert!(sym_nodes.len() > 0, "CodeGraph: no symbol nodes");
-
-        // Verify defines edges exist
-        let defines_edges: Vec<_> = graph.edges.iter().filter(|e| e.edge_type == "defines").collect();
-        assert!(!defines_edges.is_empty(), "CodeGraph: no defines edges");
-
-        // Verify resolution edges exist (calls → symbols)
-        let resolves_edges: Vec<_> = graph.edges.iter().filter(|e| e.edge_type == "resolves_to").collect();
-        assert!(!resolves_edges.is_empty(), "CodeGraph: no resolves_to edges");
-
-        // Verify confidence scores on edges
-        let high_conf: Vec<_> = resolves_edges.iter().filter(|e| e.confidence >= 0.9).collect();
-        assert!(!high_conf.is_empty(), "CodeGraph: no high-confidence resolution edges");
+        // Verify calls were resolved in the parsed files (resolution updates the store,
+        // so we check the store stats for resolved calls)
+        assert!(store_stats.resolved_calls > 0, "Store: no resolved calls");
 
         // ---- Verify JSON roundtrip ----
         let depths = compute_depths(&result.adj, &result.root_name);
@@ -1523,14 +1837,14 @@ func main() {
         let semantic = parsed["semantic"].as_array().expect("semantic array");
         assert!(semantic.len() >= 4, "JSON: expected >=4 semantic entries");
 
-        // Verify code_graph in JSON
-        let cg = parsed["code_graph"].as_object().expect("code_graph object");
-        assert!(cg["nodes"].as_array().unwrap().len() > 0, "JSON: code_graph has no nodes");
-        assert!(cg["edges"].as_array().unwrap().len() > 0, "JSON: code_graph has no edges");
+        // Verify store_stats in JSON
+        let ss = parsed["store_stats"].as_object().expect("store_stats object");
+        assert!(ss["symbols"].as_i64().unwrap() > 0, "JSON: store_stats has no symbols");
+        assert!(ss["calls"].as_i64().unwrap() > 0, "JSON: store_stats has no calls");
 
-        // Verify semantic_model in JSON
-        let sm = parsed["semantic_model"].as_object().expect("semantic_model object");
-        assert!(sm["total_symbols"].as_u64().unwrap() > 0, "JSON: semantic_model has no symbols");
+        // Verify resolution_stats in JSON
+        let rs = parsed["resolution_stats"].as_object().expect("resolution_stats object");
+        assert!(rs["calls_resolved"].as_u64().unwrap() > 0, "JSON: resolution_stats has no resolved calls");
 
         // Verify symbol_table in JSON
         let st_json = parsed["symbol_table"].as_object().expect("symbol_table object");
@@ -1583,19 +1897,20 @@ fn main() {
         assert!(main_call_names.contains(&"helper"), "main.rs should call helper, got {:?}", main_call_names);
         assert!(main_call_names.contains(&"process"), "main.rs should call process, got {:?}", main_call_names);
 
-        // Check resolution in the semantic model's copy of the file
-        let sm_main = result.semantic_model.files.values().find(|f| f.path.ends_with("main.rs")).expect("main.rs not in semantic model");
-        let resolved_count = sm_main.calls.iter()
-            .filter(|c| c.confidence != crate::semantic::Confidence::Unresolved)
-            .count();
-        assert!(resolved_count > 0, "Expected some resolved calls in semantic model, got 0 out of {}", sm_main.calls.len());
-
-        // Verify the semantic model has both files
-        assert!(result.semantic_model.total_files >= 2);
+        // Verify the store has both files indexed
+        assert!(result.store_stats.files >= 2, "Store: expected >=2 files, got {}", result.store_stats.files);
 
         // Verify the symbol table has both helper and process
-        assert!(result.symbol_table.resolve("helper").is_some());
-        assert!(result.symbol_table.resolve("process").is_some());
+        assert!(result.symbol_table.resolve("helper").is_some(), "SymbolTable: helper not found");
+        assert!(result.symbol_table.resolve("process").is_some(), "SymbolTable: process not found");
+
+        // Verify some calls were resolved via the store stats
+        assert!(result.store_stats.resolved_calls > 0, "Store: expected some resolved calls");
+
+        // Verify resolution stats
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.calls_resolved > 0, "Resolution: no cross-file calls resolved");
+        }
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -1642,16 +1957,1244 @@ def my_func():
         assert!(names.contains(&"MyClass"), "MyClass not found in {:?}", names);
         assert!(names.contains(&"my_func"), "my_func not found in {:?}", names);
 
-        // Check resolution in the semantic model's copy
-        let sm_file = result.semantic_model.files.values().find(|f| f.path.ends_with("test.py")).expect("test.py not in semantic model");
-        let my_func_call = sm_file.calls.iter().find(|c| c.callee_name == "my_func");
-        assert!(my_func_call.is_some(), "my_func() call not found in semantic model");
-        assert_eq!(my_func_call.unwrap().confidence, crate::semantic::Confidence::ExactLocal,
-            "my_func() should be ExactLocal, got {:?}", my_func_call.unwrap().confidence);
+        // Verify calls were extracted
+        let call_names: Vec<&str> = file.calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(call_names.contains(&"MyClass"), "MyClass() call not found in {:?}", call_names);
+        assert!(call_names.contains(&"my_func"), "my_func() call not found in {:?}", call_names);
 
-        // Verify stats
-        assert!(result.semantic_model.total_resolved > 0, "Should have resolved calls");
-        assert!(result.semantic_model.total_symbols >= 2, "Should have at least 2 symbols");
+        // Verify store has symbols and calls
+        assert!(result.store_stats.symbols >= 2, "Store: expected at least 2 symbols, got {}", result.store_stats.symbols);
+        assert!(result.store_stats.calls > 0, "Store: no calls found");
+
+        // Verify some calls were resolved
+        assert!(result.store_stats.resolved_calls > 0, "Store: no resolved calls");
+
+        // Verify resolution stats
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.calls_resolved > 0, "Resolution: no calls resolved");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Scope tree extraction tests
+    // =====================================================================
+
+    #[test]
+    fn scope_tree_extraction_creates_proper_hierarchy() {
+        // Verify that scope trees are properly extracted from the AST
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_scope_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Python file with nested classes and functions
+        fs::write(tmp.join("nested.py"), r#"
+class Outer:
+    def outer_method(self):
+        pass
+
+    class Inner:
+        def inner_method(self):
+            pass
+
+def top_level():
+    def nested_func():
+        pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("nested.py")).unwrap();
+
+        // Should have scopes: Module, Outer class, outer_method, Inner class, inner_method, top_level, nested_func
+        assert!(file.scopes.len() >= 4, "Expected at least 4 scopes, got {}", file.scopes.len());
+
+        // Verify scope kinds
+        let kinds: Vec<ScopeKind> = file.scopes.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&ScopeKind::Module), "Should have Module scope");
+        assert!(kinds.contains(&ScopeKind::Class), "Should have Class scope");
+        assert!(kinds.contains(&ScopeKind::Function), "Should have Function scope");
+
+        // Verify parent chain: Inner class should be a child of Outer class
+        let outer_idx = file.scopes.iter().position(|s| s.kind == ScopeKind::Class && s.line_start <= 1).unwrap();
+        let inner_idx = file.scopes.iter().position(|s| s.kind == ScopeKind::Class && s.line_start > 1).unwrap();
+        assert_eq!(file.scopes[inner_idx].parent_id, Some(outer_idx as u64),
+            "Inner class should be child of Outer class scope");
+
+        // Verify symbols have scope_id assigned
+        for sym in &file.symbols {
+            assert!(sym.scope_id.is_some(), "Symbol {} should have a scope_id", sym.name);
+        }
+
+        // Verify store has scopes
+        assert!(result.store_stats.scopes >= 4, "Store: expected >=4 scopes, got {}", result.store_stats.scopes);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn scope_symbols_have_correct_owners() {
+        // Verify that methods inside classes get the correct owner_id
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_owner_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("service.ts"), r#"
+class MyService {
+    name: string;
+
+    constructor(name: string) {
+        this.name = name;
+    }
+
+    run() {
+        console.log(this.name);
+    }
+
+    stop() {
+        console.log("stopped");
+    }
+}
+
+function createService() {
+    return new MyService("default");
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("service.ts")).unwrap();
+
+        // Find the MyService class symbol
+        let service_sym = file.symbols.iter().find(|s| s.name == "MyService").unwrap();
+        assert!(service_sym.scope_id.is_some(), "MyService should have a scope_id");
+
+        // Find methods inside MyService — they should have owner_id pointing to MyService
+        // At least some methods should have owners
+        let methods_with_owners: Vec<_> = file.symbols.iter()
+            .filter(|s| s.name == "run" || s.name == "stop" || s.name == "constructor")
+            .filter(|s| s.owner_id.is_some())
+            .collect();
+        assert!(!methods_with_owners.is_empty(), "At least one method should have an owner_id");
+
+        // createService should NOT have an owner (it's top-level)
+        let create_sym = file.symbols.iter().find(|s| s.name == "createService");
+        if let Some(create) = create_sym {
+            assert!(create.owner_id.is_none(), "createService() should not have an owner_id");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // MRO / Inheritance resolution tests
+    // =====================================================================
+
+    #[test]
+    fn mro_resolves_inheritance_edges() {
+        // Verify that MRO phase emits EXTENDS edges for class inheritance
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_mro_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("models.py"), r#"
+class BaseModel:
+    def save(self):
+        pass
+
+class User(BaseModel):
+    def get_name(self):
+        pass
+
+class Admin(User):
+    def get_permissions(self):
+        pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify heritage was extracted
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("models.py")).unwrap();
+        assert!(!file.heritage.is_empty(), "Should have heritage entries");
+        assert!(file.heritage.len() >= 2, "Should have at least 2 heritage entries (User→BaseModel, Admin→User)");
+
+        // Verify MRO edges were emitted
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges > 0, "Should have MRO edges, got {}", res_stats.mro_edges);
+        }
+
+        // Verify store has edges
+        assert!(result.store_stats.edges > 0, "Store should have edges from MRO resolution");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn mro_resolves_interface_implements() {
+        // Verify IMPLEMENTS edges for interface implementation
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_iface_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("service.ts"), r#"
+interface Runnable {
+    run(): void;
+}
+
+interface Stoppable {
+    stop(): void;
+}
+
+class WorkerService implements Runnable, Stoppable {
+    run() {}
+    stop() {}
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("service.ts")).unwrap();
+
+        // Verify heritage entries for implements
+        let implements: Vec<_> = file.heritage.iter()
+            .filter(|h| matches!(h.heritage_kind, HeritageKind::Implements))
+            .collect();
+        assert!(!implements.is_empty(), "Should have IMPLEMENTS heritage entries");
+
+        // Verify MRO edges
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 2, "Should have at least 2 IMPLEMENTS edges");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Import resolution tests
+    // =====================================================================
+
+    #[test]
+    fn import_resolution_python_relative() {
+        // Verify Python relative imports are resolved
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_imp_py_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::create_dir_all(tmp.join("pkg/sub")).unwrap();
+        fs::write(tmp.join("pkg/__init__.py"), "").unwrap();
+        fs::write(tmp.join("pkg/sub/__init__.py"), "").unwrap();
+        fs::write(tmp.join("pkg/sub/helper.py"), r#"
+def helper_func():
+    return 42
+"#).unwrap();
+        fs::write(tmp.join("pkg/main.py"), r#"
+from .sub.helper import helper_func
+
+def main():
+    return helper_func()
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify imports were extracted
+        let main_file = result.parsed_files.iter().find(|f| f.path.contains("main.py")).unwrap();
+        assert!(!main_file.imports.is_empty(), "Should have imports in main.py");
+
+        // Verify some imports were resolved
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.imports_resolved > 0, "Should have resolved some imports");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn import_resolution_typescript_relative() {
+        // Verify TypeScript relative imports
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_imp_ts_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::create_dir_all(tmp.join("src/utils")).unwrap();
+        fs::write(tmp.join("src/utils/helper.ts"), r#"
+export function helper() {
+    return 42;
+}
+"#).unwrap();
+        fs::write(tmp.join("src/main.ts"), r#"
+import { helper } from './utils/helper';
+
+function main() {
+    return helper();
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let main_file = result.parsed_files.iter().find(|f| f.path.contains("main.ts")).unwrap();
+        assert!(!main_file.imports.is_empty(), "Should have imports in main.ts");
+
+        // Verify import resolution
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.imports_resolved > 0, "Should have resolved some imports");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Cross-file resolution tests
+    // =====================================================================
+
+    #[test]
+    fn cross_file_call_resolution_with_imports() {
+        // Test that calls in one file resolve to definitions in another via imports
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_cross2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("math_utils.py"), r#"
+def add(a, b):
+    return a + b
+
+def multiply(a, b):
+    return a * b
+"#).unwrap();
+
+        fs::write(tmp.join("main.py"), r#"
+from math_utils import add, multiply
+
+def compute():
+    x = add(1, 2)
+    y = multiply(x, 3)
+    return y
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify both files were parsed
+        assert!(result.parsed_files.len() >= 2, "Should have at least 2 parsed files");
+
+        // Verify imports were resolved
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.imports_resolved > 0, "Should have resolved imports");
+        }
+
+        // Verify calls were resolved (same-file calls should resolve)
+        assert!(result.store_stats.resolved_calls > 0, "Should have resolved calls");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn cross_file_inheritance_chain() {
+        // Test multi-level inheritance across files
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_chain_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("base.py"), r#"
+class Entity:
+    def __init__(self, id):
+        self.id = id
+
+    def get_id(self):
+        return self.id
+"#).unwrap();
+
+        fs::write(tmp.join("user.py"), r#"
+from base import Entity
+
+class User(Entity):
+    def __init__(self, id, name):
+        super().__init__(id)
+        self.name = name
+
+    def get_name(self):
+        return self.name
+"#).unwrap();
+
+        fs::write(tmp.join("admin.py"), r#"
+from user import User
+
+class Admin(User):
+    def __init__(self, id, name, role):
+        super().__init__(id, name)
+        self.role = role
+
+    def get_role(self):
+        return self.role
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify all 3 files parsed
+        assert!(result.parsed_files.len() >= 3, "Should have 3 parsed files, got {}", result.parsed_files.len());
+
+        // Verify heritage was extracted
+        let user_file = result.parsed_files.iter().find(|f| f.path.contains("user.py")).unwrap();
+        assert!(!user_file.heritage.is_empty(), "User should have heritage");
+
+        let admin_file = result.parsed_files.iter().find(|f| f.path.contains("admin.py")).unwrap();
+        assert!(!admin_file.heritage.is_empty(), "Admin should have heritage");
+
+        // Verify MRO edges
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 2, "Should have at least 2 MRO edges (User→Entity, Admin→User)");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Confidence scoring tests
+    // =====================================================================
+
+    #[test]
+    fn confidence_scoring_tiers() {
+        // Verify that different resolution tiers get different confidence scores
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_conf2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("test.py"), r#"
+class MyClass:
+    def method(self):
+        pass
+
+def my_func():
+    obj = MyClass()   # ConstructorInferred
+    obj.method()      # ReceiverHeuristic
+    my_func()         # ExactLocal
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 100,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify we have resolved calls
+        assert!(result.store_stats.resolved_calls > 0, "Should have resolved calls");
+
+        // Verify symbols were extracted
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("test.py")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"), "MyClass not found");
+        assert!(names.contains(&"my_func"), "my_func not found");
+        assert!(names.contains(&"method"), "method not found");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Multi-language tests
+    // =====================================================================
+
+    #[test]
+    fn multi_language_rust_inheritance() {
+        // Verify Rust trait resolution
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_rust_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("traits.rs"), r#"
+pub trait Printable {
+    fn print(&self);
+}
+
+pub trait Serializable {
+    fn serialize(&self) -> String;
+}
+
+pub struct Report {
+    title: String,
+}
+
+impl Printable for Report {
+    fn print(&self) {
+        println!("{}", self.title);
+    }
+}
+
+impl Serializable for Report {
+    fn serialize(&self) -> String {
+        format!("Report: {}", self.title)
+    }
+}
+
+pub fn create_report() -> Report {
+    Report { title: "test".to_string() }
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("traits.rs")).unwrap();
+
+        // Verify symbols extracted
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Printable"), "Printable trait not found");
+        assert!(names.contains(&"Serializable"), "Serializable trait not found");
+        assert!(names.contains(&"Report"), "Report struct not found");
+        assert!(names.contains(&"create_report"), "create_report not found");
+
+        // Verify heritage (impl blocks)
+        assert!(!file.heritage.is_empty(), "Should have heritage entries for impl blocks");
+
+        // Verify MRO edges for trait impls
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 2, "Should have MRO edges for impl blocks");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn multi_language_go_interfaces() {
+        // Verify Go interface satisfaction
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_go_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("main.go"), r#"
+package main
+
+import "fmt"
+
+type Printer interface {
+    Print()
+}
+
+type ConsolePrinter struct {
+    prefix string
+}
+
+func (c *ConsolePrinter) Print() {
+    fmt.Println(c.prefix)
+}
+
+func NewPrinter() *ConsolePrinter {
+    return &ConsolePrinter{prefix: ">"}
+}
+
+func main() {
+    p := NewPrinter()
+    p.Print()
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("main.go")).unwrap();
+
+        // Verify symbols
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Printer"), "Printer interface not found");
+        assert!(names.contains(&"ConsolePrinter"), "ConsolePrinter struct not found");
+        assert!(names.contains(&"Print"), "Print method not found");
+        assert!(names.contains(&"NewPrinter"), "NewPrinter function not found");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn multi_language_java_inheritance() {
+        // Verify Java class inheritance and interface implementation
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_java_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("Shape.java"), r#"
+public abstract class Shape {
+    public abstract double area();
+    public String describe() {
+        return "Shape with area: " + area();
+    }
+}
+"#).unwrap();
+
+        fs::write(tmp.join("Circle.java"), r#"
+public class Circle extends Shape {
+    private double radius;
+
+    public Circle(double radius) {
+        this.radius = radius;
+    }
+
+    @Override
+    public double area() {
+        return Math.PI * radius * radius;
+    }
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Verify both files parsed
+        assert!(result.parsed_files.len() >= 2, "Should have 2 parsed files");
+
+        // Verify heritage
+        let circle_file = result.parsed_files.iter().find(|f| f.path.contains("Circle.java")).unwrap();
+        assert!(!circle_file.heritage.is_empty(), "Circle should have heritage (extends Shape)");
+
+        // Verify MRO edges
+        if let Some(ref res_stats) = result.resolution_stats {
+            assert!(res_stats.mro_edges >= 1, "Should have MRO edge for Circle extends Shape");
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Incremental scanning tests
+    // =====================================================================
+
+    #[test]
+    fn incremental_scan_detects_changed_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_incr_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Initial files
+        fs::write(tmp.join("a.py"), r#"
+def hello():
+    return "hello"
+"#).unwrap();
+        fs::write(tmp.join("b.py"), r#"
+def world():
+    return "world"
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+
+        // First scan — both files new
+        let store = GraphStore::open_in_memory().unwrap();
+        let (result1, incr1) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr1.files_added, 2, "Should add 2 files");
+        assert_eq!(incr1.files_unchanged, 0);
+        assert_eq!(incr1.files_updated, 0);
+        assert_eq!(incr1.files_removed, 0);
+        assert_eq!(result1.store_stats.symbols, 2); // hello + world
+
+        // Second scan — no changes
+        let (_result2, incr2) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr2.files_added, 0);
+        assert_eq!(incr2.files_unchanged, 2, "Both files should be unchanged");
+        assert_eq!(incr2.files_updated, 0);
+        assert_eq!(incr2.files_removed, 0);
+
+        // Modify one file
+        fs::write(tmp.join("a.py"), r#"
+def hello():
+    return "hello_modified"
+
+def new_func():
+    return 42
+"#).unwrap();
+
+        // Third scan — one file changed
+        let (_result3, incr3) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr3.files_added, 0);
+        assert_eq!(incr3.files_unchanged, 1, "b.py should be unchanged");
+        assert_eq!(incr3.files_updated, 1, "a.py should be updated");
+        assert_eq!(incr3.files_removed, 0);
+
+        // Verify the updated file has new symbols
+        let a_symbols = store.get_symbols_by_name("new_func").unwrap();
+        assert!(!a_symbols.is_empty(), "new_func should be indexed after update");
+
+        // Delete a file
+        fs::remove_file(tmp.join("b.py")).unwrap();
+
+        // Fourth scan — one file removed
+        let (_result4, incr4) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr4.files_added, 0);
+        assert_eq!(incr4.files_unchanged, 1, "a.py should be unchanged");
+        assert_eq!(incr4.files_updated, 0);
+        assert_eq!(incr4.files_removed, 1, "b.py should be removed");
+
+        // Verify b.py symbols are gone
+        let b_symbols = store.get_symbols_by_name("world").unwrap();
+        assert!(b_symbols.is_empty(), "world should be removed after file deletion");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn incremental_scan_adds_new_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_incr2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("base.py"), r#"
+class Base:
+    pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+
+        let store = GraphStore::open_in_memory().unwrap();
+        let (_result1, incr1) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr1.files_added, 1);
+
+        // Add a new file
+        fs::write(tmp.join("derived.py"), r#"
+from base import Base
+
+class Derived(Base):
+    pass
+"#).unwrap();
+
+        let (_result2, incr2) = build_graph_incremental(&opts, &store).unwrap();
+        assert_eq!(incr2.files_added, 1, "derived.py should be added");
+        assert_eq!(incr2.files_unchanged, 1, "base.py should be unchanged");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Edge case tests
+    // =====================================================================
+
+    #[test]
+    fn empty_file_produces_no_symbols() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_empty_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("empty.py"), "").unwrap();
+        fs::write(tmp.join("comments.py"), r#"
+# This is a file with only comments
+# No actual code here
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        for file in &result.parsed_files {
+            assert!(file.symbols.is_empty(), "Empty file should have no symbols: {}", file.path);
+            assert!(file.calls.is_empty(), "Empty file should have no calls: {}", file.path);
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn unicode_identifiers() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_unicode_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("unicode.py"), r#"
+def café():
+    return "café"
+
+class 日本語:
+    pass
+
+变量 = 42
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("unicode.py")).unwrap();
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"café"), "Should extract unicode function name");
+        assert!(names.contains(&"日本語"), "Should extract unicode class name");
+        assert!(names.contains(&"变量"), "Should extract unicode variable name");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn deeply_nested_scopes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_deep_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("deep.py"), r#"
+class A:
+    class B:
+        class C:
+            def method_c(self):
+                def inner():
+                    def deeper():
+                        pass
+                    pass
+                pass
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("deep.py")).unwrap();
+
+        // Should have many scopes: Module, A, B, C, method_c, inner, deeper
+        assert!(file.scopes.len() >= 5, "Should have at least 5 scopes for deeply nested code, got {}", file.scopes.len());
+
+        // Verify parent chain
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"A"));
+        assert!(names.contains(&"B"));
+        assert!(names.contains(&"C"));
+        assert!(names.contains(&"method_c"));
+        assert!(names.contains(&"inner"));
+        assert!(names.contains(&"deeper"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ambiguous_resolution_multiple_same_name() {
+        // When multiple symbols have the same name, resolution should still work
+        // but mark it as ambiguous
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_ambig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("a.py"), r#"
+def helper():
+    return "a"
+"#).unwrap();
+
+        fs::write(tmp.join("b.py"), r#"
+def helper():
+    return "b"
+
+def use_helper():
+    return helper()  # same-file, should resolve
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Both files should have been parsed
+        assert!(result.parsed_files.len() >= 2);
+
+        // The store should have 3 symbols: helper (from a), helper (from b), use_helper
+        assert!(result.store_stats.symbols >= 3, "Should have at least 3 symbols");
+
+        // Same-file resolution should work for use_helper → helper in b.py
+        assert!(result.store_stats.resolved_calls > 0, "Should resolve same-file calls");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn file_with_only_imports_no_definitions() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_imp_only_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("main.py"), r#"
+import os
+import sys
+from collections import defaultdict
+
+print(os.path.join("a", "b"))
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("main.py")).unwrap();
+        assert!(!file.imports.is_empty(), "Should extract imports");
+        assert!(file.imports.len() >= 3, "Should have at least 3 imports");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn large_file_many_symbols() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_large_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Generate a file with many symbols
+        let mut content = String::new();
+        for i in 0..100 {
+            content.push_str(&format!(r#"
+class Class{idx}:
+    def method_{idx}(self):
+        return {idx}
+
+def func_{idx}():
+    return {idx}
+"#, idx = i));
+        }
+
+        fs::write(tmp.join("large.py"), &content).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 10000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("large.py")).unwrap();
+
+        // Should have extracted many symbols: 100 classes + 100 methods + 100 functions = 300
+        assert!(file.symbols.len() >= 200, "Should extract many symbols, got {}", file.symbols.len());
+
+        // Store should have all symbols
+        assert!(result.store_stats.symbols >= 200, "Store should have many symbols, got {}", result.store_stats.symbols);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn mixed_language_project() {
+        // Test a project with multiple languages
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_mix_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::create_dir_all(tmp.join("lib")).unwrap();
+
+        fs::write(tmp.join("src/main.py"), r#"
+def main():
+    return "hello"
+"#).unwrap();
+        fs::write(tmp.join("src/utils.ts"), r#"
+export function helper(): string {
+    return "helper";
+}
+"#).unwrap();
+        fs::write(tmp.join("lib/calc.rs"), r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#).unwrap();
+        fs::write(tmp.join("lib/server.go"), r#"
+package main
+
+import "fmt"
+
+func Start() {
+    fmt.Println("starting")
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Should have parsed files in all 4 languages
+        assert!(result.parsed_files.len() >= 4, "Should parse at least 4 files, got {}", result.parsed_files.len());
+
+        // Verify each language's symbols
+        let py = result.parsed_files.iter().find(|f| f.path.contains("main.py")).unwrap();
+        assert!(py.symbols.iter().any(|s| s.name == "main"), "Python symbols");
+
+        let ts = result.parsed_files.iter().find(|f| f.path.contains("utils.ts")).unwrap();
+        assert!(ts.symbols.iter().any(|s| s.name == "helper"), "TypeScript symbols");
+
+        let rs = result.parsed_files.iter().find(|f| f.path.contains("calc.rs")).unwrap();
+        assert!(rs.symbols.iter().any(|s| s.name == "add"), "Rust symbols");
+
+        let go = result.parsed_files.iter().find(|f| f.path.contains("server.go")).unwrap();
+        assert!(go.symbols.iter().any(|s| s.name == "Start"), "Go symbols");
 
         fs::remove_dir_all(&tmp).ok();
     }

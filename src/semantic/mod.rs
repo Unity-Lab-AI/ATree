@@ -248,8 +248,65 @@ pub struct ParsedFileOutput {
 
 impl ParsedFile {
     pub fn from_captures(id: u64, path: &str, lang: LanguageId, hash: u64, captures: Vec<RawCapture>) -> Self {
-        let mut symbols = Vec::new();
-        let scopes = Vec::new();
+        Self::from_captures_with_scopes(id, path, lang, hash, captures, Vec::new())
+    }
+
+    pub fn from_captures_with_scopes(
+        id: u64, path: &str, lang: LanguageId, hash: u64,
+        captures: Vec<RawCapture>,
+        raw_scopes: Vec<crate::syntax::RawScope>,
+    ) -> Self {
+        // Convert RawScope → Scope, assigning sequential IDs
+        let mut scopes: Vec<Scope> = raw_scopes
+            .iter()
+            .enumerate()
+            .map(|(idx, rs)| Scope {
+                id: idx as u64,
+                file_id: id,
+                parent_id: rs.parent_idx.map(|p| p as u64),
+                owner_symbol_id: None, // filled in during symbol processing
+                kind: rs.kind,
+                line_start: rs.line_start,
+                line_end: rs.line_end,
+            })
+            .collect();
+
+        // Pre-compute scope ownership: for each scope, find its owner symbol index
+        // (the symbol that defines the class/struct/trait/impl that owns this scope)
+        let mut scope_owner: Vec<Option<usize>> = vec![None; scopes.len()];
+        for idx in 0..scopes.len() {
+            if matches!(scopes[idx].kind,
+                ScopeKind::Class | ScopeKind::Struct | ScopeKind::Trait |
+                ScopeKind::Impl | ScopeKind::Interface | ScopeKind::Enum) {
+                // This scope's owner will be set when we process its defining symbol
+                // For now, mark that this scope IS a class-like scope
+                scope_owner[idx] = Some(idx); // self-referential, will be updated
+            }
+        }
+
+        // Pre-compute: for each scope, the index of the innermost class-like ancestor scope
+        // that has an owner symbol. This avoids borrow issues during symbol processing.
+        let mut scope_class_ancestor: Vec<Option<usize>> = vec![None; scopes.len()];
+        for idx in 0..scopes.len() {
+            let mut cur = idx;
+            loop {
+                if let Some(pid) = scopes[cur].parent_id {
+                    let parent_idx = pid as usize;
+                    if parent_idx == cur { break; }
+                    if matches!(scopes[parent_idx].kind,
+                        ScopeKind::Class | ScopeKind::Struct | ScopeKind::Trait |
+                        ScopeKind::Impl | ScopeKind::Interface | ScopeKind::Enum) {
+                        scope_class_ancestor[idx] = Some(parent_idx);
+                        break;
+                    }
+                    cur = parent_idx;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut symbols: Vec<Symbol> = Vec::new();
         let mut imports = Vec::new();
         let exports = Vec::new();
         let references = Vec::new();
@@ -296,26 +353,67 @@ impl ParsedFile {
                 | CaptureTag::DefinitionDelegate => {
                     let key = (c.name.clone(), line);
                     if seen_symbols.insert(key) {
+                        // Find innermost scope containing this line
+                        let mut scope_idx: Option<usize> = None;
+                        let mut best_size: usize = usize::MAX;
+                        for (idx, s) in scopes.iter().enumerate() {
+                            if line >= s.line_start && line <= s.line_end {
+                                let size = s.line_end - s.line_start;
+                                if size < best_size {
+                                    scope_idx = Some(idx);
+                                    best_size = size;
+                                }
+                            }
+                        }
+                        let scope_id = scope_idx.map(|idx| idx as u64);
+                        // Owner: walk up via pre-computed class ancestor, then check owner_symbol_id
+                        let owner_id = scope_idx.and_then(|si| {
+                            scope_class_ancestor[si].and_then(|anc_idx| {
+                                scopes[anc_idx].owner_symbol_id
+                            })
+                        });
+                        let sym_idx = symbols.len();
                         symbols.push(Symbol {
-                            id: 0, // assigned by SemanticModel
+                            id: 0,
                             name: c.name.clone(),
                             qualified_name: c.name.clone(),
                             kind: c.tag,
                             file_id: id,
-                            scope_id: None,
-                            owner_id: None,
+                            scope_id,
+                            owner_id,
                             line,
                             col,
                             is_exported: false,
                         });
+                        // If this is a class-like definition, mark it as the owner of its scope
+                        if matches!(c.tag,
+                            CaptureTag::DefinitionClass | CaptureTag::DefinitionStruct |
+                            CaptureTag::DefinitionTrait | CaptureTag::DefinitionImpl |
+                            CaptureTag::DefinitionInterface | CaptureTag::DefinitionEnum) {
+                            if let Some(si) = scope_idx {
+                                scopes[si].owner_symbol_id = Some(sym_idx as u64);
+                            }
+                        }
                     }
                 }
                 CaptureTag::CallName => {
                     let key = (c.name.clone(), line);
                     if seen_calls.insert(key) {
+                        // Find innermost scope containing this call
+                        let mut caller_scope_id: Option<u64> = None;
+                        let mut best_size: usize = usize::MAX;
+                        for (idx, s) in scopes.iter().enumerate() {
+                            if line >= s.line_start && line <= s.line_end {
+                                let size = s.line_end - s.line_start;
+                                if size < best_size {
+                                    caller_scope_id = Some(idx as u64);
+                                    best_size = size;
+                                }
+                            }
+                        }
                         calls.push(Call {
                             file_id: id,
-                            caller_scope_id: None,
+                            caller_scope_id,
                             callee_name: c.name,
                             receiver: None,
                             resolved_symbol_id: None,

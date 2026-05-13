@@ -357,16 +357,16 @@ fn main() {
         if args.semantic {
             let total_defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
             let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
-            let total_resolved = scan.semantic_model.total_resolved;
-            let total_unresolved = scan.semantic_model.total_unresolved;
-            let total_edges = scan.code_graph.edges.len();
+            let total_resolved = scan.store_stats.resolved_calls as usize;
+            let total_unresolved = total_calls - total_resolved;
+            let total_edges = scan.store_stats.edges as usize;
             eprintln!(
                 "[SEMANTIC] Extracted {} symbols, {} calls ({} resolved, {} unresolved) across {} files",
                 total_defs, total_calls, total_resolved, total_unresolved, scan.parsed_files.len()
             );
             eprintln!(
-                "[SEMANTIC] Code graph: {} nodes, {} edges",
-                scan.code_graph.nodes.len(), total_edges
+                "[SEMANTIC] Store: {} symbols, {} calls, {} edges",
+                scan.store_stats.symbols, scan.store_stats.calls, total_edges
             );
         }
     }
@@ -496,10 +496,10 @@ fn main() {
         let files = scan.parsed_files.len();
         let defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
         let calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
-        let resolved = scan.semantic_model.total_resolved;
-        let unresolved = scan.semantic_model.total_unresolved;
-        let nodes = scan.code_graph.nodes.len();
-        let edges = scan.code_graph.edges.len();
+        let resolved = scan.store_stats.resolved_calls as usize;
+        let unresolved = calls - resolved;
+        let nodes = scan.store_stats.symbols as usize;
+        let edges = scan.store_stats.edges as usize;
         (files, defs, calls, resolved, unresolved, nodes, edges)
     } else {
         (0, 0, 0, 0, 0, 0, 0)
