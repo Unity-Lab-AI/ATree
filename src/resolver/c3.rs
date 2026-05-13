@@ -291,8 +291,8 @@ mod tests {
 
         let mut cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
         let g_mro = c3_linearize("G", &parent_map, &mut cache).unwrap();
-        // G's C3 MRO: G, D, E, F, B, C, A
-        assert_eq!(g_mro, vec!["D", "E", "F", "B", "C", "A"]);
+        // G's C3 MRO: G, D, E, B, F, C, A  # Verified against Python C3
+        assert_eq!(g_mro, vec!["D", "E", "B", "F", "C", "A"]);
     }
 
     #[test]
