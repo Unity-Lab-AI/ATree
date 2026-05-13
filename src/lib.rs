@@ -7,6 +7,7 @@ pub mod lang;
 pub mod syntax;
 pub mod semantic;
 pub mod resolver;
+pub mod scope_resolution;
 pub mod graph;
 pub mod store;
 /// `atree` — File-system A* pathfinding library.
