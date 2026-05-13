@@ -9,6 +9,7 @@
 //!   5. Emit edges to GraphStore
 
 pub mod import_resolver;
+pub mod c3;
 
 use crate::store::{GraphStore, SymbolRecord, ScopeRecord, ImportRecord, CallRecord, EdgeRecord};
 use crate::semantic::Confidence;
