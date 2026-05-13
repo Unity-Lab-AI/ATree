@@ -29,24 +29,38 @@ impl ParsedFile {
         let mut defs = Vec::new();
         let mut calls = Vec::new();
         let mut imports = Vec::new();
+        let mut seen_defs = std::collections::HashSet::<(String, u32)>::new();
+        let mut seen_calls = std::collections::HashSet::<(String, u32)>::new();
+        let mut seen_imports = std::collections::HashSet::<String>::new();
 
         for c in captures {
             match c.tag {
                 CaptureTag::DefinitionClass | CaptureTag::DefinitionFunction | CaptureTag::DefinitionMethod => {
-                    defs.push(Def {
-                        name: c.name,
-                        tag: c.tag,
-                        line: c.range.start_point.row,
-                    });
+                    let line = c.range.start_point.row as u32;
+                    let key = (c.name.clone(), line);
+                    if seen_defs.insert(key) {
+                        defs.push(Def {
+                            name: c.name,
+                            tag: c.tag,
+                            line: c.range.start_point.row,
+                        });
+                    }
                 },
                 CaptureTag::CallName => {
-                    calls.push(Call {
-                        name: c.name,
-                        line: c.range.start_point.row,
-                    });
+                    let line = c.range.start_point.row as u32;
+                    let key = (c.name.clone(), line);
+                    if seen_calls.insert(key) {
+                        calls.push(Call {
+                            name: c.name,
+                            line: c.range.start_point.row,
+                        });
+                    }
                 },
                 CaptureTag::ImportSource => {
-                    imports.push(c.name.trim_matches(|c| c == '\'' || c == '\"').to_string());
+                    let cleaned = c.name.trim_matches(|c| c == '\'' || c == '\"').to_string();
+                    if seen_imports.insert(cleaned.clone()) {
+                        imports.push(cleaned);
+                    }
                 },
                 _ => {}
             }

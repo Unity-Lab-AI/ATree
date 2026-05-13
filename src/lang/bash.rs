@@ -12,6 +12,8 @@ impl LanguageProvider for BashProvider {
         r#"
 (function_definition name: (word) @name) @definition.function
 (command name: (command_name (word) @call.name)) @call
+(variable_assignment name: (variable_name) @name) @definition.variable
+(for_statement (word) @name) @definition.variable
         "#
     }
 }

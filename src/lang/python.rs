@@ -12,10 +12,18 @@ impl LanguageProvider for PythonProvider {
         r#"
 (class_definition name: (identifier) @name) @definition.class
 (function_definition name: (identifier) @name) @definition.function
+(import_statement name: (dotted_name) @import.source) @import
+(import_statement name: (aliased_import name: (dotted_name) @import.source)) @import
+(import_from_statement module_name: (dotted_name) @import.source) @import
+(import_from_statement module_name: (relative_import) @import.source) @import
 (call function: (identifier) @call.name) @call
 (call function: (attribute attribute: (identifier) @call.name)) @call
-(import_from_statement module: (dotted_name) @import.source) @import
-(import_statement name: (dotted_name) @import.source) @import
+(expression_statement (assignment left: (identifier) @name type: (type)) @definition.property)
+(expression_statement (assignment left: (identifier) @name)) @definition.variable
+(class_definition name: (identifier) @heritage.class superclasses: (argument_list (identifier) @heritage.extends)) @heritage
+(assignment left: (attribute object: (_) @assignment.receiver attribute: (identifier) @assignment.property) right: (_)) @assignment
+(augmented_assignment left: (attribute object: (_) @assignment.receiver attribute: (identifier) @assignment.property) right: (_)) @assignment
+(decorator (call function: (attribute object: (identifier) @decorator.receiver attribute: (identifier) @decorator.name) arguments: (argument_list (string (string_content) @decorator.arg)?))) @decorator
         "#
     }
 }

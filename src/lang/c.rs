@@ -11,8 +11,20 @@ impl LanguageProvider for CProvider {
     fn query(&self) -> &'static str {
         r#"
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
-(call_expression function: (identifier) @call.name) @call
+(declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+(declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+(function_definition declarator: (pointer_declarator declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name)))) @definition.function
+(struct_specifier name: (type_identifier) @name) @definition.struct
+(union_specifier name: (type_identifier) @name) @definition.union
+(enum_specifier name: (type_identifier) @name) @definition.enum
+(type_definition declarator: (type_identifier) @name) @definition.typedef
+(preproc_function_def name: (identifier) @name) @definition.macro
+(preproc_def name: (identifier) @name) @definition.macro
 (preproc_include path: (_) @import.source) @import
+(call_expression function: (identifier) @call.name) @call
+(call_expression function: (field_expression field: (field_identifier) @call.name)) @call
+(declaration declarator: (init_declarator declarator: (identifier) @name)) @definition.variable
         "#
     }
 }

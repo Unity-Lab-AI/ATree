@@ -114,8 +114,7 @@ pub struct JsonOptions {
 /// Current JSON schema version. Bump on any breaking change to the JSON output
 /// (renamed fields, removed fields, changed types). Consumers should pin this
 /// number; behavior-preserving changes do **not** bump it.
-pub const SCHEMA_VERSION: u32 = 1;
-pub const JSON_SCHEMA: &str = include_str!("../docs/schema.json");
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The full JSON Schema (Draft 7) for `--json` output, embedded at compile time.
 /// Source of truth is `docs/schema.json`; this constant guarantees the binary
@@ -1093,6 +1092,7 @@ mod tests {
             include_files: true,
             threads: 2,
             tree_mode: false,
+            semantic: false,
         };
         let result = build_graph(&opts).unwrap();
         // root + 2 subdirs + 1 inner dir + 3 files = 7
@@ -1134,6 +1134,7 @@ mod tests {
             include_files: true,
             threads: 2,
             tree_mode: false,
+            semantic: false,
         };
         let scan = build_graph(&opts).unwrap();
         let depths = compute_depths(&scan.adj, &scan.root_name);
@@ -1148,7 +1149,7 @@ mod tests {
         let parsed: JsonReport = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(parsed.schema_version, SCHEMA_VERSION);
-        assert_eq!(parsed.schema_version, 1); // pin: bump only on breaking changes
+        assert_eq!(parsed.schema_version, 2); // pin: bump only on breaking changes
         assert_eq!(parsed.version, report.version);
         assert_eq!(parsed.root_name, report.root_name);
         assert_eq!(parsed.stats.total_nodes, report.stats.total_nodes);
@@ -1191,6 +1192,7 @@ mod tests {
             include_files: false,
             threads: 1,
             tree_mode: false,
+            semantic: false,
         };
         let err = match build_graph(&opts) {
             Err(e) => e,
@@ -1217,6 +1219,7 @@ mod tests {
             include_files: false,
             threads: 1,
             tree_mode: false,
+            semantic: false,
         };
         let err = match build_graph(&opts) {
             Err(e) => e,
@@ -1246,6 +1249,7 @@ mod tests {
             include_files: false,
             threads: 4,
             tree_mode: true,
+            semantic: false,
         };
         let result = build_graph(&opts).unwrap();
         assert!(result.truncated);

@@ -11,6 +11,7 @@ impl LanguageProvider for JSONProvider {
     fn query(&self) -> &'static str {
         r#"
 (pair key: (string (string_content) @name)) @definition.property
+(array (pair key: (string (string_content) @name))) @definition.property
         "#
     }
 }
