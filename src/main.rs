@@ -355,11 +355,18 @@ fn main() {
             );
         }
         if args.semantic {
-            let total_defs: usize = scan.parsed_files.iter().map(|f| f.defs.len()).sum();
+            let total_defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
             let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
+            let total_resolved = scan.semantic_model.total_resolved;
+            let total_unresolved = scan.semantic_model.total_unresolved;
+            let total_edges = scan.code_graph.edges.len();
             eprintln!(
-                "[SEMANTIC] Extracted {} symbols, {} calls across {} files",
-                total_defs, total_calls, scan.parsed_files.len()
+                "[SEMANTIC] Extracted {} symbols, {} calls ({} resolved, {} unresolved) across {} files",
+                total_defs, total_calls, total_resolved, total_unresolved, scan.parsed_files.len()
+            );
+            eprintln!(
+                "[SEMANTIC] Code graph: {} nodes, {} edges",
+                scan.code_graph.nodes.len(), total_edges
             );
         }
     }
@@ -485,16 +492,20 @@ fn main() {
         }
     }
 
-    let (sem_files, sem_defs, sem_calls) = if args.semantic {
+    let (sem_files, sem_defs, sem_calls, sem_resolved, sem_unresolved, sem_nodes, sem_edges) = if args.semantic {
         let files = scan.parsed_files.len();
-        let defs: usize = scan.parsed_files.iter().map(|f| f.defs.len()).sum();
+        let defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
         let calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
-        (files, defs, calls)
+        let resolved = scan.semantic_model.total_resolved;
+        let unresolved = scan.semantic_model.total_unresolved;
+        let nodes = scan.code_graph.nodes.len();
+        let edges = scan.code_graph.edges.len();
+        (files, defs, calls, resolved, unresolved, nodes, edges)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0, 0, 0, 0)
     };
 
-    print_summary_box(&args, threads, elapsed, stats, sem_files, sem_defs, sem_calls);
+    print_summary_box(&args, threads, elapsed, stats, sem_files, sem_defs, sem_calls, sem_resolved, sem_unresolved, sem_nodes, sem_edges);
 }
 
 /// Resolve start/goal (with auto-pick fallback) and run A* + BFS comparison.
@@ -571,7 +582,7 @@ fn compute_path(
     }
 }
 
-fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, stats: &atree::Stats, semantic_files: usize, semantic_defs: usize, semantic_calls: usize) {
+fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, stats: &atree::Stats, semantic_files: usize, semantic_defs: usize, semantic_calls: usize, semantic_resolved: usize, semantic_unresolved: usize, semantic_nodes: usize, semantic_edges: usize) {
     let stderr = io::stderr();
     let mut out = stderr.lock();
     let box_top = if args.ascii { "+--[ SUMMARY ]--" } else { "┌──[ SUMMARY ]──" };
@@ -594,7 +605,8 @@ fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, 
     let _ = writeln!(out, "│  Total size     : {}", human_size(stats.total_size_bytes));
     let _ = writeln!(out, "│  Threads        : {}", threads);
     if args.semantic {
-        let _ = writeln!(out, "│  Semantic       : {} defs, {} calls ({} files)", semantic_defs, semantic_calls, semantic_files);
+        let _ = writeln!(out, "│  Semantic       : {} defs, {} calls ({} resolved, {} unresolved) in {} files", semantic_defs, semantic_calls, semantic_resolved, semantic_unresolved, semantic_files);
+        let _ = writeln!(out, "│  Code graph     : {} nodes, {} edges", semantic_nodes, semantic_edges);
     }
     let _ = writeln!(out, "│");
     let _ = writeln!(

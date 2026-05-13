@@ -1,6 +1,8 @@
 use crate::lang::get_provider_for_extension;
 use crate::semantic::ParsedFile;
 use crate::syntax::SyntaxEngine;
+use crate::resolver::{SemanticModel, SymbolTable};
+use crate::graph::CodeGraph;
 pub mod lang;
 pub mod syntax;
 pub mod semantic;
@@ -80,6 +82,9 @@ pub struct ScanOptions {
 /// Result of a successful [`build_graph`] call.
 pub struct ScanResult {
     pub parsed_files: Vec<crate::semantic::ParsedFile>,
+    pub semantic_model: SemanticModel,
+    pub symbol_table: SymbolTable,
+    pub code_graph: CodeGraph,
     pub adj: FxHashMap<String, Vec<String>>,
     pub root_name: String,
     pub meta: FxHashMap<String, NodeMeta>,
@@ -128,7 +133,10 @@ pub const SCHEMA_JSON: &str = include_str!("../docs/schema.json");
 /// version (changes more often, doesn't necessarily mean schema changed).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonReport {
-    pub semantic: Option<Vec<ParsedFile>>,
+    pub semantic: Option<Vec<crate::semantic::ParsedFileOutput>>,
+    pub semantic_model: Option<SemanticModel>,
+    pub code_graph: Option<CodeGraph>,
+    pub symbol_table: Option<SymbolTable>,
     pub schema_version: u32,
     pub version: String,
     pub root: String,
@@ -402,8 +410,15 @@ fn process_dir(
             if let Some(ext) = Path::new(&child_rel).extension().and_then(|s| s.to_str()) {
                 if let Some(provider) = get_provider_for_extension(ext) {
                     if let Ok(content) = fs::read_to_string(&entry_path) {
+                        let file_hash = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            content.hash(&mut h);
+                            h.finish()
+                        };
+                        let file_id = file_hash; // use hash as unique ID
                         let captures = syntax.extract_captures(provider, &content);
-                        let parsed = ParsedFile::from_captures(&child_rel, provider.id(), captures);
+                        let parsed = ParsedFile::from_captures(file_id, &child_rel, provider.id(), file_hash, captures);
                         local.parsed_files.push(parsed);
                     }
                 }
@@ -463,10 +478,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
     let pending = AtomicUsize::new(0);
 
     let n = opts.threads.max(1);
-    let max_depth = opts.max_depth;
     let max_nodes = opts.max_nodes;
-    let include_files = opts.include_files;
-    let tree_mode = opts.tree_mode;
 
     let mut workers: Vec<Worker<Job>> = (0..n).map(|_| Worker::new_lifo()).collect();
     let stealers: Vec<Stealer<Job>> = workers.iter().map(|w| w.stealer()).collect();
@@ -592,8 +604,21 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
     for local in &locals {
         parsed_files.extend(local.parsed_files.clone());
     }
+
+    // Build the semantic model (in-memory hot-path index with resolution)
+    let semantic_model = SemanticModel::build_from_parsed(parsed_files.clone());
+
+    // Build flat symbol table from the resolved model
+    let symbol_table = SymbolTable::from_model(&semantic_model);
+
+    // Build the code graph from the resolved model
+    let code_graph = CodeGraph::from_model(&semantic_model);
+
     Ok(ScanResult {
         parsed_files,
+        semantic_model,
+        symbol_table,
+        code_graph,
         adj,
         root_name,
         meta,
@@ -960,7 +985,12 @@ pub fn build_json_report(
     let depths_map: BTreeMap<String, i32> =
         depths.iter().map(|(k, v)| (k.clone(), *v)).collect();
     JsonReport {
-        semantic: if options.semantic { Some(scan.parsed_files.clone()) } else { None },
+        semantic: if options.semantic {
+            Some(scan.parsed_files.iter().map(|f| f.to_output()).collect())
+        } else { None },
+        semantic_model: if options.semantic { Some(scan.semantic_model.clone()) } else { None },
+        code_graph: if options.semantic { Some(scan.code_graph.clone()) } else { None },
+        symbol_table: if options.semantic { Some(scan.symbol_table.clone()) } else { None },
         schema_version: SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: options.root.display().to_string(),
@@ -972,7 +1002,7 @@ pub fn build_json_report(
             max_nodes: cap_or_none(options.max_nodes),
             include_files: options.include_files,
             tree_mode: options.tree_mode,
-                semantic: options.semantic,
+            semantic: options.semantic,
         },
         stats: scan.stats.clone(),
         truncated: scan.truncated,
@@ -1254,6 +1284,375 @@ mod tests {
         let result = build_graph(&opts).unwrap();
         assert!(result.truncated);
         assert!(result.stats.total_nodes <= 10);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // Semantic engine integration test
+    // =====================================================================
+
+    #[test]
+    fn semantic_engine_extracts_symbols_across_languages() {
+        // Create a temp directory with source files in multiple languages
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_sem_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Rust file: defines a struct, impl, function, and calls println
+        fs::write(tmp.join("main.rs"), r#"
+use std::fmt;
+
+pub struct MyService {
+    name: String,
+}
+
+impl MyService {
+    pub fn new(name: &str) -> Self {
+        MyService { name: name.to_string() }
+    }
+
+    pub fn run(&self) {
+        println!("Running {}", self.name);
+    }
+}
+
+pub fn create_service() -> MyService {
+    MyService::new("default")
+}
+
+fn main() {
+    let svc = create_service();
+    svc.run();
+}
+"#).unwrap();
+
+        // Python file: defines a class, function, import, decorator
+        fs::write(tmp.join("app.py"), r#"
+import os
+from typing import Optional
+
+def my_decorator(func):
+    return func
+
+@my_decorator
+class App:
+    def __init__(self):
+        self.value = 42
+
+    def start(self):
+        print("started")
+
+def create_app() -> App:
+    return App()
+
+if __name__ == "__main__":
+    app = create_app()
+    app.start()
+"#).unwrap();
+
+        // TypeScript file: defines a class, interface, heritage
+        fs::write(tmp.join("service.ts"), r#"
+import { EventEmitter } from 'events';
+
+interface Runnable {
+    run(): void;
+}
+
+class BaseService {
+    protected name: string;
+    constructor(name: string) {
+        this.name = name;
+    }
+}
+
+class WorkerService extends BaseService implements Runnable {
+    run() {
+        console.log(`Running ${this.name}`);
+    }
+}
+
+function createWorker(): WorkerService {
+    return new WorkerService("worker");
+}
+
+const w = createWorker();
+w.run();
+"#).unwrap();
+
+        // Go file: defines struct, interface, function
+        fs::write(tmp.join("server.go"), r#"
+package main
+
+import "fmt"
+
+type Server interface {
+    Start() error
+}
+
+type HttpServer struct {
+    addr string
+}
+
+func (s *HttpServer) Start() error {
+    fmt.Println("Starting server on", s.addr)
+    return nil
+}
+
+func NewServer(addr string) *HttpServer {
+    return &HttpServer{addr: addr}
+}
+
+func main() {
+    s := NewServer(":8080")
+    s.Start()
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 10000,
+            include_files: true,
+            threads: 2,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // ---- Verify parsed files ----
+        assert!(result.parsed_files.len() >= 4, "Expected at least 4 parsed files, got {}", result.parsed_files.len());
+
+        // ---- Verify Rust symbols ----
+        let rust_file = result.parsed_files.iter().find(|f| f.path.ends_with("main.rs")).expect("main.rs not found");
+        let rust_names: Vec<&str> = rust_file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(rust_names.contains(&"MyService"), "Rust: MyService not found. Symbols: {:?}", rust_names);
+        assert!(rust_names.contains(&"new"), "Rust: new not found. Symbols: {:?}", rust_names);
+        assert!(rust_names.contains(&"run"), "Rust: run not found. Symbols: {:?}", rust_names);
+        assert!(rust_names.contains(&"create_service"), "Rust: create_service not found. Symbols: {:?}", rust_names);
+        assert!(rust_names.contains(&"main"), "Rust: main not found. Symbols: {:?}", rust_names);
+
+        // ---- Verify Python symbols ----
+        let py_file = result.parsed_files.iter().find(|f| f.path.ends_with("app.py")).expect("app.py not found");
+        let py_names: Vec<&str> = py_file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(py_names.contains(&"my_decorator"), "Python: my_decorator not found. Symbols: {:?}", py_names);
+        assert!(py_names.contains(&"App"), "Python: App not found. Symbols: {:?}", py_names);
+        assert!(py_names.contains(&"create_app"), "Python: create_app not found. Symbols: {:?}", py_names);
+
+        // ---- Verify TypeScript symbols ----
+        let ts_file = result.parsed_files.iter().find(|f| f.path.ends_with("service.ts")).expect("service.ts not found");
+        let ts_names: Vec<&str> = ts_file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(ts_names.contains(&"Runnable"), "TS: Runnable not found. Symbols: {:?}", ts_names);
+        assert!(ts_names.contains(&"BaseService"), "TS: BaseService not found. Symbols: {:?}", ts_names);
+        assert!(ts_names.contains(&"WorkerService"), "TS: WorkerService not found. Symbols: {:?}", ts_names);
+        assert!(ts_names.contains(&"createWorker"), "TS: createWorker not found. Symbols: {:?}", ts_names);
+
+        // ---- Verify Go symbols ----
+        let go_file = result.parsed_files.iter().find(|f| f.path.ends_with("server.go")).expect("server.go not found");
+        let go_names: Vec<&str> = go_file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(go_names.contains(&"Server"), "Go: Server not found. Symbols: {:?}", go_names);
+        assert!(go_names.contains(&"HttpServer"), "Go: HttpServer not found. Symbols: {:?}", go_names);
+        assert!(go_names.contains(&"Start"), "Go: Start not found. Symbols: {:?}", go_names);
+        assert!(go_names.contains(&"NewServer"), "Go: NewServer not found. Symbols: {:?}", go_names);
+
+        // ---- Verify symbol table ----
+        let st = &result.symbol_table;
+        assert!(st.resolve("MyService").is_some(), "SymbolTable: MyService not found");
+        assert!(st.resolve("App").is_some(), "SymbolTable: App not found");
+        assert!(st.resolve("WorkerService").is_some(), "SymbolTable: WorkerService not found");
+        assert!(st.resolve("HttpServer").is_some(), "SymbolTable: HttpServer not found");
+        assert!(st.resolve("NewServer").is_some(), "SymbolTable: NewServer not found");
+
+        // ---- Verify semantic model ----
+        let model = &result.semantic_model;
+        assert!(model.total_files >= 4, "SemanticModel: expected >=4 files, got {}", model.total_files);
+        assert!(model.total_symbols > 0, "SemanticModel: no symbols indexed");
+        assert!(model.total_calls > 0, "SemanticModel: no calls found");
+
+        // Verify same-file resolution in semantic model
+        let sm_rust = result.semantic_model.files.values().find(|f| f.path.ends_with("main.rs")).expect("main.rs not in semantic model");
+        let create_service_call = sm_rust.calls.iter().find(|c| c.callee_name == "create_service");
+        if let Some(call) = create_service_call {
+            assert_eq!(call.confidence, crate::semantic::Confidence::ExactLocal,
+                "create_service() call should be ExactLocal, got {:?}", call.confidence);
+        }
+
+        // Verify TypeScript heritage resolution in semantic model
+        let sm_ts = result.semantic_model.files.values().find(|f| f.path.ends_with("service.ts")).expect("service.ts not in semantic model");
+        assert!(!sm_ts.heritage.is_empty(), "TS: no heritage found in semantic model");
+        let extends = sm_ts.heritage.iter().find(|h| h.target_name == "BaseService");
+        assert!(extends.is_some(), "TS: extends BaseService heritage not found");
+
+        // ---- Verify code graph ----
+        let graph = &result.code_graph;
+        assert!(!graph.nodes.is_empty(), "CodeGraph: no nodes");
+        assert!(!graph.edges.is_empty(), "CodeGraph: no edges");
+
+        // Verify file nodes exist
+        let file_nodes: Vec<_> = graph.nodes.iter().filter(|n| n.node_type == "file").collect();
+        assert!(file_nodes.len() >= 4, "CodeGraph: expected >=4 file nodes, got {}", file_nodes.len());
+
+        // Verify symbol nodes exist
+        let sym_nodes: Vec<_> = graph.nodes.iter().filter(|n| n.node_type == "symbol").collect();
+        assert!(sym_nodes.len() > 0, "CodeGraph: no symbol nodes");
+
+        // Verify defines edges exist
+        let defines_edges: Vec<_> = graph.edges.iter().filter(|e| e.edge_type == "defines").collect();
+        assert!(!defines_edges.is_empty(), "CodeGraph: no defines edges");
+
+        // Verify resolution edges exist (calls → symbols)
+        let resolves_edges: Vec<_> = graph.edges.iter().filter(|e| e.edge_type == "resolves_to").collect();
+        assert!(!resolves_edges.is_empty(), "CodeGraph: no resolves_to edges");
+
+        // Verify confidence scores on edges
+        let high_conf: Vec<_> = resolves_edges.iter().filter(|e| e.confidence >= 0.9).collect();
+        assert!(!high_conf.is_empty(), "CodeGraph: no high-confidence resolution edges");
+
+        // ---- Verify JSON roundtrip ----
+        let depths = compute_depths(&result.adj, &result.root_name);
+        let report = build_json_report(&result, &opts, &depths, None, 1.0);
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("deserialize");
+
+        // Verify semantic array in JSON
+        let semantic = parsed["semantic"].as_array().expect("semantic array");
+        assert!(semantic.len() >= 4, "JSON: expected >=4 semantic entries");
+
+        // Verify code_graph in JSON
+        let cg = parsed["code_graph"].as_object().expect("code_graph object");
+        assert!(cg["nodes"].as_array().unwrap().len() > 0, "JSON: code_graph has no nodes");
+        assert!(cg["edges"].as_array().unwrap().len() > 0, "JSON: code_graph has no edges");
+
+        // Verify semantic_model in JSON
+        let sm = parsed["semantic_model"].as_object().expect("semantic_model object");
+        assert!(sm["total_symbols"].as_u64().unwrap() > 0, "JSON: semantic_model has no symbols");
+
+        // Verify symbol_table in JSON
+        let st_json = parsed["symbol_table"].as_object().expect("symbol_table object");
+        assert!(st_json["definitions"].as_object().unwrap().len() > 0, "JSON: symbol_table has no definitions");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn semantic_engine_cross_file_resolution() {
+        // Test that calls in one file resolve to definitions in another
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_cross_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // File 1: defines a function
+        fs::write(tmp.join("lib.rs"), r#"
+pub fn helper() -> i32 { 42 }
+pub fn process(x: i32) -> i32 { x * 2 }
+"#).unwrap();
+
+        // File 2: calls the function from file 1
+        fs::write(tmp.join("main.rs"), r#"
+fn main() {
+    let result = helper();
+    let processed = process(result);
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // The main.rs file should have calls to helper and process (check parsed_files for extraction)
+        let main_file = result.parsed_files.iter().find(|f| f.path.ends_with("main.rs")).expect("main.rs not found");
+        let main_call_names: Vec<&str> = main_file.calls.iter().map(|c| c.callee_name.as_str()).collect();
+        assert!(main_call_names.contains(&"helper"), "main.rs should call helper, got {:?}", main_call_names);
+        assert!(main_call_names.contains(&"process"), "main.rs should call process, got {:?}", main_call_names);
+
+        // Check resolution in the semantic model's copy of the file
+        let sm_main = result.semantic_model.files.values().find(|f| f.path.ends_with("main.rs")).expect("main.rs not in semantic model");
+        let resolved_count = sm_main.calls.iter()
+            .filter(|c| c.confidence != crate::semantic::Confidence::Unresolved)
+            .count();
+        assert!(resolved_count > 0, "Expected some resolved calls in semantic model, got 0 out of {}", sm_main.calls.len());
+
+        // Verify the semantic model has both files
+        assert!(result.semantic_model.total_files >= 2);
+
+        // Verify the symbol table has both helper and process
+        assert!(result.symbol_table.resolve("helper").is_some());
+        assert!(result.symbol_table.resolve("process").is_some());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn semantic_engine_confidence_scoring() {
+        // Verify that confidence scores are properly assigned
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_conf_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("test.py"), r#"
+class MyClass:
+    def method(self):
+        pass
+
+def my_func():
+    obj = MyClass()
+    obj.method()  # receiver heuristic
+    my_func()     # same-file exact
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 100,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("test.py")).expect("test.py not found");
+
+        // Verify symbols were extracted
+        let names: Vec<&str> = file.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"), "MyClass not found in {:?}", names);
+        assert!(names.contains(&"my_func"), "my_func not found in {:?}", names);
+
+        // Check resolution in the semantic model's copy
+        let sm_file = result.semantic_model.files.values().find(|f| f.path.ends_with("test.py")).expect("test.py not in semantic model");
+        let my_func_call = sm_file.calls.iter().find(|c| c.callee_name == "my_func");
+        assert!(my_func_call.is_some(), "my_func() call not found in semantic model");
+        assert_eq!(my_func_call.unwrap().confidence, crate::semantic::Confidence::ExactLocal,
+            "my_func() should be ExactLocal, got {:?}", my_func_call.unwrap().confidence);
+
+        // Verify stats
+        assert!(result.semantic_model.total_resolved > 0, "Should have resolved calls");
+        assert!(result.semantic_model.total_symbols >= 2, "Should have at least 2 symbols");
+
         fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -2,6 +2,194 @@ use serde::{Serialize, Deserialize};
 use crate::lang::{LanguageId, CaptureTag};
 use crate::syntax::RawCapture;
 
+// =====================================================================
+// Confidence-scored inference tiers
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Confidence {
+    ExactLocal,       // direct local symbol in same scope
+    ExactImport,      // resolved via explicit import
+    ExactExport,      // resolved via re-export chain
+    AnnotationInferred, // from type annotation (e.g., `x: Foo`)
+    ConstructorInferred, // from `new Foo()` or `Foo()`
+    ReceiverHeuristic, // `self.method()` / `this.method()` receiver chain
+    GlobalFallback,   // matched by name across all indexed symbols
+    Ambiguous,        // multiple candidates, can't disambiguate
+    Unresolved,       // no candidate found
+}
+
+impl Confidence {
+    pub fn score(&self) -> f64 {
+        match self {
+            Confidence::ExactLocal => 1.0,
+            Confidence::ExactImport => 0.95,
+            Confidence::ExactExport => 0.95,
+            Confidence::AnnotationInferred => 0.85,
+            Confidence::ConstructorInferred => 0.80,
+            Confidence::ReceiverHeuristic => 0.70,
+            Confidence::GlobalFallback => 0.45,
+            Confidence::Ambiguous => 0.30,
+            Confidence::Unresolved => 0.0,
+        }
+    }
+}
+
+// =====================================================================
+// Symbol IR
+// =====================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Symbol {
+    pub id: u64,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: CaptureTag,
+    pub file_id: u64,
+    pub scope_id: Option<u64>,
+    pub owner_id: Option<u64>,
+    pub line: usize,
+    pub col: usize,
+    pub is_exported: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Scope {
+    pub id: u64,
+    pub file_id: u64,
+    pub parent_id: Option<u64>,
+    pub owner_symbol_id: Option<u64>,
+    pub kind: ScopeKind,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeKind {
+    Module,
+    Function,
+    Class,
+    Interface,
+    Struct,
+    Enum,
+    Trait,
+    Impl,
+    Block,
+    Namespace,
+    Method,
+    Constructor,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Import {
+    pub file_id: u64,
+    pub source: String,       // raw import path
+    pub imported_name: String, // the name being imported
+    pub local_name: String,    // local alias (may == imported_name)
+    pub resolved_file_id: Option<u64>,
+    pub confidence: Confidence,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Export {
+    pub file_id: u64,
+    pub exported_name: String,
+    pub symbol_id: u64,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Reference {
+    pub file_id: u64,
+    pub scope_id: Option<u64>,
+    pub name: String,
+    pub resolved_symbol_id: Option<u64>,
+    pub confidence: Confidence,
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Call {
+    pub file_id: u64,
+    pub caller_scope_id: Option<u64>,
+    pub callee_name: String,
+    pub receiver: Option<String>, // e.g., "self", "this", or inferred type
+    pub resolved_symbol_id: Option<u64>,
+    pub confidence: Confidence,
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Heritage {
+    pub file_id: u64,
+    pub class_name: String,
+    pub heritage_kind: HeritageKind,
+    pub target_name: String,
+    pub resolved_symbol_id: Option<u64>,
+    pub confidence: Confidence,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeritageKind {
+    Extends,
+    Implements,
+    UsesTrait,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Assignment {
+    pub file_id: u64,
+    pub name: String,
+    pub receiver: Option<String>,
+    pub line: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Decorator {
+    pub file_id: u64,
+    pub name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HttpClient {
+    pub file_id: u64,
+    pub name: String,
+    pub url: Option<String>,
+    pub line: usize,
+}
+
+// =====================================================================
+// ParsedFile IR — the intermediate representation per file
+// =====================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ParsedFile {
+    pub id: u64,
+    pub path: String,
+    pub language: LanguageId,
+    pub hash: u64,
+    pub symbols: Vec<Symbol>,
+    pub scopes: Vec<Scope>,
+    pub imports: Vec<Import>,
+    pub exports: Vec<Export>,
+    pub references: Vec<Reference>,
+    pub calls: Vec<Call>,
+    pub heritage: Vec<Heritage>,
+    pub assignments: Vec<Assignment>,
+    pub decorators: Vec<Decorator>,
+    pub http_clients: Vec<HttpClient>,
+}
+
+// =====================================================================
+// Legacy flat types for JSON output compatibility
+// =====================================================================
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Def {
     pub name: String,
@@ -10,68 +198,259 @@ pub struct Def {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Call {
+pub struct CallSite {
     pub name: String,
     pub line: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ParsedFile {
+pub struct HeritageRef {
+    pub tag: CaptureTag,
+    pub name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssignmentRef {
+    pub name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DecoratorRef {
+    pub name: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HttpClientRef {
+    pub name: String,
+    pub line: usize,
+}
+
+/// Flat representation for JSON output (backward-compatible with schema v2)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ParsedFileOutput {
     pub path: String,
     pub language: LanguageId,
     pub defs: Vec<Def>,
-    pub calls: Vec<Call>,
+    pub calls: Vec<CallSite>,
     pub imports: Vec<String>,
+    pub heritage: Vec<HeritageRef>,
+    pub assignments: Vec<AssignmentRef>,
+    pub decorators: Vec<DecoratorRef>,
+    pub http_clients: Vec<HttpClientRef>,
 }
 
+// =====================================================================
+// Raw capture → ParsedFile IR (first pass, no resolution yet)
+// =====================================================================
+
 impl ParsedFile {
-    pub fn from_captures(path: &str, lang: LanguageId, captures: Vec<RawCapture>) -> Self {
-        let mut defs = Vec::new();
-        let mut calls = Vec::new();
+    pub fn from_captures(id: u64, path: &str, lang: LanguageId, hash: u64, captures: Vec<RawCapture>) -> Self {
+        let mut symbols = Vec::new();
+        let scopes = Vec::new();
         let mut imports = Vec::new();
-        let mut seen_defs = std::collections::HashSet::<(String, u32)>::new();
-        let mut seen_calls = std::collections::HashSet::<(String, u32)>::new();
+        let exports = Vec::new();
+        let references = Vec::new();
+        let mut calls = Vec::new();
+        let mut heritage = Vec::new();
+        let mut assignments = Vec::new();
+        let mut decorators = Vec::new();
+        let mut http_clients = Vec::new();
+
+        let mut seen_symbols = std::collections::HashSet::<(String, usize)>::new();
+        let mut seen_calls = std::collections::HashSet::<(String, usize)>::new();
         let mut seen_imports = std::collections::HashSet::<String>::new();
+        let mut seen_heritage = std::collections::HashSet::<(String, usize)>::new();
+        let mut seen_assignments = std::collections::HashSet::<(String, usize)>::new();
+        let mut seen_decorators = std::collections::HashSet::<(String, usize)>::new();
+        let mut seen_http = std::collections::HashSet::<(String, usize)>::new();
 
         for c in captures {
+            let line = c.range.start_point.row;
+            let col = c.range.start_point.column;
             match c.tag {
-                CaptureTag::DefinitionClass | CaptureTag::DefinitionFunction | CaptureTag::DefinitionMethod => {
-                    let line = c.range.start_point.row as u32;
+                CaptureTag::DefinitionClass
+                | CaptureTag::DefinitionFunction
+                | CaptureTag::DefinitionMethod
+                | CaptureTag::DefinitionInterface
+                | CaptureTag::DefinitionEnum
+                | CaptureTag::DefinitionStruct
+                | CaptureTag::DefinitionTrait
+                | CaptureTag::DefinitionProperty
+                | CaptureTag::DefinitionVariable
+                | CaptureTag::DefinitionConst
+                | CaptureTag::DefinitionModule
+                | CaptureTag::DefinitionMacro
+                | CaptureTag::DefinitionNamespace
+                | CaptureTag::DefinitionConstructor
+                | CaptureTag::DefinitionType
+                | CaptureTag::DefinitionTypedef
+                | CaptureTag::DefinitionUnion
+                | CaptureTag::DefinitionTemplate
+                | CaptureTag::DefinitionAnnotation
+                | CaptureTag::DefinitionStatic
+                | CaptureTag::DefinitionImpl
+                | CaptureTag::DefinitionRecord
+                | CaptureTag::DefinitionDelegate => {
                     let key = (c.name.clone(), line);
-                    if seen_defs.insert(key) {
-                        defs.push(Def {
-                            name: c.name,
-                            tag: c.tag,
-                            line: c.range.start_point.row,
+                    if seen_symbols.insert(key) {
+                        symbols.push(Symbol {
+                            id: 0, // assigned by SemanticModel
+                            name: c.name.clone(),
+                            qualified_name: c.name.clone(),
+                            kind: c.tag,
+                            file_id: id,
+                            scope_id: None,
+                            owner_id: None,
+                            line,
+                            col,
+                            is_exported: false,
                         });
                     }
-                },
+                }
                 CaptureTag::CallName => {
-                    let line = c.range.start_point.row as u32;
                     let key = (c.name.clone(), line);
                     if seen_calls.insert(key) {
                         calls.push(Call {
-                            name: c.name,
-                            line: c.range.start_point.row,
+                            file_id: id,
+                            caller_scope_id: None,
+                            callee_name: c.name,
+                            receiver: None,
+                            resolved_symbol_id: None,
+                            confidence: Confidence::Unresolved,
+                            line,
+                            col,
                         });
                     }
-                },
+                }
                 CaptureTag::ImportSource => {
-                    let cleaned = c.name.trim_matches(|c| c == '\'' || c == '\"').to_string();
+                    let cleaned = c.name.trim_matches(|ch| ch == '\'' || ch == '"').to_string();
                     if seen_imports.insert(cleaned.clone()) {
-                        imports.push(cleaned);
+                        imports.push(Import {
+                            file_id: id,
+                            source: cleaned.clone(),
+                            imported_name: cleaned.clone(),
+                            local_name: cleaned.clone(),
+                            resolved_file_id: None,
+                            confidence: Confidence::Unresolved,
+                        });
                     }
-                },
-                _ => {}
+                }
+                CaptureTag::HeritageExtends
+                | CaptureTag::HeritageImplements
+                | CaptureTag::HeritageTrait => {
+                    let key = (c.name.clone(), line);
+                    if seen_heritage.insert(key) {
+                        let hkind = match c.tag {
+                            CaptureTag::HeritageExtends => HeritageKind::Extends,
+                            CaptureTag::HeritageImplements => HeritageKind::Implements,
+                            CaptureTag::HeritageTrait => HeritageKind::UsesTrait,
+                            _ => HeritageKind::Unknown,
+                        };
+                        heritage.push(Heritage {
+                            file_id: id,
+                            class_name: String::new(), // filled by resolver
+                            heritage_kind: hkind,
+                            target_name: c.name,
+                            resolved_symbol_id: None,
+                            confidence: Confidence::Unresolved,
+                            line,
+                        });
+                    }
+                }
+                CaptureTag::Assignment => {
+                    let key = (c.name.clone(), line);
+                    if seen_assignments.insert(key) {
+                        assignments.push(Assignment {
+                            file_id: id,
+                            name: c.name,
+                            receiver: None,
+                            line,
+                        });
+                    }
+                }
+                CaptureTag::Decorator => {
+                    let key = (c.name.clone(), line);
+                    if seen_decorators.insert(key) {
+                        decorators.push(Decorator {
+                            file_id: id,
+                            name: c.name,
+                            line,
+                        });
+                    }
+                }
+                CaptureTag::HttpClient => {
+                    let key = (c.name.clone(), line);
+                    if seen_http.insert(key) {
+                        http_clients.push(HttpClient {
+                            file_id: id,
+                            name: c.name,
+                            url: None,
+                            line,
+                        });
+                    }
+                }
+                CaptureTag::Unknown | CaptureTag::CallWrapper | CaptureTag::ImportWrapper | CaptureTag::HeritageWrapper => {}
             }
         }
 
         Self {
+            id,
             path: path.to_string(),
             language: lang,
-            defs,
-            calls,
+            hash,
+            symbols,
+            scopes,
             imports,
+            exports,
+            references,
+            calls,
+            heritage,
+            assignments,
+            decorators,
+            http_clients,
+        }
+    }
+
+    /// Convert to flat output format for JSON serialization
+    pub fn to_output(&self) -> ParsedFileOutput {
+        ParsedFileOutput {
+            path: self.path.clone(),
+            language: self.language,
+            defs: self.symbols.iter().map(|s| Def {
+                name: s.name.clone(),
+                tag: s.kind,
+                line: s.line,
+            }).collect(),
+            calls: self.calls.iter().map(|c| CallSite {
+                name: c.callee_name.clone(),
+                line: c.line,
+            }).collect(),
+            imports: self.imports.iter().map(|i| i.source.clone()).collect(),
+            heritage: self.heritage.iter().map(|h| HeritageRef {
+                tag: match h.heritage_kind {
+                    HeritageKind::Extends => CaptureTag::HeritageExtends,
+                    HeritageKind::Implements => CaptureTag::HeritageImplements,
+                    HeritageKind::UsesTrait => CaptureTag::HeritageTrait,
+                    HeritageKind::Unknown => CaptureTag::Unknown,
+                },
+                name: h.target_name.clone(),
+                line: h.line,
+            }).collect(),
+            assignments: self.assignments.iter().map(|a| AssignmentRef {
+                name: a.name.clone(),
+                line: a.line,
+            }).collect(),
+            decorators: self.decorators.iter().map(|d| DecoratorRef {
+                name: d.name.clone(),
+                line: d.line,
+            }).collect(),
+            http_clients: self.http_clients.iter().map(|h| HttpClientRef {
+                name: h.name.clone(),
+                line: h.line,
+            }).collect(),
         }
     }
 }
