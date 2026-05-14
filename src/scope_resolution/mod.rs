@@ -391,5 +391,6 @@ pub struct ScopeResolutionStats {
     pub files_skipped: usize,
     pub imports_emitted: usize,
     pub reference_edges_emitted: usize,
+    pub resolved_sites: usize,
     pub unresolved_sites: usize,
 }

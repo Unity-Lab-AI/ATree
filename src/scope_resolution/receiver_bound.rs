@@ -33,6 +33,7 @@ pub fn emit_receiver_bound_calls(
     node_lookup: &GraphNodeLookup,
     provider: &ReceiverBoundProvider,
     workspace_index: &WorkspaceResolutionIndex,
+    resolved_sites: &mut rustc_hash::FxHashSet<String>,
 ) -> usize {
     let mut emitted = 0;
     let mut seen = FxHashSet::default();
@@ -55,7 +56,7 @@ pub fn emit_receiver_bound_calls(
             None => continue,
         };
 
-        let _site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+        let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
 
         // ── super branch ─────────────────────────────────────────
         if (provider.is_super_receiver)(receiver_name) {
@@ -67,7 +68,8 @@ pub fn emit_receiver_bound_calls(
                                 edges, indexes, node_lookup, site, member,
                                 "global", &mut seen, 0.85, provider.collapse_member_calls,
                             );
-                            if ok { emitted += 1; }
+                                let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+                            if ok { emitted += 1; resolved_sites.insert(site_key); }
                             break;
                         }
                     }
@@ -91,7 +93,8 @@ pub fn emit_receiver_bound_calls(
                             edges, indexes, node_lookup, site, member,
                             "global", &mut seen, 0.85, provider.collapse_member_calls,
                         );
-                        if ok { emitted += 1; }
+                                let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+                        if ok { emitted += 1; resolved_sites.insert(site_key); }
                         break;
                     }
                 }
@@ -121,7 +124,8 @@ pub fn emit_receiver_bound_calls(
                         edges, indexes, node_lookup, site, member,
                         reason, &mut seen, conf, provider.collapse_member_calls,
                     );
-                    if ok { emitted += 1; }
+                                let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+                    if ok { emitted += 1; resolved_sites.insert(site_key); }
                     break;
                 }
             }
@@ -139,7 +143,8 @@ pub fn emit_receiver_bound_calls(
                                 edges, indexes, node_lookup, site, member,
                                 "global", &mut seen, 0.85, provider.collapse_member_calls,
                             );
-                            if ok { emitted += 1; }
+                                let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+                            if ok { emitted += 1; resolved_sites.insert(site_key); }
                             continue;
                         }
                     }
@@ -169,7 +174,8 @@ pub fn emit_receiver_bound_calls(
                                 edges, indexes, node_lookup, site, member,
                                 reason, &mut seen, conf, provider.collapse_member_calls,
                             );
-                            if ok { emitted += 1; }
+                                let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+                            if ok { emitted += 1; resolved_sites.insert(site_key); }
                             break;
                         }
                     }

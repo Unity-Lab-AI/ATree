@@ -57,6 +57,7 @@ pub fn run_scope_resolution(
     // Phase 7: Emit edges (load-bearing order per Contract Invariant I1)
     let mut edges = Vec::new();
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut resolved_sites: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
 
     // 6c: MRO edges (EXTENDS/IMPLEMENTS) — emitted first so call resolution can use them
     edges.extend(mro_edges);
@@ -76,6 +77,7 @@ pub fn run_scope_resolution(
         &node_lookup,
         &provider,
         &workspace_index,
+        &mut resolved_sites,
     );
     stats.reference_edges_emitted += receiver_emitted;
 
@@ -86,6 +88,7 @@ pub fn run_scope_resolution(
         &reference_sites,
         &node_lookup,
         &workspace_index,
+        &mut resolved_sites,
     );
     stats.reference_edges_emitted += free_emitted;
 
@@ -93,8 +96,10 @@ pub fn run_scope_resolution(
     let import_emitted = graph_bridge::emit_import_edges(&mut edges, &indexes);
     stats.imports_emitted = import_emitted;
 
-    // Count unresolved
-    stats.unresolved_sites = reference_sites.len(); // simplified
+    // Honest stats: count actually resolved vs unresolved reference sites
+    let total_sites = reference_sites.len();
+    stats.resolved_sites = resolved_sites.len().min(total_sites);
+    stats.unresolved_sites = total_sites - stats.resolved_sites;
 
     (stats, edges)
 }
@@ -179,6 +184,32 @@ fn build_indexes(
                     break;
                 }
             }
+        }
+
+        // Also index AST-extracted type bindings (Tier 0: explicit annotations)
+        // These are extracted directly from the AST with full structural context.
+        for tb in &parsed.type_bindings {
+            // Find the innermost scope containing this binding's line
+            let mut best_scope_id = 0u64;
+            let mut best_size = usize::MAX;
+            for scope in &parsed.scopes {
+                if tb.line >= scope.line_start && tb.line <= scope.line_end {
+                    let size = scope.line_end - scope.line_start;
+                    if size < best_size {
+                        best_scope_id = scope.id;
+                        best_size = size;
+                    }
+                }
+            }
+            let type_ref = crate::scope_resolution::TypeRef {
+                raw_name: tb.type_text.clone(),
+                declared_at_scope: best_scope_id,
+            };
+            indexes.type_bindings
+                .entry(best_scope_id)
+                .or_default()
+                .entry(tb.var_name.clone())
+                .or_insert(type_ref);
         }
 
         indexes.parsed_files.push(parsed.clone());

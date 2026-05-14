@@ -20,6 +20,7 @@ pub fn emit_free_call_fallback(
     reference_sites: &[ReferenceSite],
     node_lookup: &GraphNodeLookup,
     _workspace_index: &WorkspaceResolutionIndex,
+    resolved_sites: &mut rustc_hash::FxHashSet<String>,
 ) -> usize {
     let mut emitted = 0;
     let mut seen = FxHashSet::default();
@@ -58,6 +59,8 @@ pub fn emit_free_call_fallback(
         );
         if ok {
             emitted += 1;
+            let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+            resolved_sites.insert(site_key);
         }
         handled_sites.insert(site_key);
     }
