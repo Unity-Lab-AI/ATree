@@ -59,6 +59,7 @@ pub enum CaptureTag {
     CallWrapper,    // @call wrapper capture
     ImportWrapper,  // @import wrapper capture
     HeritageWrapper, // @heritage wrapper capture
+    TypeAnnotation, // @type annotation on a variable/parameter/return
     Unknown,
 }
 
@@ -100,6 +101,7 @@ impl From<&str> for CaptureTag {
             "call" => CaptureTag::CallWrapper,
             "import" => CaptureTag::ImportWrapper,
             "heritage" => CaptureTag::HeritageWrapper,
+            "type.annotation" => CaptureTag::TypeAnnotation,
             _ => CaptureTag::Unknown,
         }
     }

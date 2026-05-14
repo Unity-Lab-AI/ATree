@@ -1,38 +1,45 @@
 {
-  "phase": "semantic-engine-complete",
+  "phase": "semantic-engine-v2",
   "commits": [
-    "e9c905d - scope-resolution pipeline (RFC #909 Ring 3)",
+    "e9c905d - scope-resolution pipeline",
     "bfd6fb1 - wire scope-resolution into build_graph",
     "46f3667 - replace legacy ResolutionEngine",
     "750fcab - parallel parse + community/process/search engines",
-    "cc0c9f3 - call form classification + parallel parse pipeline"
+    "cc0c9f3 - call form classification",
+    "5d18578 - type environment + AST-based route extraction"
   ],
-  "completed": [
-    "8 P1/P2 bugs fixed from PR review",
-    "Two-phase parallel pipeline: scan → parse",
+  "modules": {
+    "core": ["lang/", "syntax/", "semantic/", "parse/"],
+    "resolution": ["resolver/", "scope_resolution/", "type_env/"],
+    "graph": ["store/", "graph/"],
+    "analysis": ["community/", "process/", "routes/"],
+    "search": ["search/"]
+  },
+  "stats": {
+    "source_files": 41,
+    "tests_passing": 79,
+    "tests_failing": 0,
+    "test_time_ms": 68
+  },
+  "done": [
+    "Parallel two-phase pipeline (scan → parse)",
+    "16-language tree-sitter extraction",
     "Call form classification (Free/Member/Constructor/Scoped)",
     "Receiver extraction from AST",
+    "Scope resolution (receiver-bound, free-call, imports, C3 MRO)",
+    "Type environment (self/this/super, scope-aware, nullable stripping)",
+    "Route extraction (Next.js, Express via AST)",
     "Community detection (weighted label propagation)",
     "Process tracing (entry point → BFS call chains)",
     "BM25 + hybrid search (SQLite FTS5)",
     "SQLite graph store with recursive CTEs",
-    "Incremental scanning with hash-based change detection",
-    "AST caching to skip re-parsing unchanged files",
-    "16-language tree-sitter extraction",
-    "Scope resolution (receiver-bound, free-call, imports, C3 MRO)",
-    "Per-language import resolution"
+    "Incremental scanning + AST caching",
+    "8 P1/P2 bugs fixed"
   ],
-  "stats": {
-    "source_files": 39,
-    "total_lines": 11700,
-    "tests_passing": 67,
-    "tests_failing": 0,
-    "test_time_ms": 680
-  },
   "next_up": [
-    "Type environment (type-aware cross-file resolution)",
-    "Route extraction (Express/Next.js/Django/Flask)",
-    "Embedding/semantic search",
-    "Wildcard import synthesis"
+    "Embedding/semantic search (vector similarity)",
+    "Wildcard import synthesis (Go/Ruby/Swift re-exports)",
+    "Flask/Django route detection via tree-sitter queries",
+    "Type annotation extraction from AST"
   ]
 }
