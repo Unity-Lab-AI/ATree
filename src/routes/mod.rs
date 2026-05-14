@@ -76,38 +76,16 @@ pub fn detect_routes_from_path(file_path: &str) -> Vec<Route> {
     routes
 }
 
-/// Tree-sitter query for Express-style route handlers.
-/// Matches: app.METHOD(path, handler) or router.METHOD(path, handler)
-const EXPRESS_ROUTE_QUERY: &str = r#"
-(call_expression
-  function: (member_expression
-    object: (identifier) @obj
-    property: (property_identifier) @method)
-  arguments: (arguments
-    (string) @path
-    (_)? @handler))
-"#;
-
-/// Tree-sitter query for Flask/FastAPI decorators.
-/// Matches: @app.route('/path') or @app.get('/path')
-const FLASK_DECORATOR_QUERY: &str = r#"
-(decorator
-  (call
-    function: (attribute
-      object: (identifier) @_app
-      property: (identifier) @method)
-    arguments: (argument_list
-      (string) @path)))
-"#;
-
-/// Detect Express routes from AST captures.
-/// We look for call_expression nodes where:
-/// - The function is a member_expression (obj.method)
-/// - The object is "app" or "router"
-/// - The method is an HTTP verb
-/// - The first argument is a string literal (the path)
+/// Detect Express/Node.js routes by walking the tree-sitter AST.
+/// Handles: app.METHOD(path, handler), router.METHOD(path, handler)
+/// where METHOD is an HTTP verb and path is a string literal.
+///
+/// This walks the AST directly instead of using tree-sitter queries,
+/// giving us access to the full call expression structure including
+/// the path string argument.
 pub fn detect_express_routes_from_ast(
-    captures: &[crate::syntax::RawCapture],
+    tree: &tree_sitter::Tree,
+    content: &str,
     file_path: &str,
 ) -> Vec<Route> {
     let mut routes = Vec::new();
@@ -116,53 +94,145 @@ pub fn detect_express_routes_from_ast(
         "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ALL",
     ];
 
-    // Group captures by their match index (approximate by byte range)
-    // For each call_expression that looks like app.METHOD(path, ...):
-    for capture in captures {
-        if capture.tag != crate::lang::CaptureTag::CallName {
-            continue;
-        }
+    walk_node_for_routes(tree.root_node(), content, file_path, &http_methods, &mut routes);
+    routes
+}
 
-        let method = &capture.name;
-        if !http_methods.contains(&method.as_str()) {
-            continue;
+fn walk_node_for_routes<'a>(
+    node: tree_sitter::Node<'a>,
+    content: &str,
+    file_path: &str,
+    http_methods: &[&str],
+    routes: &mut Vec<Route>,
+) {
+    // Look for call_expression nodes
+    if node.kind() == "call_expression" {
+        if let Some(route) = parse_express_route_call(node, content, file_path, http_methods) {
+            routes.push(route);
         }
-
-        // Check if the call has a receiver (member call like app.get)
-        if capture.receiver.is_none() {
-            continue;
-        }
-
-        let receiver = capture.receiver.as_ref().unwrap();
-        if receiver != "app" && receiver != "router" {
-            continue;
-        }
-
-        // This looks like an Express route handler
-        // The path would be the next string argument — we'd need the full AST
-        // For now, mark it as detected with unknown path
-        routes.push(Route {
-            method: method.to_uppercase(),
-            path: String::new(), // Would need AST walk to extract path arg
-            file_path: file_path.to_string(),
-            framework: "express".to_string(),
-            line: capture.range.start_point.row,
-        });
     }
+
+    // Recurse into children
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            walk_node_for_routes(cursor.node(), content, file_path, http_methods, routes);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn parse_express_route_call(
+    call_node: tree_sitter::Node,
+    content: &str,
+    file_path: &str,
+    http_methods: &[&str],
+) -> Option<Route> {
+    // The function must be a member_expression: app.METHOD or router.METHOD
+    let func = call_node.child_by_field_name("function")?;
+    if func.kind() != "member_expression" {
+        return None;
+    }
+
+    // Extract the object (app/router) and method (get/post/etc.)
+    let obj = func.child_by_field_name("object")?;
+    let obj_text = &content[obj.start_byte()..obj.end_byte()];
+    if obj_text != "app" && obj_text != "router" {
+        return None;
+    }
+
+    let method_node = func.child_by_field_name("property")?;
+    let method_text = &content[method_node.start_byte()..method_node.end_byte()];
+    if !http_methods.contains(&method_text) {
+        return None;
+    }
+
+    // Extract the path from the first string argument
+    let args = call_node.child_by_field_name("arguments")?;
+    let path = extract_first_string_arg(args, content)?;
+
+    Some(Route {
+        method: method_text.to_uppercase(),
+        path,
+        file_path: file_path.to_string(),
+        framework: "express".to_string(),
+        line: call_node.start_position().row,
+    })
+}
+
+/// Extract the string value from the first string argument node.
+fn extract_first_string_arg(args_node: tree_sitter::Node, content: &str) -> Option<String> {
+    let mut cursor = args_node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            // String literals can be "string" (JS/TS) or "string_content" inside "string"
+            if node.kind() == "string" || node.kind() == "string_content" {
+                let text = &content[node.start_byte()..node.end_byte()];
+                // Strip quotes
+                let cleaned = text.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+                return Some(cleaned.to_string());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Detect all routes from a file (path-based + AST-based).
+/// Takes the tree-sitter tree for AST-based detection.
+pub fn detect_routes_with_tree(
+    file_path: &str,
+    tree: &tree_sitter::Tree,
+    content: &str,
+) -> Vec<Route> {
+    let mut routes = detect_routes_from_path(file_path);
+
+    // Also try AST-based detection (Express)
+    routes.extend(detect_express_routes_from_ast(tree, content, file_path));
 
     routes
 }
 
-/// Detect all routes from a file (path-based + AST-based).
+/// Legacy: detect routes from captures only (no path extraction).
+/// Keeps backward compatibility with existing tests.
 pub fn detect_routes(
     file_path: &str,
     captures: &[crate::syntax::RawCapture],
 ) -> Vec<Route> {
     let mut routes = detect_routes_from_path(file_path);
 
-    // If no path-based routes found, try AST-based detection
+    // If no path-based routes found, try AST-based detection from captures
+    // (limited: can detect method but not path)
     if routes.is_empty() {
-        routes.extend(detect_express_routes_from_ast(captures, file_path));
+        let http_methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "all",
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ALL",
+        ];
+        for capture in captures {
+            if capture.tag != crate::lang::CaptureTag::CallName {
+                continue;
+            }
+            let method = &capture.name;
+            if !http_methods.contains(&method.as_str()) {
+                continue;
+            }
+            if let Some(ref receiver) = capture.receiver {
+                if receiver == "app" || receiver == "router" {
+                    routes.push(Route {
+                        method: method.to_uppercase(),
+                        path: String::new(), // Can't extract path from captures alone
+                        file_path: file_path.to_string(),
+                        framework: "express".to_string(),
+                        line: capture.range.start_point.row,
+                    });
+                }
+            }
+        }
     }
 
     routes
@@ -210,65 +280,59 @@ mod tests {
 
     #[test]
     fn test_express_ast_detection() {
-        // Simulate AST captures from tree-sitter
-        use crate::syntax::{RawCapture, CallForm};
-        use crate::lang::CaptureTag;
+        // Test with real tree-sitter parsing
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()).unwrap();
 
-        let captures = vec![
-            RawCapture {
-                tag: CaptureTag::CallName,
-                name: "get".to_string(),
-                range: tree_sitter::Range {
-                    start_byte: 0,
-                    end_byte: 3,
-                    start_point: tree_sitter::Point { row: 1, column: 4 },
-                    end_point: tree_sitter::Point { row: 1, column: 7 },
-                },
-                call_form: CallForm::Member,
-                receiver: Some("app".to_string()),
-            },
-            RawCapture {
-                tag: CaptureTag::CallName,
-                name: "post".to_string(),
-                range: tree_sitter::Range {
-                    start_byte: 50,
-                    end_byte: 54,
-                    start_point: tree_sitter::Point { row: 5, column: 4 },
-                    end_point: tree_sitter::Point { row: 5, column: 8 },
-                },
-                call_form: CallForm::Member,
-                receiver: Some("app".to_string()),
-            },
-        ];
+        let code = r#"
+import express from 'express';
+const app = express();
+const router = express.Router();
 
-        let routes = detect_express_routes_from_ast(&captures, "src/routes.ts");
-        assert_eq!(routes.len(), 2);
+app.get('/users', (req, res) => {});
+app.post('/users', (req, res) => {});
+app.get('/users/:id', (req, res) => {});
+router.put('/users/:id', (req, res) => {});
+app.delete('/users/:id', handler);
+"#;
+
+        let tree = parser.parse(code, None).unwrap();
+        let routes = detect_express_routes_from_ast(&tree, code, "src/routes.ts");
+
+        assert_eq!(routes.len(), 5, "Should find 5 Express routes");
+
         assert_eq!(routes[0].method, "GET");
+        assert_eq!(routes[0].path, "/users");
         assert_eq!(routes[0].framework, "express");
+
         assert_eq!(routes[1].method, "POST");
+        assert_eq!(routes[1].path, "/users");
+
+        assert_eq!(routes[2].method, "GET");
+        assert_eq!(routes[2].path, "/users/:id");
+
+        assert_eq!(routes[3].method, "PUT");
+        assert_eq!(routes[3].path, "/users/:id");
+        assert_eq!(routes[3].framework, "express");
+
+        assert_eq!(routes[4].method, "DELETE");
+        assert_eq!(routes[4].path, "/users/:id");
     }
 
     #[test]
     fn test_express_non_app_call_ignored() {
-        use crate::syntax::{RawCapture, CallForm};
-        use crate::lang::CaptureTag;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()).unwrap();
 
-        let captures = vec![
-            RawCapture {
-                tag: CaptureTag::CallName,
-                name: "get".to_string(),
-                range: tree_sitter::Range {
-                    start_byte: 0,
-                    end_byte: 3,
-                    start_point: tree_sitter::Point { row: 1, column: 4 },
-                    end_point: tree_sitter::Point { row: 1, column: 7 },
-                },
-                call_form: CallForm::Member,
-                receiver: Some("client".to_string()), // Not app/router
-            },
-        ];
+        let code = r#"
+const client = http.createClient();
+client.get('/data');
+"#;
 
-        let routes = detect_express_routes_from_ast(&captures, "src/api.ts");
+        let tree = parser.parse(code, None).unwrap();
+        let routes = detect_express_routes_from_ast(&tree, code, "src/api.ts");
         assert!(routes.is_empty(), "Non-app calls should not be detected as routes");
     }
+
+
 }
