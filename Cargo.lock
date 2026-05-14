@@ -29,6 +29,7 @@ version = "0.7.0-alpha"
 dependencies = [
  "crossbeam-deque",
  "mimalloc",
+ "regex",
  "rusqlite",
  "rustc-hash",
  "serde",

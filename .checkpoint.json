@@ -1,33 +1,38 @@
 {
-  "completed_steps": [
-    {"id": "fix-1", "description": "Fix P1: TypeScript .tsx → split into TS + TSX providers", "verified": true},
-    {"id": "fix-2", "description": "Fix P2: JS lexical_declaration → constrain @const to 'const' keyword", "verified": true},
-    {"id": "fix-3", "description": "Fix P1: C variable declarations → add plain decl pattern", "verified": true},
-    {"id": "fix-4", "description": "Fix P1: file_id collision → path-based hash", "verified": true},
-    {"id": "fix-5", "description": "Fix P2: PHP @heritage.class → Unknown tag", "verified": true},
-    {"id": "fix-6", "description": "Fix P1: Ruby → add scope_resolution patterns", "verified": true},
-    {"id": "fix-7", "description": "Fix P2: C# → remove implicit_object_creation pattern", "verified": true},
-    {"id": "fix-8", "description": "Fix P2: CHANGELOG.md structure", "verified": true},
-    {"id": "feat-1", "description": "Add community detection (weighted label propagation)", "verified": true},
-    {"id": "feat-2", "description": "Add process tracing (entry point → BFS call chains)", "verified": true},
-    {"id": "feat-3", "description": "Add BM25 search (SQLite FTS5 + hybrid graph proximity)", "verified": true},
-    {"id": "feat-4", "description": "Wire community/process/search into build_graph pipeline", "verified": true},
-    {"id": "fix-9", "description": "Fix get_symbol O(n) → O(1) via symbols_by_id HashMap", "verified": true},
-    {"id": "arch-1", "description": "Restructured scan pipeline: separate file discovery from parallel parsing", "verified": true},
-    {"id": "arch-2", "description": "Phase 1: parallel directory scan collects file contents into LocalAccum", "verified": true},
-    {"id": "arch-3", "description": "Phase 2: parallel parse distributes files across threads, each with own SyntaxEngine", "verified": true},
-    {"id": "arch-4", "description": "No race conditions: each thread owns its own Parser, content is read-only shared via &", "verified": true}
+  "phase": "semantic-engine-complete",
+  "commits": [
+    "e9c905d - scope-resolution pipeline (RFC #909 Ring 3)",
+    "bfd6fb1 - wire scope-resolution into build_graph",
+    "46f3667 - replace legacy ResolutionEngine",
+    "750fcab - parallel parse + community/process/search engines",
+    "cc0c9f3 - call form classification + parallel parse pipeline"
   ],
-  "next_step": null,
+  "completed": [
+    "8 P1/P2 bugs fixed from PR review",
+    "Two-phase parallel pipeline: scan → parse",
+    "Call form classification (Free/Member/Constructor/Scoped)",
+    "Receiver extraction from AST",
+    "Community detection (weighted label propagation)",
+    "Process tracing (entry point → BFS call chains)",
+    "BM25 + hybrid search (SQLite FTS5)",
+    "SQLite graph store with recursive CTEs",
+    "Incremental scanning with hash-based change detection",
+    "AST caching to skip re-parsing unchanged files",
+    "16-language tree-sitter extraction",
+    "Scope resolution (receiver-bound, free-call, imports, C3 MRO)",
+    "Per-language import resolution"
+  ],
   "stats": {
     "source_files": 39,
-    "total_lines": 11500,
-    "tests_passing": 63,
+    "total_lines": 11700,
+    "tests_passing": 67,
     "tests_failing": 0,
-    "test_time_ms": 680,
-    "new_modules": ["community", "process", "search"],
-    "bugs_fixed": 8,
-    "features_added": 3,
-    "arch_changes": ["two-phase scan+parse", "parallel parse with per-thread SyntaxEngine", "content caching in LocalAccum"]
-  }
+    "test_time_ms": 680
+  },
+  "next_up": [
+    "Type environment (type-aware cross-file resolution)",
+    "Route extraction (Express/Next.js/Django/Flask)",
+    "Embedding/semantic search",
+    "Wildcard import synthesis"
+  ]
 }

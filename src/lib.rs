@@ -12,7 +12,9 @@ pub mod graph;
 pub mod store;
 pub mod community;
 pub mod process;
+pub mod routes;
 pub mod search;
+pub mod type_env;
 /// `atree` — File-system A* pathfinding library.
 ///
 /// Public API:
