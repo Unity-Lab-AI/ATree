@@ -116,6 +116,7 @@ pub struct Call {
     pub caller_scope_id: Option<u64>,
     pub callee_name: String,
     pub receiver: Option<String>, // e.g., "self", "this", or inferred type
+    pub call_form: crate::syntax::CallForm, // classified at parse time
     pub resolved_symbol_id: Option<u64>,
     pub confidence: Confidence,
     pub line: usize,
@@ -418,7 +419,8 @@ impl ParsedFile {
                             file_id: id,
                             caller_scope_id,
                             callee_name: c.name,
-                            receiver: None,
+                            receiver: c.receiver,
+                            call_form: c.call_form,
                             resolved_symbol_id: None,
                             confidence: Confidence::Unresolved,
                             line,

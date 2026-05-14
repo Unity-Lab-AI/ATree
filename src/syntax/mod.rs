@@ -1,4 +1,5 @@
 use streaming_iterator::StreamingIterator;
+use serde::{Serialize, Deserialize};
 use tree_sitter::{Parser, Query, QueryCursor, Node, Tree};
 use crate::lang::{LanguageProvider, CaptureTag};
 use crate::semantic::ScopeKind;
@@ -14,10 +15,34 @@ pub fn hash_content(content: &str) -> u64 {
     h.finish()
 }
 
+/// Classified call form — how the call site is structured in the AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallForm {
+    /// Free/unqualified call: `foo()`
+    Free,
+    /// Member/instance call: `obj.method()`, `this.method()`
+    Member,
+    /// Constructor call: `new Foo()`, `Foo()`
+    Constructor,
+    /// Scoped/qualified call: `Foo::bar()`, `ns::func()`
+    Scoped,
+    /// Unknown/unclassified
+    Unknown,
+}
+
+impl Default for CallForm {
+    fn default() -> Self { CallForm::Unknown }
+}
+
+#[derive(Debug)]
 pub struct RawCapture {
     pub tag: CaptureTag,
     pub name: String,
     pub range: tree_sitter::Range,
+    /// For CallName captures: the classified call form.
+    pub call_form: CallForm,
+    /// For Member/Constructor calls: the receiver expression text (e.g., "self", "obj", "new").
+    pub receiver: Option<String>,
 }
 
 /// A scope node extracted from the AST during the walk.
@@ -85,7 +110,6 @@ impl SyntaxEngine {
             }
 
             if let Some(name_idx) = name_capture_idx {
-                // Get the name text from the @name capture node
                 let name_capture = m
                     .captures
                     .iter()
@@ -95,9 +119,17 @@ impl SyntaxEngine {
                     &content[name_capture.node.start_byte()..name_capture.node.end_byte()];
                 let name_range = name_capture.node.range();
 
-                // Pair the name with all semantic tags in this match.
-                // Skip wrapper tags (CallWrapper, ImportWrapper, HeritageWrapper) —
-                // they're redundant when we have the specific tag (CallName, etc.).
+                // Find the @call wrapper node for call form analysis
+                let call_node = m.captures.iter()
+                    .find(|c| {
+                        let tn = capture_names[c.index as usize];
+                        tn == "call" || tn == "call_expression" || tn == "invocation_expression"
+                            || tn == "method_invocation" || tn == "member_call_expression"
+                            || tn == "nullsafe_member_call_expression" || tn == "scoped_call_expression"
+                            || tn == "new_expression" || tn == "object_creation_expression"
+                    })
+                    .map(|c| c.node);
+
                 for &(_, ref tag) in &semantic_captures {
                     match tag {
                         CaptureTag::CallWrapper
@@ -111,16 +143,22 @@ impl SyntaxEngine {
                         name_range.end_byte,
                     );
                     if seen.insert(key) {
+                        let (call_form, receiver) = if *tag == CaptureTag::CallName {
+                            classify_call_form(name_capture.node, call_node, &content)
+                        } else {
+                            (CallForm::Unknown, None)
+                        };
                         captures.push(RawCapture {
                             tag: *tag,
                             name: name_text.to_string(),
                             range: name_range,
+                            call_form,
+                            receiver,
                         });
                     }
                 }
             } else {
                 // No @name capture — use the capture text directly
-                // (import.source, heritage.*, decorator, http_client, assignment)
                 for &(idx, ref tag) in &semantic_captures {
                     let c = m.captures.iter().find(|c| c.index as usize == idx).unwrap();
                     let text = &content[c.node.start_byte()..c.node.end_byte()];
@@ -130,11 +168,100 @@ impl SyntaxEngine {
                             tag: *tag,
                             name: text.to_string(),
                             range: c.node.range(),
+                            call_form: CallForm::Unknown,
+                            receiver: None,
                         });
                     }
                 }
             }
         }
+
+    /// Classify a call capture by inspecting the AST relationship between
+    /// the name node and its parent call node.
+    /// Ported from GitNexus call-analysis.ts inferCallForm().
+    fn classify_call_form(
+        name_node: Node,
+        call_node: Option<Node>,
+        content: &str,
+    ) -> (CallForm, Option<String>) {
+        let call = match call_node {
+            Some(n) => n,
+            None => return (CallForm::Unknown, None),
+        };
+
+        // Constructor: call node is a new_expression or object_creation_expression
+        let call_kind = call.kind();
+        if call_kind == "new_expression" || call_kind == "object_creation_expression"
+            || call_kind == "constructor_invocation" || call_kind == "struct_expression"
+            || call_kind == "composite_literal"
+        {
+            return (CallForm::Constructor, None);
+        }
+
+        // Check if name_node is inside a member-access wrapper
+        let name_parent = match name_node.parent() {
+            Some(p) => p,
+            None => return (CallForm::Free, None),
+        };
+
+        let parent_kind = name_parent.kind();
+        let is_member = matches!(
+            parent_kind,
+            "member_expression" | "attribute" | "member_access_expression"
+                | "field_expression" | "selector_expression" | "navigation_suffix"
+                | "member_binding_expression" | "field_access" | "scoped_identifier"
+        );
+
+        if is_member {
+            // Extract the receiver (object) from the member access
+            let receiver = if let Some(obj) = name_parent.child_by_field_name("object") {
+                let text = &content[obj.start_byte()..obj.end_byte()];
+                Some(text.to_string())
+            } else if let Some(obj) = name_parent.child(0) {
+                let text = &content[obj.start_byte()..obj.end_byte()];
+                Some(text.to_string())
+            } else {
+                None
+            };
+            return (CallForm::Member, receiver);
+        }
+
+        // PHP member calls
+        if call_kind == "member_call_expression" || call_kind == "nullsafe_member_call_expression" {
+            return (CallForm::Member, None);
+        }
+
+        // Java method_invocation with object field
+        if call_kind == "method_invocation" && call.child_by_field_name("object").is_some() {
+            if let Some(obj) = call.child_by_field_name("object") {
+                let text = &content[obj.start_byte()..obj.end_byte()];
+                return (CallForm::Member, Some(text.to_string()));
+            }
+            return (CallForm::Member, None);
+        }
+
+        // Ruby call with receiver
+        if call_kind == "call" && call.child_by_field_name("receiver").is_some() {
+            if let Some(rcv) = call.child_by_field_name("receiver") {
+                let text = &content[rcv.start_byte()..rcv.end_byte()];
+                return (CallForm::Member, Some(text.to_string()));
+            }
+            return (CallForm::Member, None);
+        }
+
+        // Scoped calls (Rust Foo::new(), C++ ns::func())
+        // The name node itself may be a scoped_identifier, or its parent may be one
+        let name_kind = name_node.kind();
+        if name_kind == "scoped_identifier" || name_kind == "qualified_identifier"
+            || parent_kind == "scoped_identifier" || parent_kind == "qualified_identifier"
+        {
+            return (CallForm::Scoped, None);
+        }
+
+        // Default: free call
+        (CallForm::Free, None)
+    }
+
         captures
     }
 
@@ -444,5 +571,76 @@ impl SyntaxEngine {
             "for_statement" | "while_statement" | "if_statement" => Some(ScopeKind::Block),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::{LanguageId, LanguageProvider};
+    use tree_sitter::Language;
+
+    // Minimal test provider for Rust
+    #[derive(Debug)]
+    struct TestRustProvider;
+    impl LanguageProvider for TestRustProvider {
+        fn id(&self) -> LanguageId { LanguageId::Rust }
+        fn extensions(&self) -> &'static [&'static str] { &["rs"] }
+        fn tree_sitter_language(&self) -> Language { tree_sitter_rust::LANGUAGE.into() }
+        fn query(&self) -> &'static str {
+            r#"
+(function_item name: (identifier) @name) @definition.function
+(call_expression function: (identifier) @call.name) @call
+(call_expression function: (field_expression field: (field_identifier) @call.name)) @call
+(call_expression function: (scoped_identifier) @call.name) @call
+            "#
+        }
+    }
+
+    #[test]
+    fn test_call_form_free() {
+        let mut engine = SyntaxEngine::new();
+        let provider = TestRustProvider;
+        let code = "fn main() { foo(); }";
+        let captures = engine.extract_captures(&provider, code);
+        let call = captures.iter().find(|c| c.tag == CaptureTag::CallName && c.name == "foo");
+        assert!(call.is_some(), "should find foo() call, got: {:?}", captures);
+        assert_eq!(call.unwrap().call_form, CallForm::Free, "foo() should be a free call");
+    }
+
+    #[test]
+    fn test_call_form_member() {
+        let mut engine = SyntaxEngine::new();
+        let provider = TestRustProvider;
+        let code = "fn main() { obj.method(); }";
+        let captures = engine.extract_captures(&provider, code);
+        let call = captures.iter().find(|c| c.tag == CaptureTag::CallName && c.name == "method");
+        assert!(call.is_some(), "should find method() call, got: {:?}", captures);
+        assert_eq!(call.unwrap().call_form, CallForm::Member, "obj.method() should be a member call");
+        assert_eq!(call.unwrap().receiver, Some("obj".to_string()), "receiver should be obj");
+    }
+
+    #[test]
+    fn test_call_form_scoped() {
+        let mut engine = SyntaxEngine::new();
+        let provider = TestRustProvider;
+        let code = "fn main() { let x = Foo::new(); }";
+        let captures = engine.extract_captures(&provider, code);
+        // Foo::new is captured as a single scoped_identifier @call.name
+        let call = captures.iter().find(|c| c.tag == CaptureTag::CallName && c.name == "Foo::new");
+        assert!(call.is_some(), "should find Foo::new() call, got: {:?}", captures);
+        assert_eq!(call.unwrap().call_form, CallForm::Scoped, "Foo::new() should be a scoped call");
+    }
+
+    #[test]
+    fn test_call_form_self_receiver() {
+        let mut engine = SyntaxEngine::new();
+        let provider = TestRustProvider;
+        let code = "fn main() { self.do_something(); }";
+        let captures = engine.extract_captures(&provider, code);
+        let call = captures.iter().find(|c| c.tag == CaptureTag::CallName && c.name == "do_something");
+        assert!(call.is_some(), "should find self.do_something() call, got: {:?}", captures);
+        assert_eq!(call.unwrap().call_form, CallForm::Member, "self.method() should be member");
+        assert_eq!(call.unwrap().receiver, Some("self".to_string()), "receiver should be self");
     }
 }
