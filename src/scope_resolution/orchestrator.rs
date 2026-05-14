@@ -43,6 +43,11 @@ pub fn run_scope_resolution(
     // Phase 4: Build Method Dispatch (MRO) for all classes
     build_method_dispatch(&mut indexes, parsed_files);
 
+    // Phase 4b: Emit MRO edges (EXTENDS/IMPLEMENTS) from computed method dispatch
+    let mut mro_edges = Vec::new();
+    emit_mro_edges(&indexes, &mut mro_edges);
+    stats.reference_edges_emitted += mro_edges.len();
+
     // Phase 5: Extract reference sites from parsed files
     let reference_sites = extract_reference_sites(parsed_files);
 
@@ -52,6 +57,9 @@ pub fn run_scope_resolution(
     // Phase 7: Emit edges (load-bearing order per Contract Invariant I1)
     let mut edges = Vec::new();
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+
+    // 6c: MRO edges (EXTENDS/IMPLEMENTS) — emitted first so call resolution can use them
+    edges.extend(mro_edges);
 
     // 7a: Receiver-bound calls FIRST
     let provider = ReceiverBoundProvider {
@@ -89,6 +97,22 @@ pub fn run_scope_resolution(
     stats.unresolved_sites = reference_sites.len(); // simplified
 
     (stats, edges)
+}
+
+/// Emit MRO edges (EXTENDS/IMPLEMENTS) from computed method dispatch.
+/// For each class with MRO, emit edges: class → each ancestor in MRO order.
+fn emit_mro_edges(indexes: &ScopeResolutionIndexes, edges: &mut Vec<GraphEdge>) {
+    for (class_id, ancestor_ids) in &indexes.method_dispatch {
+        for (order, ancestor_id) in ancestor_ids.iter().enumerate() {
+            edges.push(GraphEdge {
+                source_id: *class_id,
+                target_id: *ancestor_id,
+                edge_type: "EXTENDS".to_string(),
+                confidence: 1.0,
+                reason: format!("MRO-order-{}", order),
+            });
+        }
+    }
 }
 
 /// Build ScopeResolutionIndexes from parsed files.
@@ -172,13 +196,32 @@ fn build_method_dispatch(indexes: &mut ScopeResolutionIndexes, parsed_files: &[P
 
     for parsed in parsed_files {
         for her in &parsed.heritage {
-            // Find the child class symbol
-            if let Some(child_sym) = parsed.symbols.iter().find(|s| {
-                (s.name == her.class_name || her.class_name.is_empty())
-                    && matches!(s.kind,
+            // Find the child class symbol. When class_name is empty (parser limitation),
+            // match by finding the class whose scope contains the heritage line.
+            let child_sym = if !her.class_name.is_empty() {
+                parsed.symbols.iter().find(|s| {
+                    s.name == her.class_name
+                        && matches!(s.kind,
+                            crate::lang::CaptureTag::DefinitionClass |
+                            crate::lang::CaptureTag::DefinitionInterface)
+                })
+            } else {
+                parsed.symbols.iter().find(|s| {
+                    if !matches!(s.kind,
                         crate::lang::CaptureTag::DefinitionClass |
-                        crate::lang::CaptureTag::DefinitionInterface)
-            }) {
+                        crate::lang::CaptureTag::DefinitionInterface) {
+                        return false;
+                    }
+                    if let Some(scope_id) = s.scope_id {
+                        if let Some(scope) = indexes.scopes_by_id.get(&scope_id) {
+                            return her.line >= scope.line_start && her.line <= scope.line_end;
+                        }
+                    }
+                    her.line >= s.line && her.line <= s.line + 100
+                })
+            };
+
+            if let Some(child_sym) = child_sym {
                 parent_map.entry(child_sym.id)
                     .or_default()
                     .push((her.target_name.clone(), parsed.path.clone()));

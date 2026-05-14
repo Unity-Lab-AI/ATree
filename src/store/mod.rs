@@ -511,6 +511,17 @@ impl GraphStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Get the file_id for a given symbol ID.
+    pub fn get_file_id_for_symbol(&self, symbol_id: i64) -> rusqlite::Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT file_id FROM symbols WHERE id = ?1")?;
+        let result: rusqlite::Result<i64> = stmt.query_row([symbol_id], |row| row.get(0));
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get all edges for a node (incoming + outgoing).
     pub fn get_edges_for_node(&self, node_id: i64) -> rusqlite::Result<Vec<EdgeRecord>> {
         let mut stmt = self.conn.prepare(

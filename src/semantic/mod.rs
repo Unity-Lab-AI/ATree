@@ -373,8 +373,11 @@ impl ParsedFile {
                             })
                         });
                         let sym_idx = symbols.len();
+                        // Unique symbol ID: high 32 bits = file_id hash, low 32 bits = symbol index
+                        // This ensures uniqueness within a file and across files
+                        let sym_id = ((id & 0xFFFFFFFF) << 32) | (sym_idx as u64 & 0xFFFFFFFF);
                         symbols.push(Symbol {
-                            id: 0,
+                            id: sym_id,
                             name: c.name.clone(),
                             qualified_name: c.name.clone(),
                             kind: c.tag,
