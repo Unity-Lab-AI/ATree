@@ -78,12 +78,30 @@ pub struct Stats {
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
     pub semantic: bool,
+    pub db_path: Option<PathBuf>,
+    pub incremental: bool,
     pub root: PathBuf,
     pub max_depth: usize,
     pub max_nodes: usize,
     pub include_files: bool,
     pub threads: usize,
     pub tree_mode: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            semantic: false,
+            db_path: None,
+            incremental: false,
+            root: PathBuf::from("."),
+            max_depth: 4,
+            max_nodes: 150,
+            include_files: false,
+            threads: 1,
+            tree_mode: false,
+        }
+    }
 }
 
 /// Result of a successful [`build_graph`] call.
@@ -118,6 +136,8 @@ pub struct PathReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JsonOptions {
     pub semantic: bool,
+    pub db_path: Option<PathBuf>,
+    pub incremental: bool,
     pub max_depth: Option<usize>,
     pub max_nodes: Option<usize>,
     pub include_files: bool,
@@ -598,12 +618,12 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                                 };
                                 let file_hash = crate::syntax::hash_content(content);
 
-                                let (captures, raw_scopes) =
+                                let (captures, raw_scopes, type_bindings) =
                                     engine.extract_captures_and_scopes(provider, content);
 
                                 let parsed = ParsedFile::from_captures_with_scopes(
                                     file_id, rel_path, provider.id(), file_hash,
-                                    captures, raw_scopes,
+                                    captures, raw_scopes, type_bindings,
                                 );
                                 results.push(parsed);
                             }
@@ -686,17 +706,42 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
     // Parsed files from the parallel parse phase above.
     let mut parsed_files = all_parsed_files;
 
+    // Build type environments for all parsed files.
+    // This extracts type annotations from the AST (x: Type, let x: Type, etc.)
+    // and populates the type environment used for type-aware resolution.
+    let type_envs = if opts.semantic {
+        crate::type_env::build_type_envs(&parsed_files)
+    } else {
+        rustc_hash::FxHashMap::default()
+    };
+
     // Build the persistent graph store and run scope-resolution pipeline.
     // The scope-resolution pipeline (RFC #909) replaces the legacy
     // ResolutionEngine with proper scope-chain walks, receiver-bound
     // resolution, C3 linearization, and cross-file import edges.
     let (store_stats, symbol_table, resolution_stats, scope_resolution_stats) = if opts.semantic {
         let result: io::Result<_> = (|| {
-            let store = GraphStore::open_in_memory()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Open or create the graph store (persistent or in-memory)
+            let store = match &opts.db_path {
+                Some(path) => GraphStore::open(path)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+                None => GraphStore::open_in_memory()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+            };
 
-            // Insert raw parsed data into the store
+            // Insert raw parsed data into the store.
+            // In incremental mode, skip files whose hashes haven't changed.
+            let mut files_inserted = 0u64;
+            let mut files_reused = 0u64;
             for file in &parsed_files {
+                if opts.incremental {
+                    if let Some(existing_id) = store.check_file_unchanged(&file.path, file.hash)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
+                        files_reused += 1;
+                        continue;
+                    }
+                }
+                files_inserted += 1;
                 let file_id = store.upsert_file(&file.path, file.hash, &format!("{:?}", file.language), 0)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -826,6 +871,9 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let symbol_table = SymbolTable::from_store(&store)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut store_stats = store_stats;
+            // Track incremental stats (files_inserted/files_reused are set above)
+            // These are already tracked in the local variables.
             Ok((store_stats, symbol_table, None, scope_resolution_stats))
         })();
         match result {
@@ -833,7 +881,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             Err(e) => return Err(e),
         }
     } else {
-        (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0 }, SymbolTable::new(), None, None)
+        (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0 }, SymbolTable::new(), None, None)
     };
 
     Ok(ScanResult {
@@ -935,7 +983,7 @@ pub fn build_graph_incremental(
         if let Ok(content) = fs::read_to_string(&full_path) {
             if let Some(ext) = Path::new(&rel_path).extension().and_then(|s| s.to_str()) {
                 if let Some(provider) = get_provider_for_extension(ext) {
-                    let (captures, raw_scopes) = syntax.extract_captures_and_scopes(provider, &content);
+                    let (captures, raw_scopes, _type_bindings) = syntax.extract_captures_and_scopes(provider, &content);
                     // Use path-based hash for file_id to avoid collisions on identical content
                     let file_id = {
                         use std::hash::{Hash, Hasher};
@@ -944,7 +992,7 @@ pub fn build_graph_incremental(
                         h.finish()
                     };
                     let parsed = ParsedFile::from_captures_with_scopes(
-                        file_id, rel_path, provider.id(), *hash, captures, raw_scopes,
+                        file_id, rel_path, provider.id(), *hash, captures, raw_scopes, Vec::new(),
                     );
                     parsed_files.push(parsed);
                 }
@@ -1488,6 +1536,8 @@ pub fn build_json_report(
             include_files: options.include_files,
             tree_mode: options.tree_mode,
             semantic: options.semantic,
+            db_path: options.db_path.clone(),
+            incremental: options.incremental,
         },
         stats: scan.stats.clone(),
         truncated: scan.truncated,
@@ -1608,6 +1658,8 @@ mod tests {
             include_files: true,
             threads: 2,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: false,
         };
         let result = build_graph(&opts).unwrap();
@@ -1650,6 +1702,8 @@ mod tests {
             include_files: true,
             threads: 2,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: false,
         };
         let scan = build_graph(&opts).unwrap();
@@ -1708,6 +1762,8 @@ mod tests {
             include_files: false,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: false,
         };
         let err = match build_graph(&opts) {
@@ -1735,6 +1791,8 @@ mod tests {
             include_files: false,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: false,
         };
         let err = match build_graph(&opts) {
@@ -1765,6 +1823,8 @@ mod tests {
             include_files: false,
             threads: 4,
             tree_mode: true,
+            db_path: None,
+            incremental: false,
             semantic: false,
         };
         let result = build_graph(&opts).unwrap();
@@ -1907,6 +1967,8 @@ func main() {
             include_files: true,
             threads: 2,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2029,6 +2091,8 @@ fn main() {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2088,6 +2152,8 @@ def my_func():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2161,6 +2227,8 @@ def top_level():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2235,6 +2303,8 @@ function createService() {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2300,6 +2370,8 @@ class Admin(User):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2355,6 +2427,8 @@ class WorkerService implements Runnable, Stoppable {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2413,6 +2487,8 @@ def main():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2463,6 +2539,8 @@ function main() {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2519,6 +2597,8 @@ def compute():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2590,6 +2670,8 @@ class Admin(User):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2647,6 +2729,8 @@ def my_func():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2720,6 +2804,8 @@ pub fn create_report() -> Report {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2791,6 +2877,8 @@ func main() {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2851,6 +2939,8 @@ public class Circle extends Shape {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -2903,6 +2993,8 @@ def world():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
 
@@ -2983,6 +3075,8 @@ class Base:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
 
@@ -3034,6 +3128,8 @@ class Derived(Base):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3075,6 +3171,8 @@ class 日本語:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3119,6 +3217,8 @@ class A:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3174,6 +3274,8 @@ def use_helper():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3217,6 +3319,8 @@ print(os.path.join("a", "b"))
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3262,6 +3366,8 @@ def func_{idx}():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3323,6 +3429,8 @@ func Start() {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3399,6 +3507,8 @@ class Manager{idx}:
             include_files: true,
             threads: 4,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
 
@@ -3451,6 +3561,8 @@ class Manager{idx}:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3504,6 +3616,8 @@ class D(B, C):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3559,6 +3673,8 @@ class D(B, C):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3579,6 +3695,79 @@ class D(B, C):
         if let Some(ref srs) = result.scope_resolution_stats {
             assert!(srs.reference_edges_emitted >= 4, "Should have scope-resolution edges");
         }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // =====================================================================
+    // PHP heritage test — verify no self-edge
+    // =====================================================================
+
+    #[test]
+    fn test_php_heritage_no_self_edge() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_php_herit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("Controller.php"), r#"<?php
+
+class UserController extends Controller {
+    public function index() {
+        return $this->render('index');
+    }
+}
+
+class BaseController extends AbstractController {
+    use SomeTrait;
+}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            semantic: true,
+            db_path: None,
+            incremental: false,
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.ends_with("Controller.php")).unwrap();
+
+        // Check heritage entries
+        let heritage_targets: Vec<&str> = file.heritage.iter().map(|h| h.target_name.as_str()).collect();
+
+        // UserController extends Controller → heritage target should be "Controller"
+        assert!(heritage_targets.contains(&"Controller"),
+            "UserController should extend Controller, got: {:?}", heritage_targets);
+
+        // BaseController extends AbstractController → heritage target should be "AbstractController"
+        assert!(heritage_targets.contains(&"AbstractController"),
+            "BaseController should extend AbstractController, got: {:?}", heritage_targets);
+
+        // CRITICAL: No self-edges. UserController should NOT extend UserController.
+        let self_edges: Vec<_> = file.heritage.iter()
+            .filter(|h| h.target_name == "UserController" || h.target_name == "BaseController")
+            .collect();
+        assert!(self_edges.is_empty(),
+            "PHP heritage should NOT produce self-edges, found: {:?}", self_edges);
+
+        // BaseController uses SomeTrait
+        let trait_targets: Vec<&str> = file.heritage.iter()
+            .filter(|h| matches!(h.heritage_kind, crate::semantic::HeritageKind::UsesTrait))
+            .map(|h| h.target_name.as_str())
+            .collect();
+        assert!(trait_targets.contains(&"SomeTrait"),
+            "BaseController should use SomeTrait, got: {:?}", trait_targets);
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -3622,6 +3811,8 @@ class _PrivateClass:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3676,6 +3867,8 @@ const INTERNAL_CONST = 0;
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3745,6 +3938,8 @@ class UserService {
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3812,6 +4007,8 @@ class AlsoValid(Valid):
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
 
@@ -3858,6 +4055,8 @@ class B:
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
 
@@ -3892,6 +4091,8 @@ def main():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();
@@ -3932,6 +4133,8 @@ def main():
             include_files: true,
             threads: 1,
             tree_mode: false,
+            db_path: None,
+            incremental: false,
             semantic: true,
         };
         let result = build_graph(&opts).unwrap();

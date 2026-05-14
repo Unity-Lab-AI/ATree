@@ -49,6 +49,8 @@ struct Args {
     semantic: bool,
     json: bool,
     print_schema: bool,
+    db_path: Option<PathBuf>,
+    incremental: bool,
 }
 
 impl Default for Args {
@@ -70,6 +72,8 @@ impl Default for Args {
             semantic: false,
             json: false,
             print_schema: false,
+            db_path: None,
+            incremental: false,
         }
     }
 }
@@ -150,6 +154,11 @@ fn parse_args() -> Args {
             "--no-limit" | "--unlimited" | "--no-cap" => args.no_limit = true,
             "--no-mem-cap" | "--hard" => args.no_mem_cap = true,
             "--semantic" => args.semantic = true,
+            "--db" => {
+                args.db_path = Some(PathBuf::from(take_value(&cli_args, i)));
+                i += 1;
+            }
+            "--incremental" => args.incremental = true,
             "--json" => args.json = true,
             "--print-schema" | "--schema" => args.print_schema = true,
             "--help" | "-h" => {
@@ -205,6 +214,8 @@ Options:
       --no-limit             Remove --max-depth and --max-nodes caps (scan everything)
       --no-mem-cap           With --no-limit, disable the ~half-RAM safety cap
       --semantic             Enable code intelligence: extract symbols via tree-sitter
+      --db <PATH>            Path to SQLite index file (default: in-memory)
+      --incremental          Only re-index changed files (requires --db)
       --json                 Emit a JSON report on stdout (status still goes to stderr)
       --print-schema         Print the bundled JSON Schema (Draft 7) on stdout and exit
   -h, --help                 Show this help
@@ -300,6 +311,8 @@ fn main() {
         threads,
         tree_mode: args.tree,
         semantic: args.semantic,
+        db_path: args.db_path.clone(),
+        incremental: args.incremental,
     };
 
     if !args.json {

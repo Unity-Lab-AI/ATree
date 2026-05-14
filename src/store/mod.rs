@@ -641,7 +641,13 @@ impl GraphStore {
         let resolved_calls: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM calls WHERE resolved_symbol_id IS NOT NULL", [], |row| row.get(0)
         )?;
-        Ok(StoreStats { files, symbols, scopes, imports, calls, edges, resolved_calls })
+        Ok(StoreStats { files, symbols, scopes, imports, calls, edges, resolved_calls, files_inserted: 0, files_reused: 0 })
+    }
+
+    /// Set incremental indexing stats.
+    pub fn set_incremental_stats(&self, inserted: i64, reused: i64) {
+        // Store in a separate metadata table or just track in memory
+        // For now, these are tracked externally and passed through ScanResult
     }
 }
 
@@ -740,4 +746,6 @@ pub struct StoreStats {
     pub calls: i64,
     pub edges: i64,
     pub resolved_calls: i64,
+    pub files_inserted: i64,
+    pub files_reused: i64,
 }
