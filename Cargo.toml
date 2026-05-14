@@ -1,8 +1,8 @@
 [package]
 name = "atree"
-version = "0.6.0-alpha"
+version = "0.7.0-alpha"
 edition = "2021"
-description = "Production-grade parallel filesystem analysis and A* pathfinder. Lock-free work-stealing scan, JSON output for inter-process integration, used in AI-agent indexing and large-scale auditing."
+description = "Production-grade parallel filesystem analysis, A* pathfinder, and semantic code intelligence engine. Lock-free work-stealing scan, tree-sitter-powered multi-language symbol extraction, scope-aware resolution with confidence scoring, SQLite persistent cache."
 authors = [
     "UnityAILab <contact@unityailab.com>",
     "Sponge <sponge@unityailab.com>",
@@ -19,6 +19,27 @@ rustc-hash = "2"
 crossbeam-deque = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tree-sitter = "0.26.8"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-php = "0.24.2"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-swift = "0.7.2"
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", version = "0.4.0" }
+tree-sitter-language = "0.1.7"
+streaming-iterator = "0.1.9"
+tree-sitter-bash = "0.25.1"
+tree-sitter-json = "0.24.8"
+tree-sitter-yaml = "0.7.2"
+regex = "1"
 
 [lib]
 name = "atree"

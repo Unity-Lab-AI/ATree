@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/atree/schema/v1.json",
+  "$id": "https://github.com/atree/schema/v2.json",
   "title": "JsonReport",
   "description": "Output schema for `atree --json`. Pin schema_version to detect breaking format changes.",
   "type": "object",
@@ -24,7 +24,7 @@
     "schema_version": {
       "description": "Format version. Pin this in your consumer; only bumps on breaking changes.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "version": {
       "description": "Binary version (CARGO_PKG_VERSION). Bumps more often than schema_version.",
@@ -51,7 +51,7 @@
     "options": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["max_depth", "max_nodes", "include_files", "tree_mode"],
+      "required": ["max_depth", "max_nodes", "include_files", "tree_mode", "semantic"],
       "properties": {
         "max_depth": {
           "description": "Depth cap. `null` means unbounded (--no-limit).",
@@ -66,6 +66,10 @@
         "include_files": { "type": "boolean" },
         "tree_mode": {
           "description": "True when --tree (skip per-file stat) was used. Implies size=0, mode=0, is_exec=false on file nodes.",
+          "type": "boolean"
+        },
+        "semantic": {
+          "description": "True when --semantic (code intelligence via tree-sitter) was enabled.",
           "type": "boolean"
         }
       }
@@ -123,6 +127,16 @@
       "oneOf": [
         { "type": "null" },
         { "$ref": "#/definitions/PathReport" }
+      ]
+    },
+    "semantic": {
+      "description": "Code intelligence results. `null` when --semantic was not enabled.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ParsedFile" }
+        }
       ]
     }
   },
@@ -198,6 +212,72 @@
         "efficiency_pct": {
           "description": "100 * (1 - astar_expanded / bfs_expanded). 0.0 when bfs_expanded is 0.",
           "type": "number"
+        }
+      }
+    },
+    "ParsedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "language", "defs", "calls", "imports"],
+      "properties": {
+        "path": {
+          "description": "File path relative to scan root.",
+          "type": "string"
+        },
+        "language": {
+          "description": "Detected language identifier.",
+          "type": "string"
+        },
+        "defs": {
+          "description": "Symbol definitions found in this file.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/Def" }
+        },
+        "calls": {
+          "description": "Call sites found in this file.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/Call" }
+        },
+        "imports": {
+          "description": "Import sources found in this file.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "Def": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tag", "line"],
+      "properties": {
+        "name": {
+          "description": "Symbol name (e.g., function name, class name).",
+          "type": "string"
+        },
+        "tag": {
+          "description": "Capture tag classifying the definition type.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based line number of the definition.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "Call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "line"],
+      "properties": {
+        "name": {
+          "description": "Called symbol name.",
+          "type": "string"
+        },
+        "line": {
+          "description": "1-based line number of the call site.",
+          "type": "integer",
+          "minimum": 1
         }
       }
     }

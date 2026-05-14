@@ -76,3 +76,4 @@ perf.data.old
 .env.local
 .env.*.local
 .claude/
+.gitnexus

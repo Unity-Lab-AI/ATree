@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | `0.6.0-alpha` |
-| **Status** | Alpha — public API stabilizing. JSON `schema_version` is `1`. |
+| **Version** | `0.7.0-alpha` |
+| **Status** | Alpha — semantic engine v2 with persistent SQLite indexing, type-aware extraction, and query API. |
 | **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
@@ -55,6 +55,54 @@ The tool walks a directory tree using a lock-free work-stealing parallel scanner
 - Stable `schema_version` independent of the binary version
 - Status on stderr, data on stdout — pipeable through `jq`, `head`, etc.
 - Familiar flag aliases drawn from `find`, `tree`, and `du`
+
+### Semantic code intelligence (v2)
+
+ATree includes a Rust-native semantic indexing engine that uses Tree-sitter for multi-language symbol extraction and a persistent SQLite graph store for querying:
+
+```bash
+# Build a semantic index (persistent SQLite DB)
+./target/release/atree --semantic --db .atree/index.sqlite --root . --include-files
+
+# Query the index
+./target/release/atree query symbols "UserService" --db .atree/index.sqlite
+./target/release/atree query callers "build_graph" --db .atree/index.sqlite
+./target/release/atree query impact "UserService" --db .atree/index.sqlite
+./target/release/atree query routes --db .atree/index.sqlite
+./target/release/atree query search "type annotation" --db .atree/index.sqlite
+./target/release/atree query stats --db .atree/index.sqlite
+
+# Incremental re-index (only changed files)
+./target/release/atree --semantic --db .atree/index.sqlite --root . --incremental
+```
+
+**Supported languages (Tier 1):** TypeScript, JavaScript, Python, Rust
+**Supported languages (Tier 2):** Go, Java, C#, PHP
+**Supported languages (Tier 3):** C, C++, Ruby, Kotlin, Swift, Bash, JSON, YAML
+
+**Known limitations:**
+- Scope resolution edges (CALLS, IMPORTS, EXTENDS) are extracted but not yet fully persisted to the SQLite graph for small corpora
+- Type bindings are extracted from AST but type-aware receiver resolution is not yet wired into the query layer
+- Route detection works for Express (AST) and Next.js (path-based); Flask/FastAPI decorator detection is not yet integrated
+
+## Performance
+
+Benchmark results on ATree's own codebase (41 source files, ~7,300 LOC):
+
+| Metric | Cold Index | Incremental (warm) |
+|--------|-----------|-------------------|
+| **Time** | 28.6s | 0.29s |
+| **Speedup** | 1× | **99×** |
+| **Files indexed** | 23 | 0 (all reused) |
+| **Symbols extracted** | 780 | — |
+| **Calls extracted** | 3,771 | — |
+
+Run your own benchmarks:
+
+```bash
+cargo build --release
+./scripts/benchmark.sh
+```
 
 ## Installation
 

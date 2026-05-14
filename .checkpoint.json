@@ -1,0 +1,46 @@
+{
+  "phase": "semantic-engine-v2",
+  "commits": [
+    "52a0aee - honest scope resolution stats",
+    "bbe907e - AST type binding extraction wired into TypeEnvironment",
+    "506dc58 - Express route path extraction from AST",
+    "3b8b5d5 - persistent SQLite --db and --incremental flags",
+    "db691fe - CLI query subcommands",
+    "f2eedd8 - golden fixture tests for Tier 1 languages",
+    "20ea33a - edge persistence with in-memory to DB symbol ID mapping",
+    "4a7b415 - README with honest capabilities and benchmarks"
+  ],
+  "stats": {
+    "source_files": 41,
+    "tests_passing": 93,
+    "tests_failing": 0,
+    "test_time_ms": 70
+  },
+  "done": [
+    "Parallel two-phase pipeline (scan → parse)",
+    "16-language tree-sitter extraction",
+    "Call form classification (Free/Member/Constructor/Scoped)",
+    "Receiver extraction from AST",
+    "Scope resolution (receiver-bound, free-call, imports, C3 MRO)",
+    "Honest scope resolution stats (resolved/unresolved tracking)",
+    "AST type binding extraction (10 languages)",
+    "Type environment with scope-aware lookup",
+    "Route extraction (Next.js path-based, Express AST with paths)",
+    "Community detection (weighted label propagation)",
+    "Process tracing (entry point → BFS call chains)",
+    "BM25 + hybrid search (SQLite FTS5)",
+    "SQLite graph store with recursive CTEs",
+    "Persistent SQLite index (--db flag)",
+    "Incremental indexing (--incremental flag, 99x speedup)",
+    "CLI query layer (symbols, callers, callees, impact, routes, search, stats)",
+    "Golden fixture tests (13 tests, 4 languages)",
+    "PHP heritage verified (no self-edges)",
+    "Edge persistence (in-memory → DB symbol ID mapping)",
+    "Benchmark harness + README"
+  ],
+  "known_issues": [
+    "Scope resolution edges not persisted for large corpora (symbol ID resolution fails for cross-file references in large repos)",
+    "Type-aware receiver resolution extracted but not wired into query layer",
+    "Flask/FastAPI decorator detection not integrated"
+  ]
+}

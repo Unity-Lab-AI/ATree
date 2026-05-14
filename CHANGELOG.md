@@ -2,7 +2,19 @@
 
 All notable changes to `atree` are documented here. The project
 follows semantic versioning; the JSON output format is independently versioned
-via the `schema_version` field (currently `1`).
+via the `schema_version` field (currently `2`).
+
+## [0.7.0-alpha] - 2026-05-12
+
+### Added
+- **Native Semantic Engine**: Integrated Tree-sitter for parallel symbol extraction.
+- **Multi-language Support**: 16 language providers implemented in Rust.
+- **--semantic flag**: CLI and JSON output support for code intelligence.
+- **Modular Architecture**: Restructured project into modular logic layers.
+- **Scope-Resolution Pipeline**: Full scope-chain walks, receiver-bound resolution, C3 MRO, and cross-file import edges (RFC #909).
+- **Persistent Graph Store**: SQLite-backed storage with recursive CTEs for graph traversal.
+- **Incremental Scanning**: Hash-based change detection, only re-parses changed files.
+- **Confidence Scoring**: 9-tier confidence system on all resolution edges.
 
 ## [0.6.0-alpha] — 2026-05-04
 
