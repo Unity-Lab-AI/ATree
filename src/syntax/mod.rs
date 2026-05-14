@@ -43,10 +43,26 @@ pub struct RawCapture {
     pub call_form: CallForm,
     /// For Member/Constructor calls: the receiver expression text (e.g., "self", "obj", "new").
     pub receiver: Option<String>,
+    /// For TypeAnnotation captures: the variable/parameter name being typed.
+    /// When present, `name` holds the type text and `related_name` holds the binding target.
+    pub related_name: Option<String>,
+}
+
+/// A type binding extracted from the AST: a variable/parameter and its type annotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeBinding {
+    /// The variable/parameter name (e.g., "user", "index").
+    pub var_name: String,
+    /// The type text (e.g., "User", "number", "string | null").
+    pub type_text: String,
+    /// Line number of the binding.
+    pub line: usize,
+    /// The AST node kind that owns this binding (e.g., "variable_declarator", "formal_parameter").
+    pub owner_kind: String,
 }
 
 /// A scope node extracted from the AST during the walk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawScope {
     pub kind: ScopeKind,
     pub line_start: usize,
@@ -153,7 +169,7 @@ impl SyntaxEngine {
                             name: name_text.to_string(),
                             range: name_range,
                             call_form,
-                            receiver,
+                            receiver, related_name: None,
                         });
                     }
                 }
@@ -169,7 +185,7 @@ impl SyntaxEngine {
                             name: text.to_string(),
                             range: c.node.range(),
                             call_form: CallForm::Unknown,
-                            receiver: None,
+                            receiver: None, related_name: None,
                         });
                     }
                 }
@@ -271,37 +287,38 @@ impl SyntaxEngine {
         &mut self,
         provider: &dyn LanguageProvider,
         content: &str,
-    ) -> (Vec<RawCapture>, Vec<RawScope>) {
+    ) -> (Vec<RawCapture>, Vec<RawScope>, Vec<TypeBinding>) {
         let mut parser = Parser::new();
         if parser.set_language(&provider.tree_sitter_language()).is_err() {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
         let tree = match parser.parse(content, None) {
             Some(t) => t,
-            None => return (Vec::new(), Vec::new()),
+            None => { return (Vec::new(), Vec::new(), Vec::new()); }
         };
 
         // Extract captures using the query
         let captures = self.extract_captures(provider, content);
 
-        // Walk the AST to extract scope tree
-        let scopes = self.extract_scopes_from_tree(&tree, content, provider.id());
+        // Walk the AST to extract scope tree and type bindings
+        let (scopes, type_bindings) = self.extract_scopes_and_types(&tree, content, provider.id());
 
-        (captures, scopes)
+        (captures, scopes, type_bindings)
     }
 
-    /// Walk the tree-sitter AST and extract scope-defining nodes.
-    /// Returns a flat list of RawScope with parent_idx pointing to the
-    /// index of the parent scope in the same list.
-    fn extract_scopes_from_tree(
+    /// Walk the tree-sitter AST and extract scope-defining nodes + type bindings.
+    /// Returns (scopes, type_bindings) where type_bindings are extracted from
+    /// AST nodes that have both a name child and a type annotation child.
+    fn extract_scopes_and_types(
         &self,
         tree: &Tree,
         content: &str,
         lang: crate::lang::LanguageId,
-    ) -> Vec<RawScope> {
+    ) -> (Vec<RawScope>, Vec<TypeBinding>) {
         let root = tree.root_node();
         let mut scopes: Vec<RawScope> = Vec::new();
+        let mut type_bindings: Vec<TypeBinding> = Vec::new();
         // Stack of (node, scope_index_in_scopes_vec)
         let mut scope_stack: Vec<(Node, usize)> = Vec::new();
 
@@ -315,9 +332,9 @@ impl SyntaxEngine {
         scopes.push(module_scope);
         scope_stack.push((root, 0));
 
-        self.walk_node(root, content, lang, &mut scopes, &mut scope_stack);
+        self.walk_node(root, content, lang, &mut scopes, &mut scope_stack, &mut type_bindings);
 
-        scopes
+        (scopes, type_bindings)
     }
 
     fn walk_node<'a>(
@@ -327,6 +344,7 @@ impl SyntaxEngine {
         lang: crate::lang::LanguageId,
         scopes: &mut Vec<RawScope>,
         scope_stack: &mut Vec<(Node<'a>, usize)>,
+        type_bindings: &mut Vec<TypeBinding>,
     ) {
         // Check if this node creates a new scope
         if let Some(scope_kind) = self.node_scope_kind(node, lang) {
@@ -341,11 +359,14 @@ impl SyntaxEngine {
             scope_stack.push((node, scope_idx));
         }
 
+        // Extract type bindings from this node if it has both a name and a type annotation
+        self.extract_type_binding(node, content, lang, type_bindings);
+
         // Recurse into children
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
-                self.walk_node(cursor.node(), content, lang, scopes, scope_stack);
+                self.walk_node(cursor.node(), content, lang, scopes, scope_stack, type_bindings);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -357,6 +378,479 @@ impl SyntaxEngine {
             scope_stack.pop();
         }
     }
+
+    /// Extract a type binding from a single AST node.
+    /// Looks for nodes that have both a name child (the variable/parameter name)
+    /// and a type annotation child (the type text).
+    fn extract_type_binding(
+        &self,
+        node: Node,
+        content: &str,
+        lang: crate::lang::LanguageId,
+        type_bindings: &mut Vec<TypeBinding>,
+    ) {
+        let node_kind = node.kind();
+        let mut var_name: Option<String> = None;
+        let mut type_text: Option<String> = None;
+
+        // Language-specific extraction based on AST structure
+        match lang {
+            crate::lang::LanguageId::TypeScript | crate::lang::LanguageId::JavaScript => {
+                self.extract_ts_js_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Python => {
+                self.extract_python_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Rust => {
+                self.extract_rust_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Go => {
+                self.extract_go_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Java => {
+                self.extract_java_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::C => {
+                // C: type comes from declaration, not annotation — handled by declaration kind
+            }
+            crate::lang::LanguageId::Cpp => {
+                self.extract_cpp_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::CSharp => {
+                self.extract_csharp_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::PHP => {
+                self.extract_php_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Ruby => {
+                // Ruby is dynamically typed — no type annotations in standard Ruby
+            }
+            crate::lang::LanguageId::Kotlin => {
+                self.extract_kotlin_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Swift => {
+                self.extract_swift_type_binding(node, content, node_kind, &mut var_name, &mut type_text);
+            }
+            crate::lang::LanguageId::Bash
+            | crate::lang::LanguageId::JSON
+            | crate::lang::LanguageId::YAML
+            | crate::lang::LanguageId::Unknown => {}
+        }
+
+        if let (Some(name), Some(ty)) = (var_name, type_text) {
+            let trimmed = ty.trim();
+            if !trimmed.is_empty() {
+                type_bindings.push(TypeBinding {
+                    var_name: name,
+                    type_text: trimmed.to_string(),
+                    line: node.start_position().row,
+                    owner_kind: node_kind.to_string(),
+                });
+            }
+        }
+    }
+
+    /// TypeScript/JavaScript type binding extraction.
+    /// Handles: variable_declarator, formal_parameter, property_signature, public_field_definition,
+    /// method_definition (return type), function_declaration (return type).
+    fn extract_ts_js_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // const x: Type = ... — name is the identifier, type is type_annotation
+            "variable_declarator" | "property_definition" | "property_signature"
+            | "public_field_definition" | "private_field_definition" | "protected_field_definition" => {
+                *var_name = node.child_by_field_name( "name")
+                    .or_else(|| node.child_by_field_name( "pattern"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // function foo(x: Type): ReturnType — formal parameters have type annotations
+            "formal_parameter" | "required_parameter" | "optional_parameter" => {
+                *var_name = node.child_by_field_name( "pattern")
+                    .or_else(|| node.child_by_field_name( "name"))
+                    .or_else(|| node.child_by_field_name( "left"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // function foo(): ReturnType — return type annotation
+            "function_declaration" | "function_signature" | "method_definition"
+            | "method_signature" | "arrow_function" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Python type binding extraction.
+    /// Handles: typed_parameter, parameter (with type comment), assignment with type annotation.
+    fn extract_python_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // def foo(x: Type) — typed_parameter
+            "typed_parameter" => {
+                // The name is the first identifier child
+                *var_name = node.children(&mut node.walk())
+                    .find(|c| c.kind() == "identifier")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // x: Type = ... — assignment with type annotation
+            "assignment" => {
+                *var_name = node.child_by_field_name( "left")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // def foo() -> ReturnType — return type
+            "function_definition" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Rust type binding extraction.
+    /// Handles: function_item (return type), let_declaration, field_declaration,
+    /// function_parameter.
+    fn extract_rust_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // let x: Type = ...
+            "let_declaration" => {
+                *var_name = node.child_by_field_name( "pattern")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // fn foo() -> ReturnType
+            "function_item" | "function_signature_item" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // param: Type
+            "function_parameter" => {
+                *var_name = node.child_by_field_name( "pattern")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // struct field: name: Type
+            "field_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Go type binding extraction.
+    /// Handles: var_spec, const_spec, parameter_declaration, function_declaration (return type).
+    fn extract_go_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // var x Type  or  x := expr (type from value)
+            "var_spec" | "const_spec" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // func(param Type) — parameter_declaration
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                // Go params can have multiple names for one type: a, b int
+                let names: Vec<String> = node.children(&mut node.walk())
+                    .filter(|c| c.kind() == "identifier")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string())
+                    .collect();
+                if !names.is_empty() {
+                    *var_name = Some(names.join(", "));
+                }
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // func foo() ReturnType — result type
+            "function_declaration" | "method_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "result")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Java type binding extraction.
+    /// Handles: local_variable_declaration, field_declaration, formal_parameter,
+    /// method_declaration (return type).
+    fn extract_java_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // Type x = ...
+            "local_variable_declaration" | "field_declaration" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                // The declarator has the variable name
+                if let Some(decl) = node.child_by_field_name( "declarator") {
+                    *var_name = decl.child_by_field_name( "name")
+                        .or_else(|| decl.child_by_field_name( "pattern"))
+                        .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                }
+            }
+            // void foo(Type param) — formal_parameter
+            "formal_parameter" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *var_name = node.child_by_field_name( "name")
+                    .or_else(|| node.child_by_field_name( "pattern"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // Type foo() — method return type
+            "method_declaration" | "constructor_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// C++ type binding extraction.
+    /// Handles: parameter_declaration, field_declaration, function_definition (return type).
+    fn extract_cpp_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            "parameter_declaration" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *var_name = node.child_by_field_name( "declarator")
+                    .map(|d| content[d.start_byte()..d.end_byte()].to_string());
+            }
+            "field_declaration" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                if let Some(decl) = node.child_by_field_name( "declarator") {
+                    *var_name = Some(content[decl.start_byte()..decl.end_byte()].to_string());
+                }
+            }
+            "function_definition" => {
+                *var_name = node.child_by_field_name( "declarator")
+                    .map(|d| content[d.start_byte()..d.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .or_else(|| node.child_by_field_name( "type"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// C# type binding extraction.
+    /// Handles: variable_declaration, parameter, property_declaration,
+    /// method_declaration (return type).
+    fn extract_csharp_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // Type x = ...
+            "variable_declaration" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                if let Some(decl) = node.child_by_field_name( "declarator") {
+                    *var_name = decl.child_by_field_name( "name")
+                        .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                }
+            }
+            // Type param
+            "parameter" => {
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // Type Property { get; set; }
+            "property_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // Type Method() — return type
+            "method_declaration" | "constructor_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// PHP type binding extraction.
+    /// Handles: parameter (typed), property_element (typed), function_definition (return type).
+    fn extract_php_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // function foo(Type $param)
+            "parameter" => {
+                *type_text = node.child_by_field_name( "type")
+                    .or_else(|| node.child_by_field_name( "type_clause"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // private Type $prop;
+            "property_element" => {
+                // type_clause or type_list
+                *type_text = node.child_by_field_name( "type")
+                    .or_else(|| node.child_by_field_name( "type_clause"))
+                    .or_else(|| node.child_by_field_name( "type_list"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // function foo(): ReturnType
+            "function_definition" | "method_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Kotlin type binding extraction.
+    /// Handles: property_declaration, parameter, function_declaration (return type).
+    fn extract_kotlin_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // val x: Type = ...
+            "property_declaration" => {
+                *var_name = node.child_by_field_name("name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string())
+                    .or_else(|| {
+                        let mut walker = node.walk();
+                        let mut found = None;
+                        let mut cur = walker.node();
+                        // Walk children looking for simple_identifier
+                        if walker.goto_first_child() {
+                            loop {
+                                if cur.kind() == "simple_identifier" {
+                                    found = Some(content[cur.start_byte()..cur.end_byte()].to_string());
+                                    break;
+                                }
+                                if !walker.goto_next_sibling() {
+                                    break;
+                                }
+                                cur = walker.node();
+                            }
+                        }
+                        found
+                    });
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // fun foo(param: Type): ReturnType
+            "parameter" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            "function_declaration" => {
+                *var_name = node.children(&mut node.walk())
+                    .find(|c| c.kind() == "simple_identifier")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .or_else(|| node.child_by_field_name( "type"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Swift type binding extraction.
+    /// Handles: property_declaration (pattern_binding), parameter, function_declaration.
+    fn extract_swift_type_binding(
+        &self, node: Node, content: &str, node_kind: &str,
+        var_name: &mut Option<String>, type_text: &mut Option<String>,
+    ) {
+        match node_kind {
+            // let x: Type = ...
+            "property_declaration" | "class_declaration" | "struct_declaration" => {
+                // pattern_binding_list → pattern_binding → pattern → name
+                if let Some(pattern) = node.child_by_field_name( "pattern") {
+                    *var_name = pattern.child_by_field_name("name")
+                        .map(|n| content[n.start_byte()..n.end_byte()].to_string())
+                        .or_else(|| {
+                            let mut walker = pattern.walk();
+                            let mut found = None;
+                            let mut cur = walker.node();
+                            if walker.goto_first_child() {
+                                loop {
+                                    if cur.kind() == "simple_identifier" {
+                                        found = Some(content[cur.start_byte()..cur.end_byte()].to_string());
+                                        break;
+                                    }
+                                    if !walker.goto_next_sibling() {
+                                        break;
+                                    }
+                                    cur = walker.node();
+                                }
+                            }
+                            found
+                        });
+                }
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // func foo(param: Type) -> ReturnType
+            "parameter" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            "function_declaration" => {
+                *var_name = node.child_by_field_name( "name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name( "return_type")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            _ => {}
+        }
+    }
+
 
     /// Determine if a tree-sitter AST node creates a new scope.
     /// Returns Some(ScopeKind) if it does, None otherwise.

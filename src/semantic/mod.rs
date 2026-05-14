@@ -185,6 +185,8 @@ pub struct ParsedFile {
     pub assignments: Vec<Assignment>,
     pub decorators: Vec<Decorator>,
     pub http_clients: Vec<HttpClient>,
+    /// Type bindings extracted from AST: variable/parameter name → type text.
+    pub type_bindings: Vec<crate::syntax::TypeBinding>,
 }
 
 // =====================================================================
@@ -249,13 +251,14 @@ pub struct ParsedFileOutput {
 
 impl ParsedFile {
     pub fn from_captures(id: u64, path: &str, lang: LanguageId, hash: u64, captures: Vec<RawCapture>) -> Self {
-        Self::from_captures_with_scopes(id, path, lang, hash, captures, Vec::new())
+        Self::from_captures_with_scopes(id, path, lang, hash, captures, Vec::new(), Vec::new())
     }
 
     pub fn from_captures_with_scopes(
         id: u64, path: &str, lang: LanguageId, hash: u64,
         captures: Vec<RawCapture>,
         raw_scopes: Vec<crate::syntax::RawScope>,
+        type_bindings: Vec<crate::syntax::TypeBinding>,
     ) -> Self {
         // Convert RawScope → Scope, assigning sequential IDs
         let mut scopes: Vec<Scope> = raw_scopes
@@ -495,7 +498,7 @@ impl ParsedFile {
                         });
                     }
                 }
-                CaptureTag::Unknown | CaptureTag::CallWrapper | CaptureTag::ImportWrapper | CaptureTag::HeritageWrapper => {}
+                CaptureTag::Unknown | CaptureTag::CallWrapper | CaptureTag::ImportWrapper | CaptureTag::HeritageWrapper | CaptureTag::TypeAnnotation => {}
             }
         }
 
@@ -514,6 +517,7 @@ impl ParsedFile {
             assignments,
             decorators,
             http_clients,
+            type_bindings,
         }
     }
 
