@@ -192,6 +192,22 @@ impl GraphStore {
         ).optional()
     }
 
+    /// Get a file record by its ID.
+    pub fn get_file_by_id(&self, file_id: i64) -> rusqlite::Result<Option<FileRecord>> {
+        self.conn.query_row(
+            "SELECT id, path, hash, language, mtime, indexed_at FROM files WHERE id = ?1",
+            [file_id],
+            |row| Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                hash: row.get::<_, i64>(2)? as u64,
+                language: row.get(3)?,
+                mtime: row.get(4)?,
+                indexed_at: row.get(5)?,
+            }),
+        ).optional()
+    }
+
     /// Check if a file needs re-parsing (hash changed or not in store).
     /// Returns Some(file_id) if the file is unchanged, None if it needs re-parsing.
     pub fn check_file_unchanged(&self, path: &str, hash: u64) -> rusqlite::Result<Option<i64>> {

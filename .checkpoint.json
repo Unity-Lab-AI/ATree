@@ -1,12 +1,11 @@
 {
   "phase": "semantic-engine-v2",
   "commits": [
-    "e9c905d - scope-resolution pipeline",
-    "bfd6fb1 - wire scope-resolution into build_graph",
-    "46f3667 - replace legacy ResolutionEngine",
-    "750fcab - parallel parse + community/process/search engines",
-    "cc0c9f3 - call form classification",
-    "5d18578 - type environment + AST-based route extraction"
+    "52a0aee - honest scope resolution stats",
+    "bbe907e - AST type binding extraction wired into TypeEnvironment",
+    "506dc58 - Express route path extraction from AST",
+    "3b8b5d5 - persistent SQLite --db and --incremental flags",
+    "3bc9b3e - checkpoint update + PHP heritage test"
   ],
   "modules": {
     "core": ["lang/", "syntax/", "semantic/", "parse/"],
@@ -17,9 +16,9 @@
   },
   "stats": {
     "source_files": 41,
-    "tests_passing": 79,
+    "tests_passing": 80,
     "tests_failing": 0,
-    "test_time_ms": 68
+    "test_time_ms": 72
   },
   "done": [
     "Parallel two-phase pipeline (scan → parse)",
@@ -27,19 +26,22 @@
     "Call form classification (Free/Member/Constructor/Scoped)",
     "Receiver extraction from AST",
     "Scope resolution (receiver-bound, free-call, imports, C3 MRO)",
-    "Type environment (self/this/super, scope-aware, nullable stripping)",
-    "Route extraction (Next.js, Express via AST)",
+    "Honest scope resolution stats (resolved/unresolved tracking)",
+    "AST type binding extraction (TS/JS, Python, Rust, Go, Java, C#, PHP, Kotlin, Swift)",
+    "Type environment with scope-aware lookup",
+    "Route extraction (Next.js path-based, Express AST with paths)",
     "Community detection (weighted label propagation)",
     "Process tracing (entry point → BFS call chains)",
     "BM25 + hybrid search (SQLite FTS5)",
     "SQLite graph store with recursive CTEs",
-    "Incremental scanning + AST caching",
-    "8 P1/P2 bugs fixed"
+    "Persistent SQLite index (--db flag)",
+    "Incremental indexing (--incremental flag)",
+    "PHP heritage verified (no self-edges)"
   ],
   "next_up": [
-    "Embedding/semantic search (vector similarity)",
-    "Wildcard import synthesis (Go/Ruby/Swift re-exports)",
-    "Flask/Django route detection via tree-sitter queries",
-    "Type annotation extraction from AST"
+    "CLI query layer (symbols, callers, callees, impact, routes, search)",
+    "Golden fixture tests for Tier 1 languages",
+    "Benchmark harness + cold/warm proof",
+    "README with honest capabilities + architecture"
   ]
 }

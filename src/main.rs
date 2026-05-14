@@ -32,6 +32,24 @@ enum ThreadSpec {
 }
 
 #[derive(Debug)]
+enum QueryCommand {
+    /// Search symbols by name (fuzzy)
+    Symbols { name: String },
+    /// Show callers of a symbol
+    Callers { symbol: String, depth: usize },
+    /// Show callees of a symbol
+    Callees { symbol: String, depth: usize },
+    /// Show impact analysis (upstream + downstream)
+    Impact { symbol: String, depth: usize },
+    /// List detected API routes
+    Routes,
+    /// Full-text search
+    Search { query: String },
+    /// Show index statistics
+    Stats,
+}
+
+#[derive(Debug)]
 struct Args {
     root: PathBuf,
     start: Option<String>,
@@ -51,6 +69,7 @@ struct Args {
     print_schema: bool,
     db_path: Option<PathBuf>,
     incremental: bool,
+    query: Option<QueryCommand>,
 }
 
 impl Default for Args {
@@ -74,6 +93,7 @@ impl Default for Args {
             print_schema: false,
             db_path: None,
             incremental: false,
+            query: None,
         }
     }
 }
@@ -161,6 +181,74 @@ fn parse_args() -> Args {
             "--incremental" => args.incremental = true,
             "--json" => args.json = true,
             "--print-schema" | "--schema" => args.print_schema = true,
+            "query" => {
+                // Parse subcommand: atree query <subcommand> [args] --db <path>
+                i += 1;
+                if i >= cli_args.len() {
+                    eprintln!("Error: 'query' requires a subcommand: symbols, callers, callees, impact, routes, search, stats");
+                    std::process::exit(2);
+                }
+                match cli_args[i].as_str() {
+                    "symbols" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query symbols' requires a name pattern");
+                            std::process::exit(2);
+                        }
+                        args.query = Some(QueryCommand::Symbols { name: cli_args[i].clone() });
+                    }
+                    "callers" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query callers' requires a symbol name");
+                            std::process::exit(2);
+                        }
+                        let symbol = cli_args[i].clone();
+                        let depth = cli_args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(3);
+                        args.query = Some(QueryCommand::Callers { symbol, depth });
+                    }
+                    "callees" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query callees' requires a symbol name");
+                            std::process::exit(2);
+                        }
+                        let symbol = cli_args[i].clone();
+                        let depth = cli_args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(3);
+                        args.query = Some(QueryCommand::Callees { symbol, depth });
+                    }
+                    "impact" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query impact' requires a symbol name");
+                            std::process::exit(2);
+                        }
+                        let symbol = cli_args[i].clone();
+                        let depth = cli_args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(3);
+                        args.query = Some(QueryCommand::Impact { symbol, depth });
+                    }
+                    "routes" => {
+                        args.query = Some(QueryCommand::Routes);
+                    }
+                    "search" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query search' requires a query string");
+                            std::process::exit(2);
+                        }
+                        args.query = Some(QueryCommand::Search { query: cli_args[i].clone() });
+                    }
+                    "stats" => {
+                        args.query = Some(QueryCommand::Stats);
+                    }
+                    other => {
+                        eprintln!("Error: unknown query subcommand '{}'. Valid: symbols, callers, callees, impact, routes, search, stats", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+                continue;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -216,6 +304,14 @@ Options:
       --semantic             Enable code intelligence: extract symbols via tree-sitter
       --db <PATH>            Path to SQLite index file (default: in-memory)
       --incremental          Only re-index changed files (requires --db)
+      query <CMD>            Query an existing index (requires --db):
+                             query symbols <name>    Search symbols by name
+                             query callers <sym> [depth]  Show callers
+                             query callees <sym> [depth]  Show callees
+                             query impact <sym> [depth]   Impact analysis
+                             query routes            List API routes
+                             query search <text>     Full-text search
+                             query stats             Index statistics
       --json                 Emit a JSON report on stdout (status still goes to stderr)
       --print-schema         Print the bundled JSON Schema (Draft 7) on stdout and exit
   -h, --help                 Show this help
@@ -284,6 +380,215 @@ fn resolve_caps(args: &Args) -> (usize, usize, bool) {
 // Main
 // ---------------------------------------------------------------------
 
+/// Execute a query command against the code index.
+fn execute_query(cmd: &QueryCommand, args: &Args, scan: &atree::ScanResult) -> ! {
+    use atree::store::GraphStore;
+    use atree::search::{self, SearchConfig};
+
+    // Open the graph store (persistent DB or in-memory from scan)
+    let store = match &args.db_path {
+        Some(path) => GraphStore::open(path).unwrap_or_else(|e| {
+            eprintln!("Error opening index at {}: {}", path.display(), e);
+            std::process::exit(1);
+        }),
+        None => {
+            // Use in-memory store from the scan — but we need to rebuild it
+            // since ScanResult doesn't expose the store directly.
+            // For now, require --db for queries.
+            eprintln!("Error: query commands require --db <PATH> to specify an index file.");
+            eprintln!("       Run 'atree --semantic --db .atree/index.sqlite --root .' first to build the index.");
+            std::process::exit(1);
+        }
+    };
+
+    match cmd {
+        QueryCommand::Symbols { name } => {
+            let symbols = store.get_symbols_by_name(name).unwrap_or_else(|e| {
+                eprintln!("Error querying symbols: {}", e);
+                std::process::exit(1);
+            });
+            if symbols.is_empty() {
+                eprintln!("No symbols matching '{}' found.", name);
+                std::process::exit(0);
+            }
+            println!("Found {} symbol(s) matching '{}':", symbols.len(), name);
+            for sym in &symbols {
+                let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
+                let file_path = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                println!("  {}  {}  {}:{}  [{}]",
+                    sym.name,
+                    sym.kind,
+                    file_path,
+                    sym.line,
+                    if sym.is_exported { "exported" } else { "local" }
+                );
+            }
+        }
+        QueryCommand::Callers { symbol, depth } => {
+            // Find the symbol first
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            if syms.is_empty() {
+                eprintln!("Symbol '{}' not found. Try 'query symbols {}' first.", symbol, symbol);
+                std::process::exit(1);
+            }
+            for sym in &syms {
+                let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
+                let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                println!("Callers of {} ({}:{}) [depth={}]:",
+                    sym.name, fp, sym.line, depth);
+                let callers = store.get_callers(sym.id, *depth).unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                });
+                if callers.is_empty() {
+                    println!("  (no resolved callers)");
+                }
+                for (caller_id, caller_name, confidence, file_id) in &callers {
+                    let file = store.get_file_by_id(*file_id).unwrap_or(None);
+                    let file_path = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                    println!("  {}  {:.2}  {}:{}", caller_name, confidence, file_path, caller_id);
+                }
+                if syms.len() > 1 {
+                    println!("  ---");
+                }
+            }
+        }
+        QueryCommand::Callees { symbol, depth } => {
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            if syms.is_empty() {
+                eprintln!("Symbol '{}' not found.", symbol);
+                std::process::exit(1);
+            }
+            for sym in &syms {
+                let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
+                let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                println!("Callees of {} ({}:{}) [depth={}]:",
+                    sym.name, fp, sym.line, depth);
+                let callees = store.get_callees(sym.id, *depth).unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                });
+                if callees.is_empty() {
+                    println!("  (no resolved callees)");
+                }
+                for (callee_id, callee_name, confidence, file_id) in &callees {
+                    let file = store.get_file_by_id(*file_id).unwrap_or(None);
+                    let file_path = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                    println!("  {}  {:.2}  {}:{}", callee_name, confidence, file_path, callee_id);
+                }
+                if syms.len() > 1 {
+                    println!("  ---");
+                }
+            }
+        }
+        QueryCommand::Impact { symbol, depth } => {
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            if syms.is_empty() {
+                eprintln!("Symbol '{}' not found.", symbol);
+                std::process::exit(1);
+            }
+            for sym in &syms {
+                let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
+                let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
+                println!("Impact analysis for {} ({}:{}):", sym.name, fp, sym.line);
+                println!("  Upstream (callers, depth={}):", depth);
+                let callers = store.get_callers(sym.id, *depth).unwrap_or_default();
+                if callers.is_empty() {
+                    println!("    (none)");
+                }
+                for (id, name, conf, _) in &callers {
+                    println!("    {}  [{:.2}]", name, conf);
+                }
+                println!("  Downstream (callees, depth={}):", depth);
+                let callees = store.get_callees(sym.id, *depth).unwrap_or_default();
+                if callees.is_empty() {
+                    println!("    (none)");
+                }
+                for (id, name, conf, _) in &callees {
+                    println!("    {}  [{:.2}]", name, conf);
+                }
+            }
+        }
+        QueryCommand::Routes => {
+            // Query edges table for route-like patterns
+            let conn = store.conn();
+            let mut stmt = conn.prepare(
+                "SELECT s.name, s.file_path, s.line, e.edge_kind, e.confidence
+                 FROM edges e
+                 JOIN symbols s ON s.id = e.src_id
+                 WHERE e.edge_kind IN ('HANDLES_ROUTE', 'ROUTE')
+                 ORDER BY s.file_path, s.line"
+            ).unwrap_or_else(|e| {
+                eprintln!("Error querying routes: {}", e);
+                std::process::exit(1);
+            });
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            }).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            let mut count = 0;
+            for row in rows {
+                let (name, file, line, kind, conf) = row.unwrap();
+                println!("  {}  {}  {}:{}  [{:.2}]", kind, name, file, line, conf);
+                count += 1;
+            }
+            if count == 0 {
+                println!("  (no routes found — routes are extracted during --semantic scan but not yet persisted to edges table)");
+            } else {
+                println!("  {} route(s) found", count);
+            }
+        }
+        QueryCommand::Search { query } => {
+            let config = SearchConfig::default();
+            let results = search::search(&store, query, &config).unwrap_or_else(|e| {
+                eprintln!("Error searching: {}", e);
+                std::process::exit(1);
+            });
+            if results.is_empty() {
+                eprintln!("No results for '{}'", query);
+                std::process::exit(0);
+            }
+            println!("Search results for '{}':", query);
+            for hit in &results {
+                println!("  {}  {}  {}:{}  [{:.3}]",
+                    hit.name, hit.kind, hit.file_path, hit.line, hit.score);
+            }
+        }
+        QueryCommand::Stats => {
+            let stats = store.stats().unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+            println!("Index statistics:");
+            println!("  Files:      {}", stats.files);
+            println!("  Symbols:    {}", stats.symbols);
+            println!("  Scopes:     {}", stats.scopes);
+            println!("  Imports:    {}", stats.imports);
+            println!("  Calls:      {}", stats.calls);
+            println!("  Edges:      {}", stats.edges);
+            println!("  Resolved:   {} calls", stats.resolved_calls);
+        }
+    }
+    std::process::exit(0);
+}
+
 fn main() {
     let args = parse_args();
 
@@ -345,6 +650,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Handle query subcommands (work with existing DB or fresh scan)
+    if let Some(ref cmd) = args.query {
+        return execute_query(cmd, &args, &scan);
+    }
 
     let elapsed = start_time.elapsed();
     let stats = &scan.stats;
