@@ -32,7 +32,7 @@ impl LanguageProvider for CSharpProvider {
 (invocation_expression function: (member_access_expression name: (identifier) @call.name)) @call
 (invocation_expression function: (conditional_access_expression (member_binding_expression (identifier) @call.name))) @call
 (object_creation_expression type: (identifier) @call.name) @call
-(variable_declaration type: (identifier) @call.name (variable_declarator (implicit_object_creation_expression) @call))
+; Note: implicit_object_creation_expression (var x = new()) has no type name — skip it
 (local_declaration_statement (variable_declaration (variable_declarator (identifier) @name))) @definition.variable
 (class_declaration name: (identifier) @heritage.class (base_list (identifier) @heritage.extends)) @heritage
 (class_declaration name: (identifier) @heritage.class (base_list (generic_name (identifier) @heritage.extends))) @heritage

@@ -37,6 +37,11 @@ impl GraphStore {
         Ok(store)
     }
 
+    /// Get a reference to the underlying SQLite connection.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     fn init_schema(&self) -> rusqlite::Result<()> {
         // PRAGMAs must use query_row, not execute — they return results
         let _: String = self.conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
@@ -280,6 +285,27 @@ impl GraphStore {
              FROM symbols WHERE name = ?1"
         )?;
         let rows = stmt.query_map([name], |row| Ok(SymbolRecord {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            kind: row.get(4)?,
+            line: row.get::<_, i64>(5)? as usize,
+            col: row.get::<_, i64>(6)? as usize,
+            is_exported: row.get::<_, i64>(7)? != 0,
+            scope_id: row.get(8)?,
+            owner_symbol_id: row.get(9)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Get all symbols across all files.
+    pub fn get_all_symbols(&self) -> rusqlite::Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbols"
+        )?;
+        let rows = stmt.query_map([], |row| Ok(SymbolRecord {
             id: row.get(0)?,
             file_id: row.get(1)?,
             name: row.get(2)?,

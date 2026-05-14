@@ -24,7 +24,10 @@ impl LanguageProvider for CProvider {
 (preproc_include path: (_) @import.source) @import
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
+; Variable with initializer: int x = 5;
 (declaration declarator: (init_declarator declarator: (identifier) @name)) @definition.variable
+; Plain variable declaration without initializer: int x; int *p;
+(declaration declarator: (identifier) @name) @definition.variable
         "#
     }
 }

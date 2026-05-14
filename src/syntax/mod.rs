@@ -5,6 +5,15 @@ use crate::semantic::ScopeKind;
 
 pub struct SyntaxEngine;
 
+/// Compute a fast hash of file content for change detection.
+#[inline]
+pub fn hash_content(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.finish()
+}
+
 pub struct RawCapture {
     pub tag: CaptureTag,
     pub name: String,

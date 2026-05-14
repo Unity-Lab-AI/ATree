@@ -56,6 +56,7 @@ pub struct ResolutionEngine<'a> {
     // Hot-path in-memory indexes (built from store)
     symbols_by_name: FxHashMap<String, Vec<i64>>,
     symbols_by_file: FxHashMap<i64, Vec<i64>>,
+    symbols_by_id: FxHashMap<i64, SymbolRecord>, // O(1) symbol lookup by ID
     files_by_path: FxHashMap<String, i64>,
     file_languages: FxHashMap<i64, String>, // file_id → language string
     scopes_by_file: FxHashMap<i64, Vec<ScopeRecord>>,
@@ -69,6 +70,7 @@ impl<'a> ResolutionEngine<'a> {
             lang_configs: HashMap::new(),
             symbols_by_name: FxHashMap::default(),
             symbols_by_file: FxHashMap::default(),
+            symbols_by_id: FxHashMap::default(),
             files_by_path: FxHashMap::default(),
             file_languages: FxHashMap::default(),
             scopes_by_file: FxHashMap::default(),
@@ -97,6 +99,10 @@ impl<'a> ResolutionEngine<'a> {
                 sym_ids.push(sym.id);
             }
             self.symbols_by_file.insert(*file_id, sym_ids);
+            // Index each symbol by ID for O(1) lookup
+            for sym in &symbols {
+                self.symbols_by_id.insert(sym.id, sym.clone());
+            }
         }
         // Index scopes
         for file_id in self.files_by_path.values() {
@@ -294,8 +300,7 @@ impl<'a> ResolutionEngine<'a> {
     }
 
     fn get_symbol(&self, id: i64) -> Option<SymbolRecord> {
-        self.store.get_symbols_by_name("").ok()?.into_iter().find(|s| s.id == id)
-        // This is inefficient but correct. For production, build a symbol_by_id index.
+        self.symbols_by_id.get(&id).cloned()
     }
 
     // =================================================================

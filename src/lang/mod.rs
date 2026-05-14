@@ -93,7 +93,7 @@ impl From<&str> for CaptureTag {
             "heritage.extends" => CaptureTag::HeritageExtends,
             "heritage.implements" => CaptureTag::HeritageImplements,
             "heritage.trait" => CaptureTag::HeritageTrait,
-            "heritage.class" => CaptureTag::HeritageExtends, // class that has the heritage
+            "heritage.class" => CaptureTag::Unknown, // class that has the heritage — not a target
             "assignment" => CaptureTag::Assignment,
             "decorator" => CaptureTag::Decorator,
             "http_client" => CaptureTag::HttpClient,
@@ -130,6 +130,7 @@ pub mod json;
 pub mod yaml;
 
 use self::typescript::TypeScriptProvider;
+use self::typescript::TSXProvider;
 use self::javascript::JavaScriptProvider;
 use self::python::PythonProvider;
 use self::go::GoProvider;
@@ -148,6 +149,7 @@ use self::yaml::YAMLProvider;
 
 pub fn get_provider_for_extension(ext: &str) -> Option<&'static dyn LanguageProvider> {
     static TS: TypeScriptProvider = TypeScriptProvider;
+    static TSX: TSXProvider = TSXProvider;
     static JS: JavaScriptProvider = JavaScriptProvider;
     static PY: PythonProvider = PythonProvider;
     static GO: GoProvider = GoProvider;
@@ -165,6 +167,7 @@ pub fn get_provider_for_extension(ext: &str) -> Option<&'static dyn LanguageProv
     static YAML: YAMLProvider = YAMLProvider;
 
     if TS.extensions().contains(&ext) { return Some(&TS); }
+    if TSX.extensions().contains(&ext) { return Some(&TSX); }
     if JS.extensions().contains(&ext) { return Some(&JS); }
     if PY.extensions().contains(&ext) { return Some(&PY); }
     if GO.extensions().contains(&ext) { return Some(&GO); }

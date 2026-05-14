@@ -18,8 +18,12 @@ impl LanguageProvider for JavaScriptProvider {
 (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression))) @definition.function
 (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))) @definition.function
 (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression)))) @definition.function
-(lexical_declaration (variable_declarator name: (identifier) @name)) @definition.const
-(export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name))) @definition.const
+; Only capture const declarations as @definition.const — constrain to "const" keyword
+(lexical_declaration "const" (variable_declarator name: (identifier) @name)) @definition.const
+(export_statement declaration: (lexical_declaration "const" (variable_declarator name: (identifier) @name))) @definition.const
+; let declarations are variables
+(lexical_declaration "let" (variable_declarator name: (identifier) @name)) @definition.variable
+(export_statement declaration: (lexical_declaration "let" (variable_declarator name: (identifier) @name))) @definition.variable
 (variable_declaration (variable_declarator name: (identifier) @name)) @definition.variable
 (import_statement source: (string) @import.source) @import
 (export_statement source: (string) @import.source) @import

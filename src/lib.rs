@@ -10,6 +10,9 @@ pub mod resolver;
 pub mod scope_resolution;
 pub mod graph;
 pub mod store;
+pub mod community;
+pub mod process;
+pub mod search;
 /// `atree` — File-system A* pathfinding library.
 ///
 /// Public API:
@@ -278,6 +281,11 @@ type Job = (PathBuf, String, usize);
 #[derive(Default)]
 struct LocalAccum {
     pub parsed_files: Vec<crate::semantic::ParsedFile>,
+    /// File contents collected during scan, keyed by rel_path.
+    /// Used by the parallel parse phase to avoid re-reading from disk.
+    pub file_contents: FxHashMap<String, String>,
+    /// Files discovered during scan that need parsing (rel_path, ext).
+    pub parse_queue: Vec<(String, String)>,
     adj: FxHashMap<String, Vec<String>>,
     meta: FxHashMap<String, NodeMeta>,
 }
@@ -332,7 +340,6 @@ fn process_dir(
     node_count: &AtomicUsize,
     queue: &Worker<Job>,
     pending: &AtomicUsize,
-    syntax: &mut SyntaxEngine,
 ) {
     if depth >= opts.max_depth || node_count.load(Ordering::Relaxed) >= opts.max_nodes {
         return;
@@ -412,20 +419,13 @@ fn process_dir(
 
         if opts.semantic && !is_dir_final && !is_symlink {
             if let Some(ext) = Path::new(&child_rel).extension().and_then(|s| s.to_str()) {
-                if let Some(provider) = get_provider_for_extension(ext) {
+                if get_provider_for_extension(ext).is_some() {
+                    // Read file content and queue for parallel parse phase.
+                    // This avoids doing tree-sitter parsing while holding the directory lock,
+                    // and allows the parse phase to batch files across all threads.
                     if let Ok(content) = fs::read_to_string(&entry_path) {
-                        let file_hash = {
-                            use std::hash::{Hash, Hasher};
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            content.hash(&mut h);
-                            h.finish()
-                        };
-                        let file_id = file_hash; // use hash as unique ID
-                        let (captures, raw_scopes) = syntax.extract_captures_and_scopes(provider, &content);
-                        let parsed = ParsedFile::from_captures_with_scopes(
-                            file_id, &child_rel, provider.id(), file_hash, captures, raw_scopes,
-                        );
-                        local.parsed_files.push(parsed);
+                        local.file_contents.insert(child_rel.clone(), content);
+                        local.parse_queue.push((child_rel.clone(), ext.to_string()));
                     }
                 }
             }
@@ -508,11 +508,12 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 let root_name_ref = &root_name;
                 let opts_ref = &opts;
                 scope.spawn(move || {
-                    let mut syntax = SyntaxEngine::new();
                     let mut local = LocalAccum::default();
                     let hint = (max_nodes.min(1 << 18) / n).max(16);
                     local.adj.reserve(hint);
                     local.meta.reserve(hint);
+                    local.file_contents.reserve(hint);
+                    local.parse_queue.reserve(hint / 4);
 
                     let mut backoff: u32 = 0;
                     loop {
@@ -537,7 +538,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                             continue;
                         };
 
-                        process_dir(&job.0, &job.1, job.2, opts_ref, root_name_ref, &mut local, node_count_ref, &my_queue, pending_ref, &mut syntax);
+                        process_dir(&job.0, &job.1, job.2, opts_ref, root_name_ref, &mut local, node_count_ref, &my_queue, pending_ref);
                         pending_ref.fetch_sub(1, Ordering::Release);
                     }
                 })
@@ -545,6 +546,80 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+
+    // Phase 2: Parallel parse — distribute file contents across threads for tree-sitter parsing.
+    // Each thread gets its own SyntaxEngine (tree-sitter Parser is not Send/Sync).
+    // This is where the speed win comes from: all threads parse concurrently.
+    let n_parse_threads = n.max(1);
+    let all_parsed_files: Vec<ParsedFile> = if opts.semantic {
+        // Collect all file contents and parse queues from all threads
+        let mut all_contents: FxHashMap<String, String> = FxHashMap::default();
+        let mut all_parse_queue: Vec<(String, String)> = Vec::new();
+        for local in &locals {
+            all_contents.extend(local.file_contents.clone());
+            all_parse_queue.extend(local.parse_queue.clone());
+        }
+
+        if !all_parse_queue.is_empty() {
+            // Distribute parse jobs across threads
+            let chunk_size = (all_parse_queue.len() + n_parse_threads - 1) / n_parse_threads;
+            let chunks: Vec<Vec<(String, String)>> = all_parse_queue
+                .chunks(chunk_size.max(1))
+                .map(|c| c.to_vec())
+                .collect();
+
+            let parse_results: Vec<Vec<ParsedFile>> = thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let contents = &all_contents;
+                        scope.spawn(move || {
+                            let mut engine = SyntaxEngine::new();
+                            let mut results = Vec::new();
+
+                            for (rel_path, ext) in &chunk {
+                                let content = match contents.get(rel_path) {
+                                    Some(c) => c,
+                                    None => continue,
+                                };
+
+                                let provider = match get_provider_for_extension(ext) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+
+                                let file_id = {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    rel_path.hash(&mut h);
+                                    h.finish()
+                                };
+                                let file_hash = crate::syntax::hash_content(content);
+
+                                let (captures, raw_scopes) =
+                                    engine.extract_captures_and_scopes(provider, content);
+
+                                let parsed = ParsedFile::from_captures_with_scopes(
+                                    file_id, rel_path, provider.id(), file_hash,
+                                    captures, raw_scopes,
+                                );
+                                results.push(parsed);
+                            }
+
+                            results
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            parse_results.into_iter().flatten().collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     // Single-threaded merge into the global maps.
     let final_count = node_count.load(Ordering::Relaxed);
@@ -606,10 +681,8 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
 
     let truncated = final_count >= max_nodes;
 
-    let mut parsed_files = Vec::new();
-    for local in &locals {
-        parsed_files.extend(local.parsed_files.clone());
-    }
+    // Parsed files from the parallel parse phase above.
+    let mut parsed_files = all_parsed_files;
 
     // Build the persistent graph store and run scope-resolution pipeline.
     // The scope-resolution pipeline (RFC #909) replaces the legacy
@@ -729,6 +802,24 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 None
             };
 
+            // Run community detection (label propagation on CALLS/ACCESSES edges).
+            let _community_result = crate::community::detect_communities(
+                &store,
+                &crate::community::CommunityConfig::default(),
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            // Run process detection (entry point → call chain tracing).
+            let _process_result = crate::process::detect_processes(
+                &store,
+                &crate::process::ProcessConfig::default(),
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            // Initialize and populate BM25 search index.
+            crate::search::init_search_index(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let _search_count = crate::search::index_symbols(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
             let store_stats = store.stats()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let symbol_table = SymbolTable::from_store(&store)
@@ -843,7 +934,13 @@ pub fn build_graph_incremental(
             if let Some(ext) = Path::new(&rel_path).extension().and_then(|s| s.to_str()) {
                 if let Some(provider) = get_provider_for_extension(ext) {
                     let (captures, raw_scopes) = syntax.extract_captures_and_scopes(provider, &content);
-                    let file_id = *hash; // use hash as ID
+                    // Use path-based hash for file_id to avoid collisions on identical content
+                    let file_id = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        rel_path.hash(&mut h);
+                        h.finish()
+                    };
                     let parsed = ParsedFile::from_captures_with_scopes(
                         file_id, rel_path, provider.id(), *hash, captures, raw_scopes,
                     );
