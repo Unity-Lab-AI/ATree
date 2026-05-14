@@ -733,6 +733,8 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             // In incremental mode, skip files whose hashes haven't changed.
             let mut files_inserted = 0u64;
             let mut files_reused = 0u64;
+            // Global mapping: in-memory symbol ID → DB symbol ID (used for edge resolution)
+            let mut global_symbol_id_map: rustc_hash::FxHashMap<u64, i64> = rustc_hash::FxHashMap::default();
             for file in &parsed_files {
                 if opts.incremental {
                     if let Some(existing_id) = store.check_file_unchanged(&file.path, file.hash)
@@ -758,8 +760,8 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                     scope_id_map.push(store_scope_id);
                 }
 
-                // Insert symbols first (heritage needs symbol IDs)
-                let mut symbol_id_map: Vec<i64> = Vec::with_capacity(file.symbols.len());
+                // Insert symbols first (heritage needs symbol IDs).
+                // Build a mapping from in-memory symbol ID → DB symbol ID for edge resolution.
                 for sym in &file.symbols {
                     let store_scope_id = sym.scope_id.map(|sid| scope_id_map[sid as usize]);
                     let store_sym_id = store.insert_symbol(&SymbolRecord {
@@ -771,14 +773,14 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                         scope_id: store_scope_id,
                         owner_symbol_id: sym.owner_id.map(|v| v as i64),
                     }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                    symbol_id_map.push(store_sym_id);
+                    global_symbol_id_map.insert(sym.id, store_sym_id);
                 }
 
                 // Insert heritage (inheritance) relationships
                 for her in &file.heritage {
                     let child_id = file.symbols.iter()
                         .position(|s| s.name == her.class_name || her.class_name.is_empty())
-                        .map(|idx| symbol_id_map[idx])
+                        .and_then(|idx| file.symbols.get(idx).and_then(|s| global_symbol_id_map.get(&s.id).copied()))
                         .unwrap_or(0);
                     store.insert_heritage(&HeritageRecord {
                         id: 0, file_id,
@@ -826,20 +828,25 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 );
 
                 // Persist scope-resolution edges into the graph store.
-                // GraphEdge { source_id, target_id, edge_type, confidence, reason }
-                // maps to EdgeRecord { src_id, dst_id, edge_kind, confidence, file_id, line }.
+                // Map in-memory symbol IDs → DB symbol IDs using the global map.
                 let mut edges_inserted = 0u64;
                 for edge in &sr_edges {
-                    // Find the file_id for this edge by looking up which file owns the source symbol
-                    let file_id = find_file_id_for_symbol(&store, edge.source_id as i64)?;
+                    let src_db_id = global_symbol_id_map.get(&(edge.source_id as u64)).copied().unwrap_or(0);
+                    let dst_db_id = global_symbol_id_map.get(&(edge.target_id as u64)).copied().unwrap_or(0);
+                    if src_db_id == 0 || dst_db_id == 0 {
+                        // Skip edges where we can't resolve both endpoints
+                        continue;
+                    }
+                    // Find the file_id for the source symbol
+                    let file_id = find_file_id_for_symbol(&store, src_db_id).unwrap_or(None).unwrap_or(0);
                     store.insert_edge(&crate::store::EdgeRecord {
                         id: 0,
-                        src_id: edge.source_id as i64,
-                        dst_id: edge.target_id as i64,
+                        src_id: src_db_id,
+                        dst_id: dst_db_id,
                         edge_kind: edge.edge_type.clone(),
                         confidence: edge.confidence,
-                        file_id,
-                        line: 0,  // TODO: extract from reference site if available
+                        file_id: Some(file_id),
+                        line: 0,
                     }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                     edges_inserted += 1;
                 }
