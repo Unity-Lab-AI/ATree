@@ -87,6 +87,7 @@ pub struct ScanResult {
     pub symbol_table: SymbolTable,
     pub store_stats: crate::store::StoreStats,
     pub resolution_stats: Option<crate::resolver::ResolutionStats>,
+    pub scope_resolution_stats: Option<crate::scope_resolution::ScopeResolutionStats>,
     pub adj: FxHashMap<String, Vec<String>>,
     pub root_name: String,
     pub meta: FxHashMap<String, NodeMeta>,
@@ -139,6 +140,7 @@ pub struct JsonReport {
     pub symbol_table: Option<SymbolTable>,
     pub store_stats: Option<crate::store::StoreStats>,
     pub resolution_stats: Option<crate::resolver::ResolutionStats>,
+    pub scope_resolution_stats: Option<crate::scope_resolution::ScopeResolutionStats>,
     pub schema_version: u32,
     pub version: String,
     pub root: String,
@@ -708,11 +710,26 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
         (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0 }, SymbolTable::new(), None)
     };
 
+    // Run scope-resolution pipeline (RFC #909) when semantic mode is enabled.
+    // This is the registry-primary resolver that produces ScopeResolutionStats
+    // with receiver-bound calls, free-call fallback, and import edges.
+    let scope_resolution_stats = if opts.semantic && !parsed_files.is_empty() {
+        let all_file_paths: Vec<String> = parsed_files.iter().map(|f| f.path.clone()).collect();
+        let (sr_stats, _edges) = crate::scope_resolution::orchestrator::run_scope_resolution(
+            &mut parsed_files,
+            &all_file_paths,
+        );
+        Some(sr_stats)
+    } else {
+        None
+    };
+
     Ok(ScanResult {
         parsed_files,
         symbol_table,
         store_stats,
         resolution_stats,
+        scope_resolution_stats,
         adj,
         root_name,
         meta,
@@ -722,7 +739,6 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
 }
 
 // =====================================================================
-// Incremental scanning=====================================================================
 // Incremental scanning
 // =====================================================================
 
@@ -914,6 +930,7 @@ pub fn build_graph_incremental(
         symbol_table,
         store_stats: store_stats.clone(),
         resolution_stats,
+        scope_resolution_stats: None,
         adj: FxHashMap::default(),
         root_name,
         meta: FxHashMap::default(),
@@ -1334,6 +1351,7 @@ pub fn build_json_report(
         symbol_table: if options.semantic { Some(scan.symbol_table.clone()) } else { None },
         store_stats: if options.semantic { Some(scan.store_stats.clone()) } else { None },
         resolution_stats: if options.semantic { scan.resolution_stats.clone() } else { None },
+        scope_resolution_stats: if options.semantic { scan.scope_resolution_stats.clone() } else { None },
         schema_version: SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         root: options.root.display().to_string(),

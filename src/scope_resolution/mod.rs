@@ -21,6 +21,7 @@ pub mod compound_receiver;
 pub mod overload_narrowing;
 pub mod namespace_targets;
 pub mod reconcile_ownership;
+pub mod orchestrator;
 
 use serde::{Serialize, Deserialize};
 use rustc_hash::FxHashMap;
