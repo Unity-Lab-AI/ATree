@@ -247,7 +247,7 @@ pub fn run_pipeline(
                     })
                     .collect();
 
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles.into_iter().map(|h| h.join().expect("pipeline worker thread panicked")).collect()
             })
         };
 

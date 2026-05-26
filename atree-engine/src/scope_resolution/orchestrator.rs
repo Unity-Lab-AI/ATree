@@ -226,7 +226,7 @@ fn parallel_build_indexes(parsed_files: &[ParsedFile], n_threads: usize) -> Scop
             .chunks(chunk_size)
             .map(|chunk| scope.spawn(move || build_indexes_single(chunk)))
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
     });
 
     let mut merged = ScopeResolutionIndexes::new();
@@ -477,7 +477,7 @@ fn parallel_receiver_bound_calls(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
     });
 
     let mut total_emitted = 0;
@@ -556,7 +556,7 @@ fn parallel_free_call_fallback(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
     });
 
     let mut total_emitted = 0;
@@ -583,7 +583,7 @@ fn parallel_extract_reference_sites(parsed_files: &[ParsedFile], n_threads: usiz
             .chunks(chunk_size)
             .map(|chunk| scope.spawn(move || extract_reference_sites_single(chunk)))
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
     });
 
     let mut sites = Vec::new();

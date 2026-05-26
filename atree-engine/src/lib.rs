@@ -664,7 +664,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
     });
 
     perf_timer!("Tree-sitter parse");
@@ -769,7 +769,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                         })
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
             });
 
             parse_results.into_iter().flatten().collect()
