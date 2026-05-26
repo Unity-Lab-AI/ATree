@@ -669,23 +669,72 @@ Cross-compilation prerequisites and per-platform instructions are documented in 
 
 # Dependencies
 
-## atree-engine (library)
+## ATree — Filesystem tool
+
+These deps are always included. Zero optional features needed.
+
+| Crate | Purpose |
+|-------|---------|
+| `crossbeam-deque` | Lock-free work-stealing parallel scanner |
+| `rustc-hash` | `FxHashMap` — fast non-cryptographic hashing |
+| `mimalloc` | Fast multi-threaded memory allocator |
+| `serde` + `serde_json` | Structured output and config parsing |
+
+Minimal build (filesystem only, no semantic):
+```bash
+cargo build --release -p atree
+```
+
+## ATree Semantic Engine
+
+Everything above, plus these engine deps. Activated with `--semantic` or `--db`.
+
+### Core engine (always included with semantic)
 
 | Crate | Purpose |
 |-------|---------|
 | `tree-sitter` + 16 language grammars | Multi-language AST parsing and symbol extraction |
 | `rusqlite` (bundled) | Persistent SQLite graph store with recursive CTEs |
-| `git2` | Git history extraction (commits, blame, co-change) — optional feature |
-| `crossbeam-deque` | Lock-free work-stealing parallel scanner |
-| `rustc-hash` | `FxHashMap` — fast non-cryptographic hashing |
-| `mimalloc` | Fast multi-threaded memory allocator |
-| `serde` + `serde_json` | Structured output and config parsing |
-| `fastembed` | Semantic vector embeddings (optional feature) |
-| `rmcp` + `tokio` + `schemars` | MCP server for AI agent tool integration (optional feature) |
+| `regex` | Pattern matching for symbol extraction |
 
-## atree-cli (binary)
+### Optional: Git history (`git` feature, default on)
 
-All of the above via `atree-engine`, plus CLI argument parsing. No additional heavy dependencies.
+| Crate | Purpose |
+|-------|---------|
+| `git2` | Git history extraction (commits, blame, co-change) |
+| `chrono` | Timestamp handling |
+
+Disable: `atree-engine = { version = "0.7", default-features = false }`
+
+### Optional: Semantic embeddings (`embeddings` feature)
+
+| Crate | Purpose |
+|-------|---------|
+| `fastembed` | Semantic vector embeddings via ONNX runtime |
+
+Enable: `--embeddings` flag during indexing.
+
+### Optional: MCP server (`mcp` feature)
+
+| Crate | Purpose |
+|-------|---------|
+| `rmcp` | Model Context Protocol server runtime |
+| `tokio` | Async runtime for MCP stdio transport |
+| `schemars` | JSON Schema generation for tool inputs |
+
+Enable: `cargo build --release --features mcp -p atree`
+
+### Full semantic build (everything)
+
+```bash
+cargo build --release --features mcp -p atree
+```
+
+Equivalently:
+```toml
+[dependencies]
+atree-engine = { version = "0.7", features = ["git", "embeddings", "mcp"] }
+```
 
 # Project information
 
