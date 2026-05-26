@@ -220,9 +220,13 @@ fn parse_args() -> Args {
     let mut args = Args::default();
     let cli_args: Vec<String> = std::env::args().collect();
 
+    fn help() -> &'static str {
+        "\nRun 'atree --help' for usage information."
+    }
+
     fn take_value<'a>(cli_args: &'a [String], i: usize) -> &'a str {
         cli_args.get(i + 1).map(|s| s.as_str()).unwrap_or_else(|| {
-            eprintln!("Error: flag '{}' requires a value", cli_args[i]);
+            eprintln!("Error: flag '{}' requires a value{}", cli_args[i], help());
             std::process::exit(2);
         })
     }
@@ -230,8 +234,8 @@ fn parse_args() -> Args {
     fn parse_usize(flag: &str, raw: &str) -> usize {
         raw.parse().unwrap_or_else(|_| {
             eprintln!(
-                "Error: flag '{}' expected a non-negative integer, got '{}'",
-                flag, raw
+                "Error: flag '{}' expected a non-negative integer, got '{}'{}",
+                flag, raw, help()
             );
             std::process::exit(2);
         })
@@ -246,8 +250,8 @@ fn parse_args() -> Args {
                 Ok(n) => ThreadSpec::Explicit(n),
                 Err(_) => {
                     eprintln!(
-                        "Error: --threads expected 'all', 'auto', or a number, got '{}'",
-                        raw
+                        "Error: --threads expected 'all', 'auto', or a number, got '{}'{}",
+                        raw, help()
                     );
                     std::process::exit(2);
                 }
@@ -311,7 +315,7 @@ fn parse_args() -> Args {
             "group" => {
                 i += 1;
                 if i >= cli_args.len() {
-                    eprintln!("Error: 'group' requires a subcommand: scan");
+                    eprintln!("Error: 'group' requires a subcommand: scan{}", help());
                     std::process::exit(2);
                 }
                 match cli_args[i].as_str() {
@@ -351,14 +355,14 @@ fn parse_args() -> Args {
                             i += 1;
                         }
                         if repos.is_empty() {
-                            eprintln!("Error: 'group scan' requires at least one --repos name:path");
+                            eprintln!("Error: 'group scan' requires at least one --repos name:path{}", help());
                             std::process::exit(2);
                         }
                         let resolved_threads = resolve_threads(&threads);
                         args.group = Some(GroupScanArgs { repos, db_path, threads: resolved_threads, semantic });
                     }
                     other => {
-                        eprintln!("Error: unknown group subcommand '{}'. Valid: scan", other);
+                        eprintln!("Error: unknown group subcommand '{}'. Valid: scan{}", other, help());
                         std::process::exit(2);
                     }
                 }
@@ -372,14 +376,14 @@ fn parse_args() -> Args {
                 // Parse subcommand: atree query <subcommand> [args] --db <path>
                 i += 1;
                 if i >= cli_args.len() {
-                    eprintln!("Error: 'query' requires a subcommand: symbols, callers, callees, impact, routes, search, stats");
+                    eprintln!("Error: 'query' requires a subcommand. Run 'atree --help' for full list.{}", help());
                     std::process::exit(2);
                 }
                 match cli_args[i].as_str() {
                     "symbols" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query symbols' requires a name pattern");
+                            eprintln!("Error: 'query symbols' requires a name pattern{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::Symbols { name: cli_args[i].clone() });
@@ -387,7 +391,7 @@ fn parse_args() -> Args {
                     "callers" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query callers' requires a symbol name");
+                            eprintln!("Error: 'query callers' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         let symbol = cli_args[i].clone();
@@ -397,7 +401,7 @@ fn parse_args() -> Args {
                     "callees" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query callees' requires a symbol name");
+                            eprintln!("Error: 'query callees' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         let symbol = cli_args[i].clone();
@@ -407,7 +411,7 @@ fn parse_args() -> Args {
                     "impact" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query impact' requires a symbol name");
+                            eprintln!("Error: 'query impact' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         let symbol = cli_args[i].clone();
@@ -420,7 +424,7 @@ fn parse_args() -> Args {
                     "search" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query search' requires a query string");
+                            eprintln!("Error: 'query search' requires a query string{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::Search { query: cli_args[i].clone() });
@@ -428,7 +432,7 @@ fn parse_args() -> Args {
                     "semantic-search" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query semantic-search' requires a query string");
+                            eprintln!("Error: 'query semantic-search' requires a query string{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::SemanticSearch { query: cli_args[i].clone() });
@@ -442,7 +446,7 @@ fn parse_args() -> Args {
                     "context" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query context' requires a symbol name");
+                            eprintln!("Error: 'query context' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::Context { symbol: cli_args[i].clone() });
@@ -453,7 +457,7 @@ fn parse_args() -> Args {
                     "rename" => {
                         i += 1;
                         if i + 1 >= cli_args.len() {
-                            eprintln!("Error: 'query rename' requires <old_name> <new_name>");
+                            eprintln!("Error: 'query rename' requires <old_name> <new_name>{}", help());
                             std::process::exit(2);
                         }
                         let symbol_name = cli_args[i].clone();
@@ -465,7 +469,7 @@ fn parse_args() -> Args {
                     "cypher" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query cypher' requires a SQL query");
+                            eprintln!("Error: 'query cypher' requires a SQL query{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::Cypher { query: cli_args[i].clone() });
@@ -491,7 +495,7 @@ fn parse_args() -> Args {
                     "group-sync" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query group-sync' requires a group name");
+                            eprintln!("Error: 'query group-sync' requires a group name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::GroupSync { name: cli_args[i].clone() });
@@ -499,7 +503,7 @@ fn parse_args() -> Args {
                     "explain" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query explain' requires a symbol name");
+                            eprintln!("Error: 'query explain' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::ExplainSymbol { symbol: cli_args[i].clone() });
@@ -510,7 +514,7 @@ fn parse_args() -> Args {
                     "trace-path" => {
                         i += 1;
                         if i + 1 >= cli_args.len() {
-                            eprintln!("Error: 'query trace-path' requires <from> <to>");
+                            eprintln!("Error: 'query trace-path' requires <from> <to>{}", help());
                             std::process::exit(2);
                         }
                         let from = cli_args[i].clone();
@@ -526,7 +530,7 @@ fn parse_args() -> Args {
                     "affected-tests" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query affected-tests' requires a symbol name");
+                            eprintln!("Error: 'query affected-tests' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::AffectedTests { symbol: cli_args[i].clone() });
@@ -534,7 +538,7 @@ fn parse_args() -> Args {
                     "validation-plan" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query validation-plan' requires a symbol name");
+                            eprintln!("Error: 'query validation-plan' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::ValidationPlan { symbol: cli_args[i].clone() });
@@ -556,7 +560,7 @@ fn parse_args() -> Args {
                     "impact-by-kind" => {
                         i += 1;
                         if i + 1 >= cli_args.len() {
-                            eprintln!("Error: 'query impact-by-kind' requires <target> <kind> [direction]");
+                            eprintln!("Error: 'query impact-by-kind' requires <target> <kind> [direction]{}", help());
                             std::process::exit(2);
                         }
                         let target = cli_args[i].clone();
@@ -574,7 +578,7 @@ fn parse_args() -> Args {
                     "side-effects" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query side-effects' requires a symbol name");
+                            eprintln!("Error: 'query side-effects' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::SideEffectScanner { symbol: cli_args[i].clone() });
@@ -582,7 +586,7 @@ fn parse_args() -> Args {
                     "change-coupling" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query change-coupling' requires a symbol name");
+                            eprintln!("Error: 'query change-coupling' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::ChangeCoupling { symbol: cli_args[i].clone() });
@@ -595,7 +599,7 @@ fn parse_args() -> Args {
                     "edit-scope" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query edit-scope' requires a symbol name");
+                            eprintln!("Error: 'query edit-scope' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::MinimalEditScope { symbol: cli_args[i].clone() });
@@ -603,7 +607,7 @@ fn parse_args() -> Args {
                     "issue-locator" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query issue-locator' requires an issue description");
+                            eprintln!("Error: 'query issue-locator' requires an issue description{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::IssueToCodeLocator { issue: cli_args[i].clone() });
@@ -614,7 +618,7 @@ fn parse_args() -> Args {
                     "rename-safety" => {
                         i += 1;
                         if i + 1 >= cli_args.len() {
-                            eprintln!("Error: 'query rename-safety' requires <old_name> <new_name>");
+                            eprintln!("Error: 'query rename-safety' requires <old_name> <new_name>{}", help());
                             std::process::exit(2);
                         }
                         let symbol_name = cli_args[i].clone();
@@ -631,7 +635,7 @@ fn parse_args() -> Args {
                     "error-trace" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query error-trace' requires a symbol name");
+                            eprintln!("Error: 'query error-trace' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::ErrorPathTrace { symbol: cli_args[i].clone() });
@@ -639,7 +643,7 @@ fn parse_args() -> Args {
                     "resource-lifecycle" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query resource-lifecycle' requires a resource name");
+                            eprintln!("Error: 'query resource-lifecycle' requires a resource name{}", help());
                             std::process::exit(2);
                         }
                         args.query = Some(QueryCommand::ResourceLifecycleMap { resource: cli_args[i].clone() });
@@ -656,7 +660,7 @@ fn parse_args() -> Args {
                     "evidence-path" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query evidence-path' requires a query string");
+                            eprintln!("Error: 'query evidence-path' requires a query string{}", help());
                             std::process::exit(2);
                         }
                         let query = cli_args[i].clone();
@@ -671,7 +675,7 @@ fn parse_args() -> Args {
                     "file-history" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query file-history' requires a file path");
+                            eprintln!("Error: 'query file-history' requires a file path{}", help());
                             std::process::exit(2);
                         }
                         let path = cli_args[i].clone();
@@ -682,7 +686,7 @@ fn parse_args() -> Args {
                     "git-blame" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query git-blame' requires a file path");
+                            eprintln!("Error: 'query git-blame' requires a file path{}", help());
                             std::process::exit(2);
                         }
                         let path = cli_args[i].clone();
@@ -701,7 +705,7 @@ fn parse_args() -> Args {
                     "co-change" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query co-change' requires a file path");
+                            eprintln!("Error: 'query co-change' requires a file path{}", help());
                             std::process::exit(2);
                         }
                         let path = cli_args[i].clone();
@@ -715,7 +719,7 @@ fn parse_args() -> Args {
                     "symbol-ownership" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query symbol-ownership' requires a symbol name");
+                            eprintln!("Error: 'query symbol-ownership' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         let symbol = cli_args[i].clone();
@@ -724,7 +728,7 @@ fn parse_args() -> Args {
                     "change-risk" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query change-risk' requires a file path");
+                            eprintln!("Error: 'query change-risk' requires a file path{}", help());
                             std::process::exit(2);
                         }
                         let path = cli_args[i].clone();
@@ -733,7 +737,7 @@ fn parse_args() -> Args {
                     "find-experts" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query find-experts' requires a file path or symbol name");
+                            eprintln!("Error: 'query find-experts' requires a file path or symbol name{}", help());
                             std::process::exit(2);
                         }
                         let path = cli_args[i].clone();
@@ -742,7 +746,7 @@ fn parse_args() -> Args {
                     "smart-co-change" => {
                         i += 1;
                         if i >= cli_args.len() {
-                            eprintln!("Error: 'query smart-co-change' requires a symbol name");
+                            eprintln!("Error: 'query smart-co-change' requires a symbol name{}", help());
                             std::process::exit(2);
                         }
                         let symbol = cli_args[i].clone();
@@ -770,7 +774,7 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             other => {
-                eprintln!("Error: unknown argument '{}'. Try --help.", other);
+                eprintln!("Error: unknown argument '{}'. Run 'atree --help' for usage information.", other);
                 std::process::exit(2);
             }
         }
@@ -905,7 +909,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
     });
     let store = match &db_path {
         Some(path) => GraphStore::open(path).unwrap_or_else(|e| {
-            eprintln!("Error opening index at {}: {}", path.display(), e);
+            eprintln!("Error opening index at {}: {}\nRun 'atree --help' for usage information.", path.display(), e);
             std::process::exit(1);
         }),
         None => {
@@ -3910,7 +3914,7 @@ fn main() {
         }
         #[cfg(not(feature = "mcp"))]
         {
-            eprintln!("Error: mcp-server requires the 'mcp' feature. Rebuild with: cargo build --features mcp");
+            eprintln!("Error: mcp-server requires the 'mcp' feature. Rebuild with: cargo build --features mcp -p atree\nRun 'atree --help' for usage information.");
             std::process::exit(2);
         }
     }
