@@ -182,6 +182,8 @@ struct Args {
     graph_phases: bool,
     query: Option<QueryCommand>,
     group: Option<GroupScanArgs>,
+    /// When true, start the MCP server instead of scanning/querying.
+    mcp_server: bool,
 }
 
 impl Default for Args {
@@ -209,6 +211,7 @@ impl Default for Args {
             graph_phases: false,
             query: None,
             group: None,
+            mcp_server: false,
         }
     }
 }
@@ -359,6 +362,11 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     }
                 }
+            }
+            "mcp-server" => {
+                // Start MCP server for AI agent integration (used by Crush and other MCP hosts).
+                // Requires --db <path> to specify which index to serve.
+                args.mcp_server = true;
             }
             "query" => {
                 // Parse subcommand: atree query <subcommand> [args] --db <path>
@@ -3888,6 +3896,24 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
 fn main() {
     let args = parse_args();
+
+    // Handle MCP server mode — start the MCP server instead of scanning/querying.
+    if args.mcp_server {
+        #[cfg(feature = "mcp")]
+        {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(atree_engine::mcp::run_mcp_server(
+                Some("atree".to_string()),
+                args.db_path,
+            )).expect("MCP server failed");
+            return;
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            eprintln!("Error: mcp-server requires the 'mcp' feature. Rebuild with: cargo build --features mcp");
+            std::process::exit(2);
+        }
+    }
 
     // Handle group scan (cross-repo) before single-repo scan.
     if let Some(ref group_args) = args.group {

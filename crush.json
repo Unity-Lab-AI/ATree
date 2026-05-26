@@ -1,0 +1,10 @@
+{
+  "mcp": {
+    "atree": {
+      "type": "stdio",
+      "command": "atree",
+      "args": ["mcp-server"],
+      "env": {}
+    }
+  }
+}

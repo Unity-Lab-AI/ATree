@@ -20,7 +20,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 // =====================================================================
 // Tool Input Types
@@ -95,10 +94,16 @@ impl ATreeMcpServer {
     }
 
     /// Open a GraphStore from the configured db_path.
+    /// Falls back to `.atree/index.sqlite` in the current directory if no path is configured.
     fn open_store(&self) -> Result<crate::store::GraphStore, ErrorData> {
-        let path = self.db_path.as_ref()
-            .ok_or_else(|| ErrorData::internal_error("No db_path configured".to_string(), None))?;
-        crate::store::GraphStore::open(path)
+        let path = self.db_path.clone().or_else(|| {
+            let default = std::path::PathBuf::from(".atree/index.sqlite");
+            if default.exists() { Some(default) } else { None }
+        }).ok_or_else(|| ErrorData::internal_error(
+            "No db_path configured and .atree/index.sqlite not found. Pass --db <path> or run from a project with an index.".to_string(),
+            None,
+        ))?;
+        crate::store::GraphStore::open(&path)
             .map_err(|e| ErrorData::internal_error(format!("Failed to open store: {}", e), None))
     }
 

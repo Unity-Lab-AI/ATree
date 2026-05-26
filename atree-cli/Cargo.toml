@@ -28,4 +28,4 @@ schemars = { version = "1.0", optional = true }
 
 [features]
 default = []
-mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
+mcp = ["dep:rmcp", "dep:tokio", "dep:schemars", "atree-engine/mcp"]

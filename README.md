@@ -116,6 +116,39 @@ Feature flags (for the library):
 
 Omit `default-features = false` if you don't need git history or embeddings.
 
+### MCP server
+
+ATree exposes its semantic code intelligence as MCP (Model Context Protocol) tools for AI agent integration. Start the server with:
+
+```bash
+# Auto-detect .atree/index.sqlite in current directory:
+atree mcp-server
+
+# Or specify the index explicitly:
+atree mcp-server --db .atree/index.sqlite
+```
+
+Configure your MCP client (e.g. Crush) to spawn it:
+
+```json
+{
+  "mcp": {
+    "atree": {
+      "type": "stdio",
+      "command": "atree",
+      "args": ["mcp-server"],
+      "env": {}
+    }
+  }
+}
+```
+
+Requires building with the `mcp` feature: `cargo build --release --features mcp -p atree`.
+
+Available MCP tools (43 total):
+- **In-process** (fast, no subprocess): `query`, `context`, `impact`, `evidence_path`, `explain_symbol`, `trace_call_path`
+- **CLI fallback** (spawns `atree` binary): `list_repos`, `index`, `detect_changes`, `rename`, `cypher`, `route_map`, `shape_check`, `tool_map`, `api_impact`, `verify`, `group_list`, `group_sync`, `find_entrypoints`, `public_api_surface`, `affected_tests`, `validation_plan`, `contract_change_detector`, `architecture_boundary_check`, `scope_violation_detector`, `config_surface_map`, `impact_by_symbol_kind`, `semantic_diff_summary`, `side_effect_scanner`, `change_coupling`, `concurrency_surface_detector`, `minimal_edit_scope`, `issue_to_code_locator`, `docs_drift_detector`, `rename_safety_check`, `dead_code_candidates`, `ownership_hotspots`, `error_path_trace`, `resource_lifecycle_map`, `dependency_cycle_detector`, `find_uncovered_symbols`, `resolution_stats`
+
 **Supported languages (Tier 1):** TypeScript, JavaScript, Python, Rust
 **Supported languages (Tier 2):** Go, Java, C#, PHP
 **Supported languages (Tier 3):** C, C++, Ruby, Kotlin, Swift, Bash, JSON, YAML
@@ -181,6 +214,15 @@ git clone <repository-url>
 cd atree
 cargo build --release -p atree
 # binary: ./target/release/atree
+
+# With MCP server support (for AI agent integration):
+cargo build --release --features mcp -p atree
+```
+
+Copy the binary to a directory on your PATH:
+
+```bash
+cp ./target/release/atree ~/.local/bin/atree
 ```
 
 A `cargo install` workflow will be supported once the project is published to crates.io.
