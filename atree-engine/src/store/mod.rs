@@ -409,6 +409,13 @@ impl GraphStore {
         }
         drop(stmt);
         tx.commit()?;
+
+        // Post-commit verification.
+        let expected = edges.len() as i64;
+        if count as i64 != expected {
+            log::warn!("[batch] edge insert: {}/{} persisted ({} failed)", count, expected, expected - count as i64);
+        }
+
         Ok(count)
     }
 

@@ -385,6 +385,7 @@ fn persist_git_data(
     file_commits: &[FileCommitRecord],
     authors: &[AuthorStats],
 ) -> anyhow::Result<()> {
+    // SAFETY: persist_git_data is never called within an existing transaction.
     let tx = conn.unchecked_transaction()?;
 
     // Create git tables if they don't exist

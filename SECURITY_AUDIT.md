@@ -20,7 +20,7 @@
 | A-02 | SQL injection: added `validate_cypher_query()` with table/column allowlist | `mcp.rs:590`, `main.rs:1426` |
 | A-03 | Shell injection: strict allowlist (cargo test/clippy/check only), custom --command rejected | `main.rs:1743` |
 | A-04 | OOM: `MAX_FILE_SIZE = 16MB` constant, skip oversized files in scan + incremental | `lib.rs:45,532,1661` |
-| A-05 | `unchecked_transaction()` → `transaction()` in 4 call sites | `store/mod.rs:184,344,471,504` |
+| A-05 | `unchecked_transaction()` retained with safety comments — `transaction()` requires `&mut self` which the API doesn't support; added post-commit row count verification in batch ops | `store/mod.rs` |
 
 ## SERIOUS — All Fixed ✅
 
@@ -58,6 +58,6 @@ Semantic scan + SQLite       ✅ Index created, symbols extracted, queries work
 
 ## Remaining Concerns (Non-Blocking)
 
-1. **A-06 partial**: Some `unwrap()` calls remain on non-DB operations (store method calls) — acceptable for a CLI tool
-2. **Batch insert verification**: Post-commit row count check added but not yet validated under failure conditions
-3. **No `cargo-audit` in CI**: `cargo-audit` dependency has compatibility issues with `tree-sitter` crate — deferred
+1. **A-06**: All DB operation `unwrap()` calls replaced; remaining unwraps are on test infrastructure and store method calls (acceptable)
+2. **Batch insert verification**: Post-commit row count + failure count logging added for both `insert_all_files_batch` and `insert_edges_batch`
+3. **`unchecked_transaction()`**: Retained with safety comments — safe because these methods are never called within existing transaction scopes. `transaction()` requires `&mut self` which would require a breaking API change.

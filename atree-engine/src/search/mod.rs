@@ -84,7 +84,8 @@ pub fn index_symbols(store: &GraphStore) -> rusqlite::Result<usize> {
         .collect();
 
     // Batch-insert all symbols in a single transaction.
-    let tx = store.conn().unchecked_transaction()?;
+    let tx = // SAFETY: init_search_index is never called within an existing transaction.
+store.conn().unchecked_transaction()?;
     let count: usize;
     {
         let mut stmt = tx.prepare(

@@ -59,3 +59,11 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit --deny warnings 2>&1
+
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4

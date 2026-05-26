@@ -457,7 +457,8 @@ impl PipelinePhase for RoutesPhase {
 
             // Batch insert all route symbols, then update edges with their IDs.
             if !route_symbol_records.is_empty() {
-                let tx = store.conn().unchecked_transaction();
+                let tx = // SAFETY: never called within an existing transaction.
+store.conn().unchecked_transaction();
                 if let Ok(tx) = tx {
                     // Insert all route symbols.
                     let sym_ids: Vec<i64> = {
@@ -681,7 +682,8 @@ impl PipelinePhase for OrmPhase {
 
             // Batch insert new model symbols.
             if !new_model_records.is_empty() {
-                let tx = store.conn().unchecked_transaction();
+                let tx = // SAFETY: never called within an existing transaction.
+store.conn().unchecked_transaction();
                 if let Ok(tx) = tx {
                     // Insert all new model symbols and collect their real DB IDs.
                     let new_ids: Vec<i64> = {
@@ -968,7 +970,8 @@ impl PipelinePhase for MarkdownPhase {
 
             // Batch insert Section symbols and resolve IDs for CONTAINS edges.
             if !section_symbol_records.is_empty() {
-                let tx = store.conn().unchecked_transaction();
+                let tx = // SAFETY: never called within an existing transaction.
+store.conn().unchecked_transaction();
                 if let Ok(tx) = tx {
                     // Insert all Section symbols.
                     let new_ids: Vec<i64> = {
