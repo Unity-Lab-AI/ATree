@@ -6,7 +6,7 @@
 |---|---|
 | **Version** | `0.7.0-alpha` |
 | **Status** | Alpha — semantic engine v2 with persistent SQLite indexing, type-aware extraction, and query API. |
-| **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red |
+| **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red, B-A-M-N |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
 
@@ -58,7 +58,9 @@ The tool walks a directory tree using a lock-free work-stealing parallel scanner
 
 ### Semantic code intelligence (v2)
 
-ATree includes a Rust-native semantic indexing engine that uses Tree-sitter for multi-language symbol extraction and a persistent SQLite graph store for querying:
+ATree is both a CLI tool and a Rust library (`atree-engine`). Install the CLI for terminal use, or depend on `atree-engine` to embed the code intelligence engine in your own tools.
+
+### CLI
 
 ```bash
 # Build a semantic index (persistent SQLite DB)
@@ -72,22 +74,88 @@ ATree includes a Rust-native semantic indexing engine that uses Tree-sitter for 
 ./target/release/atree query search "type annotation" --db .atree/index.sqlite
 ./target/release/atree query stats --db .atree/index.sqlite
 
-# Incremental re-index (only changed files)
+# Git history queries (who changed what, when, how often)
+./target/release/atree query symbol-ownership "processRequest" --db .atree/index.sqlite
+./target/release/atree query change-risk "src/config.ts" --db .atree/index.sqlite
+./target/release/atree query find-experts "src/main.ts" --db .atree/index.sqlite
+./target/release/atree query smart-co-change "UserService" 10 --db .atree/index.sqlite
+./target/release/atree query file-history "src/main.ts" 20 --db .atree/index.sqlite
+./target/release/atree query git-blame "src/main.ts" --db .atree/index.sqlite
+
+# Incremental re-index (only changed files, ~99x faster)
 ./target/release/atree --semantic --db .atree/index.sqlite --root . --incremental
 ```
+
+### Rust library
+
+```toml
+[dependencies]
+atree-engine = "0.7"
+```
+
+```rust
+use atree_engine::{build_graph, ScanOptions};
+use atree_engine::store::GraphStore;
+use atree_engine::git_history::{extract_and_persist, get_symbol_ownership};
+
+// Index a repo
+let scan = build_graph(&ScanOptions::default())?;
+let store = GraphStore::open("index.sqlite")?;
+extract_and_persist("/path/to/repo", store.conn(), &Default::default())?;
+
+// Combined structural + git intelligence
+let owners = get_symbol_ownership(store.conn(), "processRequest")?;
+let risk = atree_engine::git_history::get_change_risk(store.conn(), "src/config.ts")?;
+```
+
+Feature flags (for the library):
+- `git` (default): git history, blame, co-change analysis
+- `embeddings`: semantic vector search (requires ONNX runtime)
+- `mcp`: MCP server for AI agent integration
+- `perf`: performance timing instrumentation
+
+Omit `default-features = false` if you don't need git history or embeddings.
 
 **Supported languages (Tier 1):** TypeScript, JavaScript, Python, Rust
 **Supported languages (Tier 2):** Go, Java, C#, PHP
 **Supported languages (Tier 3):** C, C++, Ruby, Kotlin, Swift, Bash, JSON, YAML
 
-**Known limitations:**
-- Scope resolution edges (CALLS, IMPORTS, EXTENDS) are extracted but not yet fully persisted to the SQLite graph for small corpora
-- Type bindings are extracted from AST but type-aware receiver resolution is not yet wired into the query layer
-- Route detection works for Express (AST) and Next.js (path-based); Flask/FastAPI decorator detection is not yet integrated
-
 ## Performance
 
-Benchmark results on ATree's own codebase (41 source files, ~7,300 LOC):
+### qwen-code (real-world large repo)
+
+2,555 source files (TypeScript, JavaScript, Java, Python, JSON, Bash, YAML) across a monorepo with 87,888 total files.
+
+| Metric | ATree (cold) | GitNexus | Speedup |
+|--------|-------------|----------|---------|
+| **Scan time** | **32s** | ~480s (8 min) | **~15x** |
+| **Files indexed** | 2,555 | 2,555 | — |
+| **Symbols extracted** | 78,763 | — | — |
+| **Calls extracted** | 241,904 | — | — |
+| **Edges (scope-res)** | 1,260 | — | — |
+| **Commits** | 521 | — | — |
+| **Authors** | 58 | — | — |
+| **File-commit links** | 7,106 | — | — |
+| **Scope resolution** | 2.5s | — | — |
+
+Scan taken on 20-core machine with `--no-limit`. GitNexus figure is average of repeated runs.
+
+### anthropic-cookbook (medium repo)
+
+198 source files (Python, TypeScript, JavaScript). Fresh clone, full git history.
+
+| Metric | ATree (cold) | GitNexus | Speedup |
+|--------|-------------|----------|---------|
+| **Scan time** | **1.6s** | 21.8s | **~13x** |
+| **Files indexed** | 158 | (in 3,280 nodes) | — |
+| **Symbols extracted** | 2,719 | (in 3,280 nodes) | — |
+| **Calls extracted** | 4,390 | (in 4,643 edges) | — |
+| **Commits** | 576 | (in 3,280 nodes) | — |
+| **Authors** | 98 | — | — |
+
+### ATree's own codebase (small repo)
+
+42 source files, ~7,300 LOC:
 
 | Metric | Cold Index | Incremental (warm) |
 |--------|-----------|-------------------|
@@ -106,14 +174,34 @@ cargo build --release
 
 ## Installation
 
+### CLI tool
+
 ```bash
 git clone <repository-url>
 cd atree
-cargo build --release
+cargo build --release -p atree
 # binary: ./target/release/atree
 ```
 
 A `cargo install` workflow will be supported once the project is published to crates.io.
+
+### Rust library
+
+```toml
+[dependencies]
+atree-engine = "0.7"
+```
+
+The engine crate is published as `atree-engine` on crates.io. Feature flags:
+- `git` (default): git history analysis — omit with `default-features = false` to skip the `git2` dependency
+- `embeddings`: semantic vector search via ONNX — omit to skip `fastembed`
+- `mcp`: MCP server for AI agent tool integration — omit to skip `rmcp`/`tokio`/`schemars`
+
+Minimal dependency tree (no git, no embeddings, no MCP):
+```toml
+[dependencies]
+atree-engine = { version = "0.7", default-features = false }
+```
 
 ## Quick start
 
@@ -250,7 +338,7 @@ jsonschema.validate(report, schema)
 assert report['schema_version'] == 1
 ```
 
-## Performance
+## Filesystem scan performance
 
 50,000-node `/usr` scan, warm cache, 12-core machine:
 
@@ -265,13 +353,30 @@ Cold-cache scans on file-heavy trees see an additional ~3–5× win when `--tree
 
 ## Architecture
 
-The parallel scanner uses `crossbeam-deque`'s per-thread LIFO work-stealing queues:
+ATree is a Cargo workspace with two packages:
+
+- **`atree-engine`** — the code intelligence library. Tree-sitter extraction, scope resolution, git history analysis, A* evidence paths, SQLite persistence. Feature-flagged modules for embeddings and MCP.
+- **`atree-cli`** — the CLI binary. 55+ query subcommands, JSON output, A* filesystem pathfinding. Thin wrapper over the engine.
+
+### Parallel scanner
+
+The filesystem scanner uses `crossbeam-deque`'s per-thread LIFO work-stealing queues:
 
 - Each worker pushes newly-discovered subdirectories onto its own queue (cache-hot, lock-free)
 - Idle workers steal from siblings' queues
-- Termination is detected via an atomic `pending` counter; no condition variables and no `notify_all` syscalls
+- Termination is detected via an atomic `pending` counter; no condition variables
 
-Each worker accumulates results into thread-local `FxHashMap` instances, eliminating contention on the global maps during the scan. A single-threaded merge runs once after all workers complete and is bounded by the final node count rather than by inter-thread synchronization.
+Each worker accumulates results into thread-local `FxHashMap` instances, eliminating contention on the global maps during the scan. A single-threaded merge runs once after all workers complete.
+
+### Semantic pipeline
+
+The semantic engine runs a DAG of analysis phases over the parsed files:
+
+1. **Scan/Parse** — parallel tree-sitter extraction across all source files
+2. **Cross-file** — batch SQLite insert, scope resolution (C3 MRO, receiver-bound, free-call), edge persistence
+3. **Git history** — commit log walk, per-file change tracking, author aggregation
+4. **Graph analytics** — community detection (label propagation), process tracing (BFS call chains)
+5. **Search index** — BM25 FTS5 index + optional semantic embeddings
 
 The entire scan-time hot path is `unsafe`-free Rust over `std::fs` syscalls.
 
@@ -302,10 +407,23 @@ The entire scan-time hot path is `unsafe`-free Rust over `std::fs` syscalls.
 
 ## Building and testing
 
+ATree is a Cargo workspace with two packages: `atree-engine` (library) and `atree` (CLI binary).
+
 ```bash
-cargo build --release      # binary at target/release/atree
-cargo test --release       # all unit + integration tests
-cargo doc --open           # generate and view rustdoc for the library
+# Build everything
+cargo build --release --workspace
+
+# Build just the CLI
+cargo build --release -p atree
+
+# Build just the engine library
+cargo build --release -p atree-engine
+
+# Run all tests
+cargo test -p atree-engine
+
+# Generate and view rustdoc
+cargo doc --open -p atree-engine
 ```
 
 The release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, and `strip = true` for maximum runtime performance at the cost of slightly slower builds.
@@ -324,13 +442,23 @@ Cross-compilation prerequisites and per-platform instructions are documented in 
 
 ## Dependencies
 
-| Crate              | Purpose                                                              |
-|--------------------|----------------------------------------------------------------------|
-| `mimalloc`         | Fast multi-threaded memory allocator                                 |
-| `rustc-hash`       | `FxHashMap` — non-cryptographic hash for higher throughput on string keys |
-| `crossbeam-deque`  | Lock-free work-stealing queues                                       |
-| `serde`            | Derive macros for serialize / deserialize                            |
-| `serde_json`       | JSON output and roundtrip-safe parsing                               |
+### atree-engine (library)
+
+| Crate | Purpose |
+|-------|---------|
+| `tree-sitter` + 16 language grammars | Multi-language AST parsing and symbol extraction |
+| `rusqlite` (bundled) | Persistent SQLite graph store with recursive CTEs |
+| `git2` | Git history extraction (commits, blame, co-change) — optional feature |
+| `crossbeam-deque` | Lock-free work-stealing parallel scanner |
+| `rustc-hash` | `FxHashMap` — fast non-cryptographic hashing |
+| `mimalloc` | Fast multi-threaded memory allocator |
+| `serde` + `serde_json` | Structured output and config parsing |
+| `fastembed` | Semantic vector embeddings (optional feature) |
+| `rmcp` + `tokio` + `schemars` | MCP server for AI agent tool integration (optional feature) |
+
+### atree-cli (binary)
+
+All of the above via `atree-engine`, plus CLI argument parsing. No additional heavy dependencies.
 
 ## Project information
 
@@ -342,6 +470,7 @@ Cross-compilation prerequisites and per-platform instructions are documented in 
 - **Alfreddo**
 - **Gee**
 - **Red**
+- **B-A-M-N**
 
 ### Contact
 
@@ -358,7 +487,7 @@ MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 You may use, modify, and redistribute this software freely, including in derivative works, provided that:
 
 1. The original copyright notice and the contents of `LICENSE` and `NOTICE` are retained.
-2. Attribution to **UnityAILab** and its contributors (Sponge, Alfreddo, Gee, Red) is preserved in derivative works.
+2. Attribution to **UnityAILab** and its contributors (Sponge, Alfreddo, Gee, Red, B-A-M-N) is preserved in derivative works.
 
 ### Changelog
 

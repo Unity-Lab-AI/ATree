@@ -1,0 +1,1174 @@
+//! Pipeline phase implementations.
+//!
+//! Each phase is a struct implementing `PipelinePhase`. Phases are
+//! organized in dependency order matching GitNexusRelay's 12-phase DAG.
+//!
+//! The scan and parse phases are handled by `build_graph()` in `src/lib.rs`
+//! (work-stealing filesystem scan + parallel tree-sitter parse). The pipeline
+//! starts at `cross_file` with pre-populated `ParsedFile` data.
+//!
+//! Phase dependency graph:
+//! ```text
+//!   cross_file → [routes, tools, orm, markdown, cobol, scope_resolution, mro]
+//!     → [communities, processes]
+//! ```
+//!
+//! Each phase writes its results into `PipelineSharedState` so downstream
+//! phases can read them. The `PhaseResult::output` is a lightweight status
+//! struct for dependency tracking.
+
+use super::*;
+use crate::perf_print;
+use crate::perf_timer;
+use rusqlite::params;
+use rustc_hash::FxHashMap;
+
+// ── Phase: cross_file ───────────────────────────────────────────────────────
+
+pub struct CrossFileOutput {
+    pub total_files: usize,
+    pub resolved_calls: usize,
+    pub resolved_imports: usize,
+}
+
+pub struct CrossFilePhase;
+
+impl PipelinePhase for CrossFilePhase {
+    fn name(&self) -> &str { "cross_file" }
+    fn deps(&self) -> &[&str] { &[] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let total_files = parsed_files_guard.len();
+        if parsed_files_guard.is_empty() {
+            return Box::new(CrossFileOutput { total_files: 0, resolved_calls: 0, resolved_imports: 0 });
+        }
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 50,
+            message: "Building graph store...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        // Open or create the graph store.
+        let store = match ctx.db_path {
+            Some(ref path) => crate::store::GraphStore::open(path),
+            None => crate::store::GraphStore::open_in_memory(),
+        };
+
+        let store = match store {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[cross_file] Warning: failed to open graph store: {}", e);
+                return Box::new(CrossFileOutput { total_files, resolved_calls: 0, resolved_imports: 0 });
+            }
+        };
+
+        // Batch-insert all parsed files in a single transaction.
+        // This is the key performance win: ~50K individual auto-committed INSERTs
+        // become 1 transaction. For a 10K-file repo this is the difference between
+        // ~30 seconds and ~2 seconds of SQLite write time.
+        perf_timer!("SQLite batch insert");
+        let global_symbol_id_map = match store.insert_all_files_batch(
+            &parsed_files_guard,
+            ctx.repo_label.as_deref(),
+        ) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!("[cross_file] Warning: batch insert failed: {}", e);
+                FxHashMap::default()
+            }
+        };
+
+        let resolved_imports: usize = parsed_files_guard.iter().map(|f| f.imports.len()).sum();
+        let all_file_paths: Vec<String> = parsed_files_guard.iter().map(|f| f.path.clone()).collect();
+
+        // Build the import graph for A*-guided file ordering in scope resolution.
+        // This needs &parsed_files_guard, not &mut, so we do it while the lock is held.
+        let import_graph = crate::resolver::import_graph::ImportGraph::from_parsed_files(&parsed_files_guard);
+
+        // Drop the lock before scope resolution, which needs &mut.
+        drop(parsed_files_guard);
+
+        // Run scope-resolution pipeline (needs &mut parsed_files).
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 55,
+            message: "Resolving cross-file references...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        perf_timer!("Scope resolution (cross-file)");
+        let mut parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let (sr_stats, sr_edges, heritage_resolutions) =
+            crate::scope_resolution::orchestrator::run_scope_resolution(
+                &mut parsed_files_guard,
+                &all_file_paths,
+                Some(&import_graph),
+            );
+
+        // Batch-persist scope-resolution edges in a single transaction.
+        let sr_edge_records: Vec<crate::store::EdgeRecord> = sr_edges.iter()
+            .filter_map(|edge| {
+                let src_db_id = global_symbol_id_map.get(&{ edge.source_id }).copied().unwrap_or(0);
+                let dst_db_id = global_symbol_id_map.get(&{ edge.target_id }).copied().unwrap_or(0);
+                if src_db_id == 0 || dst_db_id == 0 { return None; }
+                let file_id = store.get_file_id_for_symbol(src_db_id).unwrap_or(None).unwrap_or(0);
+                Some(crate::store::EdgeRecord {
+                    id: 0, src_id: src_db_id, dst_id: dst_db_id,
+                    edge_kind: edge.edge_type.clone(),
+                    confidence: edge.confidence,
+                    file_id: Some(file_id),
+                    line: 0,
+                })
+            })
+            .collect();
+
+        perf_timer!("Edge persistence (scope-res)");
+        if let Err(e) = store.insert_edges_batch(&sr_edge_records) {
+            eprintln!("[cross_file] Warning: edge batch insert failed: {}", e);
+        }
+
+        // Persist heritage resolutions.
+        for (child_id, parent_name, parent_id, confidence) in &heritage_resolutions {
+            let child_db_id = global_symbol_id_map.get(child_id).copied().unwrap_or(0);
+            let parent_db_id = global_symbol_id_map.get(parent_id).copied().unwrap_or(0);
+            if child_db_id == 0 || parent_db_id == 0 { continue; }
+            if let Err(e) = store.update_heritage_parent(child_db_id, parent_name, parent_db_id, *confidence) {
+                eprintln!("[cross_file] Warning: {}", e);
+            }
+        }
+
+        let resolved_calls = sr_stats.resolved_sites;
+
+        // Store the graph store, symbol ID map, and scope resolution stats.
+        *shared.store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
+        *shared.symbol_id_map.lock().unwrap_or_else(|e| e.into_inner()) = global_symbol_id_map;
+        *shared.scope_resolution_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(sr_stats);
+        drop(parsed_files_guard);
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 60,
+            message: format!("Resolved {} calls, {} imports", resolved_calls, resolved_imports),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(CrossFileOutput {
+            total_files,
+            resolved_calls,
+            resolved_imports,
+        })
+    }
+}
+
+// ── Phase: mro ──────────────────────────────────────────────────────────────
+
+pub struct MroOutput {
+    pub total_files: usize,
+    pub mro_chains_computed: usize,
+}
+
+pub struct MroPhase;
+
+impl PipelinePhase for MroPhase {
+    fn name(&self) -> &str { "mro" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+    // MRO is a no-op count query — exists for DAG compatibility.
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let cross = get_phase_output::<CrossFileOutput>(deps, "cross_file");
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "mro".to_string(),
+            percent: 65,
+            message: "Computing MRO...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        // MRO chains were already computed during scope resolution
+        // (build_method_dispatch in the orchestrator). This phase counts
+        // the computed chains from the store's heritage table.
+        let mut mro_chains_computed = 0usize;
+
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            let count = store.conn().query_row(
+                "SELECT COUNT(*) FROM heritage WHERE parent_symbol_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0);
+            mro_chains_computed = count as usize;
+        }
+        drop(store_guard);
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "mro".to_string(),
+            percent: 70,
+            message: format!("MRO: {} chains computed", mro_chains_computed),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(MroOutput {
+            total_files: cross.total_files,
+            mro_chains_computed,
+        })
+    }
+}
+
+// ── Phase: communities ──────────────────────────────────────────────────────
+
+pub struct CommunitiesOutput {
+    pub total_files: usize,
+    pub community_count: usize,
+}
+
+pub struct CommunitiesPhase;
+
+impl PipelinePhase for CommunitiesPhase {
+    fn name(&self) -> &str { "communities" }
+    fn deps(&self) -> &[&str] { &["mro"] }
+    // Depends on mro (instant count query), not on cross_file data directly.
+    // Runs in parallel with processes phase.
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let mro = get_phase_output::<MroOutput>(deps, "mro");
+
+        if ctx.options.skip_graph_phases {
+            return Box::new(CommunitiesOutput { total_files: mro.total_files, community_count: 0 });
+        }
+
+        perf_timer!("Community detection");
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "communities".to_string(),
+            percent: 75,
+            message: "Detecting communities...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let mut community_count = 0usize;
+
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            match crate::community::detect_communities(
+                store,
+                &crate::community::CommunityConfig::default(),
+            ) {
+                Ok(result) => {
+                    community_count = result.communities.len();
+                    // Persist community memberships as MEMBER_OF edges
+                    // so the evidence engine can use them.
+                    match crate::community::store_memberships(store, &result) {
+                        Ok(stored) => {
+                            (ctx.on_progress)(PipelineProgress {
+                                phase: "communities".to_string(),
+                                percent: 80,
+                                message: format!(
+                                    "Found {} communities (modularity: {:.3}), stored {} memberships",
+                                    community_count, result.stats.modularity, stored),
+                                detail: None,
+                                stats: None,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[communities] Warning: failed to store memberships: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[communities] Warning: community detection failed: {}", e);
+                }
+            }
+        }
+        drop(store_guard);
+
+        Box::new(CommunitiesOutput {
+            total_files: mro.total_files,
+            community_count,
+        })
+    }
+}
+
+// ── Phase: processes ────────────────────────────────────────────────────────
+
+pub struct ProcessesOutput {
+    pub total_files: usize,
+    pub process_count: usize,
+}
+
+pub struct ProcessesPhase;
+
+impl PipelinePhase for ProcessesPhase {
+    fn name(&self) -> &str { "processes" }
+    fn deps(&self) -> &[&str] { &["mro"] }
+    // Depends on mro (instant count), not communities — runs in parallel with communities phase.
+    // Process detection uses entry-point + BFS on the call graph, not community labels.
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let mro = get_phase_output::<MroOutput>(deps, "mro");
+
+        if ctx.options.skip_graph_phases {
+            return Box::new(ProcessesOutput { total_files: mro.total_files, process_count: 0 });
+        }
+
+        perf_timer!("Process detection");
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "processes".to_string(),
+            percent: 85,
+            message: "Detecting processes...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let mut process_count = 0usize;
+        let mut steps_count = 0usize;
+
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            match crate::process::detect_processes(
+                store,
+                &crate::process::ProcessConfig::default(),
+            ) {
+                Ok(result) => {
+                    process_count = result.processes.len();
+                    // Persist process nodes and STEP_IN_PROCESS edges.
+                    match crate::process::store_processes(store, &result) {
+                        Ok(n) => steps_count = n,
+                        Err(e) => eprintln!("[processes] Warning: failed to store process steps: {}", e),
+                    }
+                    (ctx.on_progress)(PipelineProgress {
+                        phase: "processes".to_string(),
+                        percent: 90,
+                        message: format!("Found {} execution flows ({} steps, avg {:.1})",
+                            process_count, steps_count, result.stats.avg_step_count),
+                        detail: None,
+                        stats: None,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[processes] Warning: process detection failed: {}", e);
+                }
+            }
+        }
+        drop(store_guard);
+
+        Box::new(ProcessesOutput {
+            total_files: mro.total_files,
+            process_count,
+        })
+    }
+}
+
+// ── Phase: routes ───────────────────────────────────────────────────────────
+
+pub struct RoutesOutput {
+    pub route_count: usize,
+}
+
+pub struct RoutesPhase;
+
+impl PipelinePhase for RoutesPhase {
+    fn name(&self) -> &str { "routes" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        (ctx.on_progress)(PipelineProgress {
+            phase: "routes".to_string(),
+            percent: 55,
+            message: "Detecting routes...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let symbol_id_map_guard = shared.symbol_id_map.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Detect routes and collect them.
+        let mut all_routes = Vec::new();
+        // Also collect persistence data: (file_index, handler_db_id, file_routes)
+        let mut persist_data: Vec<(usize, i64, Vec<crate::routes::Route>)> = Vec::new();
+
+        for (file_idx, file) in parsed_files_guard.iter().enumerate() {
+            let mut file_routes = crate::routes::detect_routes_from_path(&file.path);
+            let lang_name = format!("{:?}", file.language).to_lowercase();
+            file_routes.extend(crate::routes::detect_routes_from_parsed(
+                &file.path, &lang_name, &file.decorators, &file.calls,
+            ));
+
+            if !file_routes.is_empty() {
+                let handler_symbol = file.symbols.iter().find(|s| {
+                    use crate::lang::CaptureTag;
+                    matches!(s.kind,
+                        CaptureTag::DefinitionFunction |
+                        CaptureTag::DefinitionMethod |
+                        CaptureTag::DefinitionClass)
+                });
+
+                let handler_db_id = handler_symbol
+                    .and_then(|h| symbol_id_map_guard.get(&h.id).copied())
+                    .unwrap_or(0);
+
+                persist_data.push((file_idx, handler_db_id, file_routes.clone()));
+            }
+
+            all_routes.extend(file_routes);
+        }
+
+        // Batch-persist route→symbol edges in the graph store.
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            let mut route_symbol_records: Vec<crate::store::SymbolRecord> = Vec::new();
+            let mut route_edge_records: Vec<crate::store::EdgeRecord> = Vec::new();
+
+            for (_file_idx, handler_db_id, file_routes) in &persist_data {
+                if *handler_db_id == 0 { continue; }
+                let handler_file_id = store.get_file_id_for_symbol(*handler_db_id).unwrap_or(None).unwrap_or(0);
+                for route in file_routes {
+                    let route_node_name = format!("ROUTE:{}:{}", route.method, route.path);
+                    route_symbol_records.push(crate::store::SymbolRecord {
+                        id: 0, file_id: handler_file_id,
+                        name: route_node_name.clone(),
+                        qualified_name: route_node_name,
+                        kind: "Route".to_string(),
+                        line: route.line, col: 0,
+                        is_exported: false,
+                        scope_id: None, owner_symbol_id: None,
+                    });
+                    route_edge_records.push(crate::store::EdgeRecord {
+                        id: 0,
+                        src_id: 0, // will be filled after symbol insert
+                        dst_id: *handler_db_id,
+                        edge_kind: "ROUTE".to_string(),
+                        confidence: 1.0,
+                        file_id: Some(handler_file_id),
+                        line: route.line,
+                    });
+                }
+            }
+
+            // Batch insert all route symbols, then update edges with their IDs.
+            if !route_symbol_records.is_empty() {
+                let tx = store.conn().unchecked_transaction();
+                if let Ok(tx) = tx {
+                    // Insert all route symbols.
+                    let sym_ids: Vec<i64> = {
+                        let stmt = tx.prepare(
+                            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                        );
+                        let mut sym_ids = Vec::with_capacity(route_symbol_records.len());
+                        if let Ok(mut stmt) = stmt {
+                            for rec in &route_symbol_records {
+                                if stmt.execute(params![
+                                    rec.file_id, rec.name, rec.qualified_name, rec.kind,
+                                    rec.line as i64, rec.col as i64,
+                                    if rec.is_exported { 1 } else { 0 },
+                                    rec.scope_id, rec.owner_symbol_id,
+                                ]).is_ok() {
+                                    sym_ids.push(tx.last_insert_rowid());
+                                } else {
+                                    sym_ids.push(0);
+                                }
+                            }
+                        }
+                        sym_ids
+                    }; // stmt is dropped here, releasing the borrow on tx
+
+                    // Batch insert edges with correct src_ids.
+                    {
+                        let edge_stmt = tx.prepare(
+                            "INSERT INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                        );
+                        if let Ok(mut edge_stmt) = edge_stmt {
+                            for (i, edge) in route_edge_records.iter().enumerate() {
+                                if i < sym_ids.len() && sym_ids[i] != 0 {
+                                    let _ = edge_stmt.execute(params![
+                                        sym_ids[i], edge.dst_id, edge.edge_kind,
+                                        edge.confidence, edge.file_id, edge.line as i64,
+                                    ]);
+                                }
+                            }
+                        }
+                    }; // edge_stmt dropped here
+
+                    let _ = tx.commit();
+                }
+            }
+        }
+        drop(store_guard);
+        drop(symbol_id_map_guard);
+        drop(parsed_files_guard);
+
+        let route_count = all_routes.len();
+        *shared.detected_routes.lock().unwrap_or_else(|e| e.into_inner()) = all_routes;
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "routes".to_string(),
+            percent: 58,
+            message: format!("Detected {} routes", route_count),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(RoutesOutput { route_count })
+    }
+}
+
+// ── Phase: tools ────────────────────────────────────────────────────────────
+
+pub struct ToolsOutput {
+    pub tool_count: usize,
+}
+
+pub struct ToolsPhase;
+
+impl PipelinePhase for ToolsPhase {
+    fn name(&self) -> &str { "tools" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        (ctx.on_progress)(PipelineProgress {
+            phase: "tools".to_string(),
+            percent: 55,
+            message: "Detecting tools...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Tool detection: count symbols that look like tool definitions.
+        // Heuristic: functions/methods with "tool" in the name, or symbols
+        // in files that define MCP tool arrays, CLI commands, etc.
+        let mut tool_count = 0usize;
+
+        for parsed in parsed_files_guard.iter() {
+            for sym in &parsed.symbols {
+                let name_lower = sym.name.to_lowercase();
+                if name_lower.contains("tool") || name_lower.contains("command")
+                    || name_lower.contains("handler") || name_lower.contains("action")
+                {
+                    tool_count += 1;
+                }
+            }
+        }
+        drop(parsed_files_guard);
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "tools".to_string(),
+            percent: 57,
+            message: format!("Detected {} tool-like symbols", tool_count),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(ToolsOutput { tool_count })
+    }
+}
+
+// ── Phase: orm ──────────────────────────────────────────────────────────────
+
+pub struct OrmOutput {
+    pub edges_created: usize,
+    pub model_count: usize,
+}
+
+pub struct OrmPhase;
+
+impl PipelinePhase for OrmPhase {
+    fn name(&self) -> &str { "orm" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        (ctx.on_progress)(PipelineProgress {
+            phase: "orm".to_string(),
+            percent: 55,
+            message: "Detecting ORM queries...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::path::Path::new(&ctx.repo_path);
+        let mut files_with_content: Vec<(String, String)> = Vec::new();
+
+        for parsed in parsed_files_guard.iter() {
+            let full_path = root.join(&parsed.path);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                files_with_content.push((parsed.path.clone(), content));
+            }
+        }
+        drop(parsed_files_guard);
+
+        let orm_result = crate::semantic::orm::extract_orm_queries_from_files(&files_with_content);
+
+        // Persist ORM model nodes and QUERIES edges to the graph store.
+        let mut edges_created = 0usize;
+        let mut model_count = 0usize;
+
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            // model_nodes: model_key -> (db_id, is_new). is_new=true means we need to insert it.
+            let mut model_nodes: rustc_hash::FxHashMap<String, (i64, bool)> = rustc_hash::FxHashMap::default();
+            let mut seen_edges: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+            // New model symbols to insert, in order. The index in this vec corresponds
+            // to the insertion order; we track which model_key maps to which index.
+            let mut new_model_keys: Vec<String> = Vec::new();
+            let mut new_model_records: Vec<crate::store::SymbolRecord> = Vec::new();
+            let mut orm_edge_records: Vec<crate::store::EdgeRecord> = Vec::new();
+
+            for q in &orm_result.queries {
+                let model_key = format!("{}:{}", q.orm, q.model);
+                let (model_db_id, _is_new) = *model_nodes.entry(model_key.clone()).or_insert_with(|| {
+                    // Check if a Class/Interface with this name already exists.
+                    let existing = store.get_symbols_by_name(&q.model).ok()
+                        .and_then(|syms| syms.into_iter().find(|s| {
+                            s.kind == "Class" || s.kind == "Interface"
+                        }));
+                    if let Some(sym) = existing {
+                        return (sym.id, false);
+                    }
+                    // Create a new CodeElement node for the ORM model.
+                    let rec = crate::store::SymbolRecord {
+                        id: 0,
+                        file_id: 0,
+                        name: q.model.clone(),
+                        qualified_name: format!("orm:{}:{}", q.orm, q.model),
+                        kind: "CodeElement".to_string(),
+                        line: q.line_number,
+                        col: 0,
+                        is_exported: false,
+                        scope_id: None,
+                        owner_symbol_id: None,
+                    };
+                    new_model_keys.push(model_key.clone());
+                    new_model_records.push(rec);
+                    (0, true) // placeholder, filled after batch insert
+                });
+
+                // Look up the file's DB ID.
+                let file_id = store.get_file(&q.file_path).ok().flatten().map(|f| f.id).unwrap_or(0);
+                if file_id == 0 {
+                    continue;
+                }
+
+                let edge_key = format!("{}->{}:{}", file_id, model_key, q.method);
+                if seen_edges.contains(&edge_key) {
+                    continue;
+                }
+                seen_edges.insert(edge_key);
+
+                orm_edge_records.push(crate::store::EdgeRecord {
+                    id: 0,
+                    src_id: file_id,
+                    dst_id: model_db_id, // 0 for new models, filled after batch insert
+                    edge_kind: "QUERIES".to_string(),
+                    confidence: 0.9,
+                    file_id: Some(file_id),
+                    line: q.line_number,
+                });
+            }
+
+            // Batch insert new model symbols.
+            if !new_model_records.is_empty() {
+                let tx = store.conn().unchecked_transaction();
+                if let Ok(tx) = tx {
+                    // Insert all new model symbols and collect their real DB IDs.
+                    let new_ids: Vec<i64> = {
+                        let stmt = tx.prepare(
+                            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                        );
+                        let mut ids = Vec::with_capacity(new_model_records.len());
+                        if let Ok(mut stmt) = stmt {
+                            for rec in &new_model_records {
+                                if stmt.execute(rusqlite::params![
+                                    rec.file_id, rec.name, rec.qualified_name, rec.kind,
+                                    rec.line as i64, rec.col as i64,
+                                    if rec.is_exported { 1 } else { 0 },
+                                    rec.scope_id, rec.owner_symbol_id,
+                                ]).is_ok() {
+                                    ids.push(tx.last_insert_rowid());
+                                } else {
+                                    ids.push(0);
+                                }
+                            }
+                        }
+                        ids
+                    };
+
+                    // Update model_nodes with real DB IDs (deterministic: new_model_keys order).
+                    for (i, model_key) in new_model_keys.iter().enumerate() {
+                        if i < new_ids.len() && new_ids[i] != 0 {
+                            model_nodes.insert(model_key.clone(), (new_ids[i], false));
+                        }
+                    }
+
+                    // Update edge dst_ids for edges pointing to newly-inserted models.
+                    for edge in &mut orm_edge_records {
+                        if edge.dst_id == 0 {
+                            // Find which model_key this edge targets by checking seen_edges.
+                            for (model_key, (db_id, _)) in &model_nodes {
+                                if *db_id == 0 { continue; }
+                                let prefix = format!("{}->{}:", edge.src_id, model_key);
+                                if seen_edges.iter().any(|ek| ek.starts_with(&prefix)) {
+                                    edge.dst_id = *db_id;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Batch insert edges.
+                    {
+                        let edge_stmt = tx.prepare(
+                            "INSERT INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                        );
+                        if let Ok(mut edge_stmt) = edge_stmt {
+                            for edge in &orm_edge_records {
+                                if edge.dst_id != 0 {
+                                    let _ = edge_stmt.execute(rusqlite::params![
+                                        edge.src_id, edge.dst_id, edge.edge_kind,
+                                        edge.confidence, edge.file_id, edge.line as i64,
+                                    ]);
+                                    edges_created += 1;
+                                }
+                            }
+                        }
+                    };
+
+                    let _ = tx.commit();
+                }
+            }
+
+            model_count = model_nodes.len();
+        }
+        drop(store_guard);
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "orm".to_string(),
+            percent: 57,
+            message: format!("Found {} ORM queries ({} Prisma, {} Supabase) — {} edges, {} models",
+                orm_result.queries.len(), orm_result.prisma_count, orm_result.supabase_count,
+                edges_created, model_count),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(OrmOutput { edges_created, model_count })
+    }
+}
+
+// ── Phase: markdown ─────────────────────────────────────────────────────────
+
+pub struct MarkdownOutput {
+    pub sections_found: usize,
+    pub links_created: usize,
+}
+
+pub struct MarkdownPhase;
+
+impl PipelinePhase for MarkdownPhase {
+    fn name(&self) -> &str { "markdown" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        (ctx.on_progress)(PipelineProgress {
+            phase: "markdown".to_string(),
+            percent: 25,
+            message: "Extracting markdown sections...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::path::Path::new(&ctx.repo_path);
+        let mut md_files: Vec<(String, String)> = Vec::new();
+
+        for parsed in parsed_files_guard.iter() {
+            let ext = std::path::Path::new(&parsed.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if ext == "md" || ext == "mdx" {
+                let full_path = root.join(&parsed.path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    md_files.push((parsed.path.clone(), content));
+                }
+            }
+        }
+        drop(parsed_files_guard);
+
+        let md_result = crate::semantic::markdown::process_markdown_files(&md_files);
+
+        // Persist Section nodes, CONTAINS edges (heading hierarchy), and IMPORTS
+        // edges (cross-file links) to the graph store.
+        let sections_found = md_result.sections;
+        let mut links_created = 0usize;
+
+        let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref store) = *store_guard {
+            // Build the set of all known file paths for cross-link validation.
+            let all_path_set: rustc_hash::FxHashSet<String> = {
+                let files = store.get_all_files().unwrap_or_default();
+                files.into_iter().map(|f| f.path).collect()
+            };
+
+            let mut section_symbol_records: Vec<crate::store::SymbolRecord> = Vec::new();
+            let mut contains_edge_records: Vec<crate::store::EdgeRecord> = Vec::new();
+            let mut imports_edge_records: Vec<crate::store::EdgeRecord> = Vec::new();
+
+            // Track Section node IDs: (file_path, heading_text, line) -> db_id
+            let mut section_ids: Vec<(String, String, usize, i64)> = Vec::new();
+
+            for (file_path, content) in &md_files {
+                let file_id = store.get_file(file_path).ok().flatten().map(|f| f.id).unwrap_or(0);
+                if file_id == 0 {
+                    continue;
+                }
+
+                let (headings, cross_links) = crate::semantic::markdown::extract_markdown(file_path, content);
+
+                if headings.is_empty() && cross_links.is_empty() {
+                    continue;
+                }
+
+                // --- Heading hierarchy: compute endLine spans and create Section nodes ---
+                let lines: Vec<&str> = content.lines().collect();
+                let total_lines = lines.len();
+
+                // Stack for heading hierarchy: (level, section_db_id).
+                // section_db_id is 0 (placeholder) for new sections; filled after batch insert.
+                let mut section_stack: Vec<(u8, i64)> = Vec::new();
+
+                for h_idx in 0..headings.len() {
+                    let heading = &headings[h_idx];
+                    let line_1based = heading.line + 1;
+
+                    // Compute endLine: line before next heading at same or higher level, or EOF.
+                    let _end_line = {
+                        let mut el = total_lines;
+                        for j in (h_idx + 1)..headings.len() {
+                            if headings[j].level <= heading.level {
+                                el = headings[j].line;
+                                break;
+                            }
+                        }
+                        el
+                    };
+
+                    let section_rec = crate::store::SymbolRecord {
+                        id: 0,
+                        file_id,
+                        name: heading.text.clone(),
+                        qualified_name: format!("Section:{}:L{}:{}", file_path, line_1based, heading.text),
+                        kind: "Section".to_string(),
+                        line: heading.line,
+                        col: 0,
+                        is_exported: false,
+                        scope_id: None,
+                        owner_symbol_id: None,
+                    };
+                    section_symbol_records.push(section_rec);
+
+                    // Find parent: pop stack until we find a level strictly less than current.
+                    while section_stack.last().is_some_and(|(lvl, _)| *lvl >= heading.level) {
+                        section_stack.pop();
+                    }
+
+                    let parent_db_id = section_stack.last().map(|(_, id)| *id).unwrap_or(file_id);
+
+                    // CONTAINS edge from parent to this section (placeholder dst_id).
+                    contains_edge_records.push(crate::store::EdgeRecord {
+                        id: 0,
+                        src_id: parent_db_id,
+                        dst_id: 0, // placeholder, filled after batch insert
+                        edge_kind: "CONTAINS".to_string(),
+                        confidence: 1.0,
+                        file_id: Some(file_id),
+                        line: heading.line,
+                    });
+
+                    // Track for later ID resolution.
+                    section_ids.push((file_path.clone(), heading.text.clone(), heading.line, 0));
+                    // The contains edge at index (contains_edge_records.len() - 1) targets
+                    // the section at index (section_idx).
+
+                    section_stack.push((heading.level, 0)); // placeholder
+                }
+
+                // --- Cross-file links ---
+                let file_dir = std::path::Path::new(file_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut seen_links: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+
+                for link in &cross_links {
+                    // Skip external URLs, anchors, mailto.
+                    if link.target_file.starts_with("http://")
+                        || link.target_file.starts_with("https://")
+                        || link.target_file.starts_with('#')
+                        || link.target_file.starts_with("mailto:")
+                    {
+                        continue;
+                    }
+
+                    // Strip anchor fragments.
+                    let clean_target = link.target_file.split('#').next().unwrap_or("");
+                    if clean_target.is_empty() {
+                        continue;
+                    }
+
+                    // Resolve relative to the file's directory.
+                    let resolved = if clean_target.starts_with('/') {
+                        clean_target.trim_start_matches('/').to_string()
+                    } else {
+                        let joined = std::path::Path::new(&file_dir).join(clean_target);
+                        joined.to_string_lossy().to_string()
+                    };
+
+                    if !all_path_set.contains(&resolved) {
+                        continue;
+                    }
+
+                    let target_file_id = store.get_file(&resolved).ok().flatten().map(|f| f.id).unwrap_or(0);
+                    if target_file_id == 0 {
+                        continue;
+                    }
+
+                    let link_key = format!("{}->{}", file_id, target_file_id);
+                    if seen_links.contains(&link_key) {
+                        continue;
+                    }
+                    seen_links.insert(link_key);
+
+                    imports_edge_records.push(crate::store::EdgeRecord {
+                        id: 0,
+                        src_id: file_id,
+                        dst_id: target_file_id,
+                        edge_kind: "IMPORTS".to_string(),
+                        confidence: 0.8,
+                        file_id: Some(file_id),
+                        line: link.line,
+                    });
+                }
+            }
+
+            // Batch insert Section symbols and resolve IDs for CONTAINS edges.
+            if !section_symbol_records.is_empty() {
+                let tx = store.conn().unchecked_transaction();
+                if let Ok(tx) = tx {
+                    // Insert all Section symbols.
+                    let new_ids: Vec<i64> = {
+                        let stmt = tx.prepare(
+                            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                        );
+                        let mut ids = Vec::with_capacity(section_symbol_records.len());
+                        if let Ok(mut stmt) = stmt {
+                            for rec in &section_symbol_records {
+                                if stmt.execute(rusqlite::params![
+                                    rec.file_id, rec.name, rec.qualified_name, rec.kind,
+                                    rec.line as i64, rec.col as i64,
+                                    if rec.is_exported { 1 } else { 0 },
+                                    rec.scope_id, rec.owner_symbol_id,
+                                ]).is_ok() {
+                                    ids.push(tx.last_insert_rowid());
+                                } else {
+                                    ids.push(0);
+                                }
+                            }
+                        }
+                        ids
+                    };
+
+                    // Update section_ids with real DB IDs.
+                    for (i, (_, _, _, ref mut db_id)) in section_ids.iter_mut().enumerate() {
+                        if i < new_ids.len() && new_ids[i] != 0 {
+                            *db_id = new_ids[i];
+                        }
+                    }
+
+                    // Update CONTAINS edge dst_ids: each edge at index i targets section at index i.
+                    for (i, edge) in contains_edge_records.iter_mut().enumerate() {
+                        if i < section_ids.len() {
+                            edge.dst_id = section_ids[i].3;
+                        }
+                    }
+
+                    // Batch insert CONTAINS edges.
+                    {
+                        let edge_stmt = tx.prepare(
+                            "INSERT INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                        );
+                        if let Ok(mut edge_stmt) = edge_stmt {
+                            for edge in &contains_edge_records {
+                                if edge.dst_id != 0 {
+                                    let _ = edge_stmt.execute(rusqlite::params![
+                                        edge.src_id, edge.dst_id, edge.edge_kind,
+                                        edge.confidence, edge.file_id, edge.line as i64,
+                                    ]);
+                                }
+                            }
+                        }
+                    };
+
+                    let _ = tx.commit();
+                }
+            }
+
+            // Batch insert IMPORTS edges.
+            if !imports_edge_records.is_empty() {
+                let _ = store.insert_edges_batch(&imports_edge_records);
+                links_created = imports_edge_records.len();
+            }
+        }
+        drop(store_guard);
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "markdown".to_string(),
+            percent: 27,
+            message: format!("Found {} markdown sections, {} cross-links",
+                sections_found, links_created),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(MarkdownOutput { sections_found, links_created })
+    }
+}
+
+// ── Phase: cobol ────────────────────────────────────────────────────────────
+
+pub struct CobolOutput {
+    pub divisions_found: usize,
+}
+
+pub struct CobolPhase;
+
+impl PipelinePhase for CobolPhase {
+    fn name(&self) -> &str { "cobol" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cobol".to_string(),
+            percent: 25,
+            message: "Tagging COBOL...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::path::Path::new(&ctx.repo_path);
+        let mut cobol_files: Vec<(String, String)> = Vec::new();
+
+        for parsed in parsed_files_guard.iter() {
+            if crate::semantic::cobol::is_cobol_file(&parsed.path)
+                || crate::semantic::cobol::is_jcl_file(&parsed.path)
+            {
+                let full_path = root.join(&parsed.path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    cobol_files.push((parsed.path.clone(), content));
+                }
+            }
+        }
+        drop(parsed_files_guard);
+
+        let cobol_result = crate::semantic::cobol::process_cobol_files(&cobol_files);
+        let divisions_found = cobol_result.divisions;
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cobol".to_string(),
+            percent: 27,
+            message: format!("Found {} divisions, {} sections, {} paragraphs ({} JCL jobs)",
+                cobol_result.divisions, cobol_result.sections, cobol_result.paragraphs,
+                cobol_result.jcl_jobs),
+            detail: None,
+            stats: None,
+        });
+
+        Box::new(CobolOutput { divisions_found })
+    }
+}
+
+// ── Phase: scope_resolution ─────────────────────────────────────────────────
+
+pub struct ScopeResolutionOutput {
+    pub total_files: usize,
+    pub resolved_references: usize,
+}
+
+pub struct ScopeResolutionPhase;
+
+impl PipelinePhase for ScopeResolutionPhase {
+    fn name(&self) -> &str { "scope_resolution" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+    // No-op: scope resolution already ran inside cross_file phase.
+    // This phase exists only for DAG compatibility with GitNexusRelay.
+
+    fn execute(&self, ctx: &PipelineContext, _shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let cross = get_phase_output::<CrossFileOutput>(deps, "cross_file");
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "scope_resolution".to_string(),
+            percent: 60,
+            message: "Resolving scopes...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        // Scope resolution was already run as part of the cross_file phase
+        // (the orchestrator does the full scope-resolution pipeline).
+        // This phase exists in the DAG for compatibility with GitNexusRelay's
+        // 12-phase structure, but the actual work is done in cross_file.
+        let resolved_references = cross.resolved_calls;
+
+        Box::new(ScopeResolutionOutput {
+            total_files: cross.total_files,
+            resolved_references,
+        })
+    }
+}
+
+// ── Convenience: build the full phase list ──────────────────────────────────
+
+/// Build the complete pipeline phase list.
+///
+/// DAG:
+/// ```text
+///   cross_file → [routes, tools, orm, markdown, cobol, scope_resolution, mro]
+///     → [communities, processes]
+/// ```
+///
+/// Scan and parse are handled by `build_graph()` before the pipeline runs.
+pub fn all_phases() -> Vec<Box<dyn PipelinePhase>> {
+    vec![
+        Box::new(CrossFilePhase),
+        // Wave 2 — all independent readers, run in parallel:
+        Box::new(RoutesPhase),
+        Box::new(ToolsPhase),
+        Box::new(OrmPhase),
+        Box::new(MarkdownPhase),
+        Box::new(CobolPhase),
+        Box::new(ScopeResolutionPhase),  // no-op, depends on cross_file
+        Box::new(MroPhase),              // no-op count, depends on cross_file
+        // Wave 3 — parallel graph analytics:
+        Box::new(CommunitiesPhase),
+        Box::new(ProcessesPhase),
+    ]
+}
+

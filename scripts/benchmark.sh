@@ -47,7 +47,7 @@ for entry in "${REPOS[@]}"; do
     rm -f "$BENCH_DB"
     echo "  Cold run..."
     cold_start=$(date +%s%N)
-    "$ATREE_BIN" --semantic --db "$BENCH_DB" --root "$repo_path" --include-files --json > /dev/null 2>&1
+    "$ATREE_BIN" --semantic --db "$BENCH_DB" --root "$repo_path" --include-files --no-limit --json > /dev/null 2>&1
     cold_end=$(date +%s%N)
     cold_ms=$(( (cold_end - cold_start) / 1000000 ))
 

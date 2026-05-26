@@ -93,7 +93,7 @@ fn golden_ts_express_routes() {
     let content = fs::read_to_string("tests/fixtures/typescript/routes.ts").unwrap();
     let provider = get_provider_for_extension("ts").unwrap();
     let mut engine = SyntaxEngine::new();
-    let (captures, _raw_scopes, _type_bindings) = engine.extract_captures_and_scopes(provider, &content);
+    let (_captures, _raw_scopes, _type_bindings) = engine.extract_captures_and_scopes(provider, &content);
 
     // Parse the tree for route detection
     let mut parser = tree_sitter::Parser::new();
@@ -181,7 +181,7 @@ fn golden_python_heritage() {
 
     // Python classes don't have explicit extends in this fixture
     // But UserService has a forward reference to UserRepository
-    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+    let _heritage_targets: Vec<&str> = parsed.heritage.iter()
         .map(|h| h.target_name.as_str())
         .collect();
 
@@ -247,7 +247,7 @@ fn golden_rust_heritage() {
 
     // Rust uses impl blocks, not class heritage
     // But Display trait impl should be detected
-    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+    let _heritage_targets: Vec<&str> = parsed.heritage.iter()
         .map(|h| h.target_name.as_str())
         .collect();
 
@@ -351,6 +351,12 @@ fn golden_type_bindings_extracted_all_languages() {
         ("tests/fixtures/python/models.py", "py", "Python"),
         ("tests/fixtures/rust/service.rs", "rs", "Rust"),
         ("tests/fixtures/php/Controller.php", "php", "PHP"),
+        ("tests/fixtures/go/service.go", "go", "Go"),
+        ("tests/fixtures/java/Service.java", "java", "Java"),
+        ("tests/fixtures/cpp/service.cpp", "cpp", "C++"),
+        ("tests/fixtures/csharp/Service.cs", "cs", "C#"),
+        ("tests/fixtures/swift/Service.swift", "swift", "Swift"),
+        ("tests/fixtures/dart/service.dart", "dart", "Dart"),
     ];
 
     for (path, ext, name) in fixtures {
@@ -366,4 +372,500 @@ fn golden_type_bindings_extracted_all_languages() {
                 "{} has empty type binding for {}", name, binding.var_name);
         }
     }
+}
+
+// =====================================================================
+// Go fixtures
+// =====================================================================
+
+#[test]
+fn golden_go_symbols() {
+    let content = fs::read_to_string("tests/fixtures/go/service.go").unwrap();
+    let parsed = parse_file(&content, "go");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User struct");
+    assert!(names.contains(&"Repository"), "Should find Repository interface");
+    assert!(names.contains(&"UserService"), "Should find UserService struct");
+    assert!(names.contains(&"Logger"), "Should find Logger struct");
+
+    // Functions
+    assert!(names.contains(&"NewUserService"), "Should find NewUserService function");
+    assert!(names.contains(&"FindByID"), "Should find FindByID method");
+    assert!(names.contains(&"Save"), "Should find Save method");
+    assert!(names.contains(&"Count"), "Should find Count method");
+    assert!(names.contains(&"Log"), "Should find Log method");
+}
+
+#[test]
+fn golden_go_type_bindings() {
+    let content = fs::read_to_string("tests/fixtures/go/service.go").unwrap();
+    let parsed = parse_file(&content, "go");
+
+    let bindings: Vec<(&str, &str)> = parsed.type_bindings.iter()
+        .map(|b| (b.var_name.as_str(), b.type_text.as_str()))
+        .collect();
+
+    // Go exports fields with capitalized names; tree-sitter captures the field name as-is
+    // The bindings include both struct fields and function parameters
+    assert!(bindings.iter().any(|(n, t)| *n == "id" && t.contains("int")),
+        "id should have int type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "user" && t.contains("User")),
+        "user should have User type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "message" && t.contains("string")),
+        "message should have string type, got: {:?}", bindings);
+}
+
+#[test]
+fn golden_go_interfaces() {
+    let content = fs::read_to_string("tests/fixtures/go/service.go").unwrap();
+    let parsed = parse_file(&content, "go");
+
+    let repo = parsed.symbols.iter().find(|s| s.name == "Repository").unwrap();
+    assert_eq!(repo.kind, atree::lang::CaptureTag::DefinitionInterface,
+        "Repository should be an interface");
+}
+
+// =====================================================================
+// Java fixtures
+// =====================================================================
+
+#[test]
+fn golden_java_symbols() {
+    let content = fs::read_to_string("tests/fixtures/java/Service.java").unwrap();
+    let parsed = parse_file(&content, "java");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User class");
+    assert!(names.contains(&"Repository"), "Should find Repository interface");
+    assert!(names.contains(&"Logger"), "Should find Logger interface");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+
+    // Methods
+    assert!(names.contains(&"findById"), "Should find findById method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"index"), "Should find index method");
+    assert!(names.contains(&"show"), "Should find show method");
+}
+
+#[test]
+fn golden_java_type_bindings() {
+    let content = fs::read_to_string("tests/fixtures/java/Service.java").unwrap();
+    let parsed = parse_file(&content, "java");
+
+    let bindings: Vec<(&str, &str)> = parsed.type_bindings.iter()
+        .map(|b| (b.var_name.as_str(), b.type_text.as_str()))
+        .collect();
+
+    // Field types
+    assert!(bindings.iter().any(|(n, t)| *n == "id" && t.contains("int")),
+        "id field should have int type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "name" && t.contains("String")),
+        "name field should have String type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "viewPath" && t.contains("String")),
+        "viewPath field should have String type, got: {:?}", bindings);
+}
+
+#[test]
+fn golden_java_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/java/Service.java").unwrap();
+    let parsed = parse_file(&content, "java");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// C fixtures
+// =====================================================================
+
+#[test]
+fn golden_c_symbols() {
+    let content = fs::read_to_string("tests/fixtures/c/types.c").unwrap();
+    let parsed = parse_file(&content, "c");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User struct");
+    assert!(names.contains(&"Logger"), "Should find Logger struct");
+    assert!(names.contains(&"Repository"), "Should find Repository struct");
+    assert!(names.contains(&"UserService"), "Should find UserService struct");
+
+    // Functions
+    assert!(names.contains(&"logger_log"), "Should find logger_log function");
+    assert!(names.contains(&"user_service_find_by_id"), "Should find user_service_find_by_id");
+    assert!(names.contains(&"user_service_save"), "Should find user_service_save");
+    assert!(names.contains(&"user_service_new"), "Should find user_service_new");
+}
+
+#[test]
+fn golden_c_symbols_basic() {
+    // C type extraction is limited (no annotations, types come from declarations)
+    // Just verify symbols are extracted correctly
+    let content = fs::read_to_string("tests/fixtures/c/types.c").unwrap();
+    let parsed = parse_file(&content, "c");
+
+    // C has limited type binding extraction (struct fields, no annotations)
+    // Just verify we get some type bindings from declarations
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(!names.is_empty(), "C should extract symbols");
+}
+
+// =====================================================================
+// C++ fixtures
+// =====================================================================
+
+#[test]
+fn golden_cpp_symbols() {
+    let content = fs::read_to_string("tests/fixtures/cpp/service.cpp").unwrap();
+    let parsed = parse_file(&content, "cpp");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User class");
+    assert!(names.contains(&"Repository"), "Should find Repository class");
+    assert!(names.contains(&"Logger"), "Should find Logger class");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+    assert!(names.contains(&"StringHelper"), "Should find StringHelper class");
+
+    // Methods
+    assert!(names.contains(&"findById"), "Should find findById method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"log"), "Should find log method");
+    assert!(names.contains(&"trim"), "Should find trim method");
+}
+
+#[test]
+fn golden_cpp_type_bindings() {
+    let content = fs::read_to_string("tests/fixtures/cpp/service.cpp").unwrap();
+    let parsed = parse_file(&content, "cpp");
+
+    let bindings: Vec<(&str, &str)> = parsed.type_bindings.iter()
+        .map(|b| (b.var_name.as_str(), b.type_text.as_str()))
+        .collect();
+
+    // Member types
+    assert!(bindings.iter().any(|(n, t)| *n == "id" && t.contains("int")),
+        "id should have int type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "name" && t.contains("string")),
+        "name should have string type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "prefix" && t.contains("string")),
+        "prefix should have string type, got: {:?}", bindings);
+}
+
+#[test]
+fn golden_cpp_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/cpp/service.cpp").unwrap();
+    let parsed = parse_file(&content, "cpp");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// C# fixtures
+// =====================================================================
+
+#[test]
+fn golden_csharp_symbols() {
+    let content = fs::read_to_string("tests/fixtures/csharp/Service.cs").unwrap();
+    let parsed = parse_file(&content, "cs");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User record");
+    assert!(names.contains(&"IRepository"), "Should find IRepository interface");
+    assert!(names.contains(&"ILogger"), "Should find ILogger interface");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+    assert!(names.contains(&"StringHelper"), "Should find StringHelper class");
+
+    // Methods
+    assert!(names.contains(&"FindById"), "Should find FindById method");
+    assert!(names.contains(&"Save"), "Should find Save method");
+    assert!(names.contains(&"Count"), "Should find Count method");
+    assert!(names.contains(&"Render"), "Should find Render method");
+    assert!(names.contains(&"Log"), "Should find Log method");
+    assert!(names.contains(&"FormatName"), "Should find FormatName method");
+}
+
+#[test]
+fn golden_csharp_type_bindings() {
+    let content = fs::read_to_string("tests/fixtures/csharp/Service.cs").unwrap();
+    let parsed = parse_file(&content, "cs");
+
+    let bindings: Vec<(&str, &str)> = parsed.type_bindings.iter()
+        .map(|b| (b.var_name.as_str(), b.type_text.as_str()))
+        .collect();
+
+    // Property types
+    assert!(bindings.iter().any(|(n, t)| *n == "Id" && t.contains("int")),
+        "Id should have int type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "Name" && t.contains("string")),
+        "Name should have string type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "ViewPath" && t.contains("string")),
+        "ViewPath should have string type, got: {:?}", bindings);
+}
+
+#[test]
+fn golden_csharp_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/csharp/Service.cs").unwrap();
+    let parsed = parse_file(&content, "cs");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// Ruby fixtures
+// =====================================================================
+
+#[test]
+fn golden_ruby_symbols() {
+    let content = fs::read_to_string("tests/fixtures/ruby/service.rb").unwrap();
+    let parsed = parse_file(&content, "rb");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User class");
+    assert!(names.contains(&"Logger"), "Should find Logger module");
+    assert!(names.contains(&"Repository"), "Should find Repository module");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+
+    // Methods
+    assert!(names.contains(&"find_by_id"), "Should find find_by_id method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"log"), "Should find log method");
+    assert!(names.contains(&"index"), "Should find index method");
+    assert!(names.contains(&"show"), "Should find show method");
+}
+
+#[test]
+fn golden_ruby_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/ruby/service.rb").unwrap();
+    let parsed = parse_file(&content, "rb");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// Kotlin fixtures
+// =====================================================================
+
+#[test]
+fn golden_kotlin_symbols() {
+    let content = fs::read_to_string("tests/fixtures/kotlin/Service.kt").unwrap();
+    let parsed = parse_file(&content, "kt");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User data class");
+    assert!(names.contains(&"Repository"), "Should find Repository interface");
+    assert!(names.contains(&"Logger"), "Should find Logger interface");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+    assert!(names.contains(&"Utils"), "Should find Utils object");
+
+    // Methods
+    assert!(names.contains(&"findById"), "Should find findById method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"log"), "Should find log method");
+    assert!(names.contains(&"formatName"), "Should find formatName method");
+}
+
+#[test]
+fn golden_kotlin_symbols_basic() {
+    // Kotlin type extraction uses simple_identifier which may not capture all types
+    // Just verify symbols are extracted correctly
+    let content = fs::read_to_string("tests/fixtures/kotlin/Service.kt").unwrap();
+    let parsed = parse_file(&content, "kt");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(!names.is_empty(), "Kotlin should extract symbols");
+    assert!(names.contains(&"User"), "Should find User");
+    assert!(names.contains(&"UserService"), "Should find UserService");
+}
+
+#[test]
+fn golden_kotlin_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/kotlin/Service.kt").unwrap();
+    let parsed = parse_file(&content, "kt");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// Swift fixtures
+// =====================================================================
+
+#[test]
+fn golden_swift_symbols() {
+    let content = fs::read_to_string("tests/fixtures/swift/Service.swift").unwrap();
+    let parsed = parse_file(&content, "swift");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"User"), "Should find User struct");
+    assert!(names.contains(&"Repository"), "Should find Repository protocol");
+    assert!(names.contains(&"Logger"), "Should find Logger protocol");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+    assert!(names.contains(&"Utils"), "Should find Utils enum");
+
+    // Methods
+    assert!(names.contains(&"findById"), "Should find findById method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"log"), "Should find log method");
+    assert!(names.contains(&"formatName"), "Should find formatName method");
+}
+
+#[test]
+fn golden_swift_type_bindings() {
+    let content = fs::read_to_string("tests/fixtures/swift/Service.swift").unwrap();
+    let parsed = parse_file(&content, "swift");
+
+    let bindings: Vec<(&str, &str)> = parsed.type_bindings.iter()
+        .map(|b| (b.var_name.as_str(), b.type_text.as_str()))
+        .collect();
+
+    // Property types
+    assert!(bindings.iter().any(|(n, t)| *n == "id" && t.contains("Int")),
+        "id should have Int type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "name" && t.contains("String")),
+        "name should have String type, got: {:?}", bindings);
+    assert!(bindings.iter().any(|(n, t)| *n == "viewPath" && t.contains("String")),
+        "viewPath should have String type, got: {:?}", bindings);
+}
+
+#[test]
+fn golden_swift_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/swift/Service.swift").unwrap();
+    let parsed = parse_file(&content, "swift");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter()
+        .map(|h| h.target_name.as_str())
+        .collect();
+
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+// =====================================================================
+// Bash fixtures
+// =====================================================================
+
+#[test]
+fn golden_bash_symbols() {
+    let content = fs::read_to_string("tests/fixtures/bash/deploy.sh").unwrap();
+    let parsed = parse_file(&content, "sh");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+
+    // Functions
+    assert!(names.contains(&"log_message"), "Should find log_message function");
+    assert!(names.contains(&"check_prerequisites"), "Should find check_prerequisites function");
+    assert!(names.contains(&"deploy"), "Should find deploy function");
+    assert!(names.contains(&"rollback"), "Should find rollback function");
+    assert!(names.contains(&"main"), "Should find main function");
+}
+
+#[test]
+fn golden_bash_variables() {
+    let content = fs::read_to_string("tests/fixtures/bash/deploy.sh").unwrap();
+    let parsed = parse_file(&content, "sh");
+
+    // Bash variable assignments should be captured
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"APP_NAME"), "Should find APP_NAME variable");
+    assert!(names.contains(&"DEPLOY_DIR"), "Should find DEPLOY_DIR variable");
+    assert!(names.contains(&"LOG_FILE"), "Should find LOG_FILE variable");
+}
+
+// =====================================================================
+// Dart golden fixtures
+// =====================================================================
+
+#[test]
+fn golden_dart_symbols() {
+    let content = fs::read_to_string("tests/fixtures/dart/service.dart").unwrap();
+    let parsed = parse_file(&content, "dart");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+    eprintln!("Dart symbols found: {:?}", names);
+    eprintln!("Dart captures: {}", parsed.symbols.len());
+    assert!(names.contains(&"User"), "Should find User class, got: {:?}", names);
+    assert!(names.contains(&"Repository"), "Should find Repository class");
+    assert!(names.contains(&"Logger"), "Should find Logger mixin");
+    assert!(names.contains(&"UserService"), "Should find UserService class");
+    assert!(names.contains(&"AbstractController"), "Should find AbstractController class");
+    assert!(names.contains(&"UserController"), "Should find UserController class");
+    assert!(names.contains(&"Utils"), "Should find Utils class");
+}
+
+#[test]
+fn golden_dart_inheritance() {
+    let content = fs::read_to_string("tests/fixtures/dart/service.dart").unwrap();
+    let parsed = parse_file(&content, "dart");
+
+    let heritage_targets: Vec<&str> = parsed.heritage.iter().map(|h| h.target_name.as_str()).collect();
+    assert!(heritage_targets.contains(&"AbstractController"),
+        "UserController should extend AbstractController, got: {:?}", heritage_targets);
+}
+
+#[test]
+fn golden_dart_methods() {
+    let content = fs::read_to_string("tests/fixtures/dart/service.dart").unwrap();
+    let parsed = parse_file(&content, "dart");
+
+    let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"findById"), "Should find findById method");
+    assert!(names.contains(&"save"), "Should find save method");
+    assert!(names.contains(&"count"), "Should find count method");
+    assert!(names.contains(&"render"), "Should find render method");
+    assert!(names.contains(&"index"), "Should find index method");
+    assert!(names.contains(&"show"), "Should find show method");
+    assert!(names.contains(&"formatName"), "Should find formatName method");
 }

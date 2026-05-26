@@ -1,19 +1,24 @@
-[package]
-name = "atree"
+[workspace]
+members = ["atree-engine", "atree-cli"]
+resolver = "2"
+
+[workspace.package]
 version = "0.7.0-alpha"
 edition = "2021"
-description = "Production-grade parallel filesystem analysis, A* pathfinder, and semantic code intelligence engine. Lock-free work-stealing scan, tree-sitter-powered multi-language symbol extraction, scope-aware resolution with confidence scoring, SQLite persistent cache."
+license = "MIT"
 authors = [
     "UnityAILab <contact@unityailab.com>",
     "Sponge <sponge@unityailab.com>",
     "Alfreddo",
     "Gee",
     "Red",
+    "B-A-M-N <benevolentjoker@gmail.com>",
 ]
-license = "MIT"
-readme = "README.md"
 
-[dependencies]
+[workspace.metadata]
+contact = "benevolentjoker@gmail.com"
+
+[workspace.dependencies]
 mimalloc = { version = "0.1", default-features = false }
 rustc-hash = "2"
 crossbeam-deque = "0.8"
@@ -39,19 +44,14 @@ streaming-iterator = "0.1.9"
 tree-sitter-bash = "0.25.1"
 tree-sitter-json = "0.24.8"
 tree-sitter-yaml = "0.7.2"
+tree-sitter-dart = "0.2.0"
+tree-sitter-vue = "0.0.3"
+tree-sitter-cobol = "0.1.0"
 regex = "1"
-
-[lib]
-name = "atree"
-path = "src/lib.rs"
-
-[[bin]]
-name = "atree"
-path = "src/main.rs"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
+fastembed = "4.6.0"
+git2 = "0.19"
+thiserror = "1"
+chrono = "0.4"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"

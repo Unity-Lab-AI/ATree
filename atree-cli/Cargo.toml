@@ -1,0 +1,31 @@
+[package]
+name = "atree"
+description = "CLI for the ATree semantic code intelligence engine. Fast parallel filesystem scan, multi-language symbol extraction, scope-aware resolution, git history analysis, and 55+ query subcommands."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "../README.md"
+
+[[bin]]
+name = "atree"
+path = "src/main.rs"
+
+[dependencies]
+atree-engine = { path = "../atree-engine", version = "0.7.0-alpha", features = ["git", "embeddings"] }
+mimalloc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+rustc-hash = "2"
+chrono.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+rmcp = { version = "1.7.0", features = ["server"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+schemars = { version = "1.0", optional = true }
+
+[features]
+default = []
+mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
