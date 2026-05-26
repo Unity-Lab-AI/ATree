@@ -1,21 +1,21 @@
 # ATree
 
-> Parallel filesystem analysis with A\* pathfinding + semantic code intelligence engine, written in Rust.
+> A\* filesystem pathfinder and semantic code intelligence engine — parallel multi-language symbol extraction, scope-aware resolution, git history analysis, and AI agent integration via MCP.
 
 | | |
 |---|---|
 | **Version** | `0.7.0-alpha` |
-| **Status** | Alpha — filesystem tree tool + semantic engine v2 with scope resolution, type-aware extraction, MCP server, and 55+ query subcommands. |
+| **Status** | Alpha — A\* filesystem tool and semantic engine v2 with scope resolution, type-aware extraction, MCP server, and 55+ query subcommands. |
 | **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red, B-A-M-N |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
 
-ATree is two products in one:
+ATree is two products sharing one CLI binary:
 
-1. **ATree** — a parallel filesystem scanner with A\* pathfinding. Walks directory trees, renders Unicode/ASCII trees, finds optimal paths, emits JSON/Graphviz.
-2. **ATree Semantic Engine** — a multi-language code intelligence engine. Parses source with tree-sitter, resolves symbols across files, analyzes git history, and exposes everything through 55+ CLI queries, a Rust library, and an MCP server for AI agents.
+- **ATree** — parallel filesystem scanner with A\* pathfinding. Walks directory trees, renders Unicode/ASCII trees, finds optimal paths, emits JSON/Graphviz.
+- **ATree Semantic Engine** — multi-language code intelligence. Parses source with tree-sitter, resolves symbols across files, analyzes git history, exposes everything through 55+ CLI queries, a Rust library, and an MCP server for AI agents.
 
-Both share a single CLI binary. The `--semantic` flag activates the code intelligence layer.
+Pass `--semantic` to activate the code intelligence layer.
 
 ## Contents
 
@@ -697,7 +697,7 @@ ATree is developed by **UnityAILab**, a sovereign, independent research and engi
 - **Alfreddo**
 - **Gee**
 - **Red**
-- **B-A-M-N** — `benevolentjoker@gmail.com`
+- **B-A-M-N**
 
 ## Contact
 
