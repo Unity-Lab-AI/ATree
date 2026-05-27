@@ -825,6 +825,7 @@ Options:
                              query routes            List API routes
                              query search <text>     Full-text search
                              query stats             Index statistics
+      mcp-server             Start MCP server for AI agent integration (requires --db)
       --json                 Emit a JSON report on stdout (status still goes to stderr)
       --print-schema         Print the bundled JSON Schema (Draft 7) on stdout and exit
   -h, --help                 Show this help
