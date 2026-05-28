@@ -987,17 +987,24 @@ impl ATreeMcpServer {
                 let max = input.max_patterns.unwrap_or(50) as usize;
                 let out_patterns: Vec<_> = patterns.into_iter().take(max).collect();
                 if out_patterns.is_empty() {
-                    "No patterns found matching the criteria (try lowering min_frequency).".to_string()
+                    serde_json::json!({"patterns": [], "message": "No patterns found matching the criteria (try lowering min_frequency)."}).to_string()
                 } else {
-                    let mut out = format!("Mined {} patterns:\n\n", out_patterns.len());
-                    for p in &out_patterns {
-                        out.push_str(&format!(
-                            "[{}] {} — freq={}, disp={:.2}, stab={:.2}, score={:.3}\n  {}\n  evidence: {} units\n\n",
-                            p.id, p.name, p.score.frequency, p.score.dispersion, p.score.stability, p.score.overall,
-                            p.description, p.evidence_ids.len()
-                        ));
-                    }
-                    out
+                    let json_patterns: Vec<serde_json::Value> = out_patterns.iter().map(|p| {
+                        serde_json::json!({
+                            "id": p.id,
+                            "name": p.name,
+                            "description": p.description,
+                            "motif": p.motif.iter().map(|k| format!("{:?}", k)).collect::<Vec<_>>(),
+                            "score": {
+                                "frequency": p.score.frequency,
+                                "dispersion": p.score.dispersion,
+                                "stability": p.score.stability,
+                                "overall": p.score.overall,
+                            },
+                            "evidence_count": p.evidence_ids.len(),
+                        })
+                    }).collect();
+                    serde_json::json!({"patterns": json_patterns, "total": json_patterns.len()}).to_string()
                 }
             }
             "constraint_check" => {
@@ -1022,20 +1029,29 @@ impl ATreeMcpServer {
                 let patterns = crate::patterns::mine_patterns(&evidence, &pattern_config);
                 let constraint_config = crate::constraints::ConstraintSynthesisConfig::default();
                 let constraints = crate::constraints::synthesize_constraints(&evidence, &patterns, &constraint_config);
-                // If symbol filter provided, check violations for that symbol.
-                let mut out = format!("Synthesized {} constraints from {} evidence units and {} patterns.\n\n",
-                    constraints.len(), evidence.len(), patterns.len());
-                for c in &constraints {
-                    let status = if c.active { "ACTIVE" } else { "inactive" };
-                    out.push_str(&format!(
-                        "[{}] {} ({}) conf={:.2}\n  {}\n\n",
-                        status, c.name, c.kind.as_str(), c.confidence, c.description
-                    ));
-                }
-                if let Some(ref sym) = input.symbol {
-                    out.push_str(&format!("Note: Symbol '{}' not yet checked against constraints (violations coming in next iteration).\n", sym));
-                }
-                out
+                let violations = if let Some(ref sym) = input.symbol {
+                    crate::constraints::detect_violations(&constraints, &evidence)
+                        .into_iter().filter(|(_, ev_id)| {
+                            evidence.iter().any(|e| &e.id == ev_id && e.content.raw == *sym)
+                        }).collect()
+                } else { vec![] };
+                let json_constraints: Vec<serde_json::Value> = constraints.iter().map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "kind": c.kind.as_str(),
+                        "confidence": c.confidence,
+                        "active": c.active,
+                        "description": c.description,
+                    })
+                }).collect();
+                serde_json::json!({
+                    "constraints": json_constraints,
+                    "total": json_constraints.len(),
+                    "evidence_units": evidence.len(),
+                    "patterns_mined": patterns.len(),
+                    "violations": violations.len(),
+                }).to_string()
             }
             unknown => {
                 return Err(ErrorData::invalid_params(

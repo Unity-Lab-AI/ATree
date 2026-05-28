@@ -1,22 +1,7 @@
 <!-- gitnexus:start -->
-# ATree — Semantic Code Intelligence Engine
+# GitNexus — Code Intelligence
 
-## Security Audit
-
-See `SECURITY_AUDIT.md` for the full production-readiness audit and fix pipeline. All 16 CRITICAL and SERIOUS findings have been resolved.
-
-Key changes for this session:
-- All SQLite `query_map()` calls now use `.unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default()` instead of bare `.unwrap()`
-- All `conn.prepare()` calls use `match` for error handling
-- All `Mutex::lock()` calls use `.unwrap_or_else(|e| e.into_inner())` for poison recovery
-- MCP `cypher` tool validates SQL against table/column allowlist
-- `verify` command uses strict command allowlist (no shell injection)
-- Files >16MB are skipped during scan (OOM protection)
-- SQLite uses `sAGMA synchronous = NORMAL` and `mmap_size = 0` for data integrity
-
-**Before editing any function, class, or method: run `gitnexus_impact` first.**
-
-This project is indexed by GitNexus as **ATree** (2555 symbols, 6510 relationships, 226 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **ATree** (3411 symbols, 8062 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
