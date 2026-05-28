@@ -16,7 +16,7 @@
 //! 4. Post-process: merge small communities below min_size threshold
 
 use crate::store::GraphStore;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Serialize, Deserialize};
 
 /// A detected community (functional area).
@@ -247,37 +247,12 @@ pub fn detect_communities(
     })
 }
 
-/// Persist community memberships as MEMBER_OF edges in the graph store.
+/// Persist community memberships using the communities table.
 pub fn store_memberships(
     store: &GraphStore,
     result: &CommunityDetectionResult,
 ) -> rusqlite::Result<usize> {
-    let mut count = 0;
-    for (symbol_id, community_id) in &result.memberships {
-        if let Ok(Some(file_id)) = store.get_file_id_for_symbol(*symbol_id) {
-            store.insert_edge(&crate::store::EdgeRecord {
-                id: 0,
-                src_id: *symbol_id,
-                dst_id: community_node_id(community_id),
-                edge_kind: "MEMBER_OF".to_string(),
-                confidence: 1.0,
-                file_id: Some(file_id),
-                line: 0,
-            })?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Convert a community ID string to a numeric node ID for edge storage.
-/// community_0 → 1_000_000, community_1 → 1_000_001, etc.
-fn community_node_id(community_id: &str) -> i64 {
-    let n = community_id
-        .strip_prefix("community_")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0);
-    1_000_000 + n
+    store.store_communities(result)
 }
 
 /// Get edges of specific kinds from the store using a single batched query.
@@ -523,6 +498,337 @@ mod tests {
             "login and connect should be in different communities");
     }
 
+}
+
+// ── Incremental community updates ──────────────────────────────────────────
+
+/// Incrementally update communities when a subset of symbols change.
+///
+/// Strategy:
+/// 1. Identify which communities have changed symbols (added/removed)
+/// 2. For affected communities, re-run label propagation on the subgraph
+///    consisting of the community and its immediate neighbor communities
+/// 3. For unchanged communities, keep existing assignments
+/// 4. Handle new symbols by assigning them to the most-connected existing community
+///    or creating new ones
+///
+/// `changed_symbol_ids` — symbols that were added, removed, or modified
+/// `depth` — how many community hops to include in the re-cluster subgraph (default: 1)
+pub fn update_communities_incremental(
+        store: &GraphStore,
+        changed_symbol_ids: &[i64],
+        config: &CommunityConfig,
+    ) -> rusqlite::Result<CommunityDetectionResult> {
+        if changed_symbol_ids.is_empty() {
+            return detect_communities(store, config); // fallback to full recompute
+        }
+
+        // Step 1: Load current community assignments
+        let existing_memberships = store.get_communities()?;
+
+        // Build a map of symbol_id → community_id from the existing memberships table
+        let mut symbol_to_community: FxHashMap<i64, String> = FxHashMap::default();
+        let mut community_symbols: FxHashMap<String, Vec<i64>> = FxHashMap::default();
+
+        // Query all existing memberships
+        let all_existing = get_all_memberships(store)?;
+        for (sym_id, comm_id) in &all_existing {
+            symbol_to_community.insert(*sym_id, comm_id.clone());
+            community_symbols.entry(comm_id.clone()).or_default().push(*sym_id);
+        }
+
+        // Step 2: Identify affected communities (those containing changed symbols)
+        let changed_set: FxHashSet<i64> = changed_symbol_ids.iter().copied().collect();
+        let mut affected_communities: FxHashSet<String> = FxHashSet::default();
+        let mut affected_symbols: FxHashSet<i64> = FxHashSet::default();
+
+        for sym_id in changed_symbol_ids {
+            if let Some(comm_id) = symbol_to_community.get(sym_id) {
+                affected_communities.insert(comm_id.clone());
+            }
+            affected_symbols.insert(*sym_id);
+        }
+
+        // Step 3: Expand to neighbor communities (communities with edges to affected ones)
+        let mut neighbor_comms: Vec<String> = Vec::new();
+        for comm_id in &affected_communities {
+            if let Some(symbols) = community_symbols.get(comm_id) {
+                for sym_id in symbols {
+                    if let Ok(edges) = store.get_edges_for_node(*sym_id) {
+                        for edge in &edges {
+                            let other_id = if edge.src_id == *sym_id { edge.dst_id } else { edge.src_id };
+                            if !changed_set.contains(&other_id) {
+                                if let Some(other_comm) = symbol_to_community.get(&other_id) {
+                                    if !affected_communities.contains(other_comm) && !neighbor_comms.contains(other_comm) {
+                                        neighbor_comms.push(other_comm.clone());
+                                    }
+                                }
+                            }
+                            affected_symbols.insert(other_id);
+                        }
+                    }
+                }
+            }
+        }
+        for nc in neighbor_comms {
+            affected_communities.insert(nc);
+        }
+
+        // Include changed symbols themselves
+        for sym_id in changed_symbol_ids {
+            affected_symbols.insert(*sym_id);
+        }
+
+        // If too many communities affected, fall back to full recompute
+        let total_community_count = community_symbols.len();
+        if affected_communities.len() > total_community_count / 2 {
+            return detect_communities(store, config);
+        }
+
+        // Step 4: Remove old memberships for affected symbols
+        for sym_id in &affected_symbols {
+            symbol_to_community.remove(sym_id);
+        }
+        for comm_id in &affected_communities {
+            community_symbols.remove(comm_id);
+        }
+
+        // Step 5: Run LPA on the affected subgraph only
+        let subgraph_symbols = affected_symbols.into_iter().collect::<Vec<_>>();
+        if subgraph_symbols.len() < 2 {
+            // Too few symbols — just assign to nearest community or keep existing
+            for sym_id in &subgraph_symbols {
+                let best_comm = find_best_community(store, *sym_id, &symbol_to_community, &community_symbols);
+                if let Some(comm_id) = best_comm {
+                    symbol_to_community.insert(*sym_id, comm_id.clone());
+                    community_symbols.entry(comm_id).or_default().push(*sym_id);
+                }
+            }
+        } else {
+            // Run label propagation on the affected subgraph
+            let subgraph_result = detect_communities_subgraph(
+                store, &subgraph_symbols, &symbol_to_community, config,
+            )?;
+
+            // Merge subgraph results back into global assignments
+            for (sym_id, comm_id) in &subgraph_result.memberships {
+                symbol_to_community.insert(*sym_id, comm_id.clone());
+                community_symbols.entry(comm_id.clone()).or_default().push(*sym_id);
+            }
+        }
+
+        // Step 6: Build full result from merged assignments
+        build_detection_result(store, &symbol_to_community, &community_symbols, config)
+    }
+
+    /// Find the best existing community for a new/changed symbol based on edge connectivity.
+    fn find_best_community(
+        store: &GraphStore,
+        symbol_id: i64,
+        symbol_to_community: &FxHashMap<i64, String>,
+        _community_symbols: &FxHashMap<String, Vec<i64>>,
+    ) -> Option<String> {
+        let edges = store.get_edges_for_node(symbol_id).ok()?;
+        let mut comm_votes: FxHashMap<String, f64> = FxHashMap::default();
+
+        for edge in &edges {
+            let other_id = if edge.src_id == symbol_id { edge.dst_id } else { edge.src_id };
+            if let Some(comm_id) = symbol_to_community.get(&other_id) {
+                *comm_votes.entry(comm_id.clone()).or_insert(0.0) += edge.confidence;
+            }
+        }
+
+        comm_votes.into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(comm_id, _)| comm_id)
+    }
+
+    /// Run community detection on a subgraph (affected symbols only).
+    fn detect_communities_subgraph(
+        store: &GraphStore,
+        subgraph_symbol_ids: &[i64],
+        existing_assignments: &FxHashMap<i64, String>,
+        config: &CommunityConfig,
+    ) -> rusqlite::Result<CommunityDetectionResult> {
+        if subgraph_symbol_ids.len() < 2 {
+            return Ok(CommunityDetectionResult::default());
+        }
+
+        let subgraph_set: FxHashSet<i64> = subgraph_symbol_ids.iter().copied().collect();
+        let id_to_idx: FxHashMap<i64, usize> = subgraph_symbol_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        let node_count = subgraph_symbol_ids.len();
+
+        // Load edges between subgraph symbols
+        let mut adjacency: Vec<Vec<(usize, f64)>> = vec![Vec::new(); node_count];
+        for sym_id in subgraph_symbol_ids {
+            if let Some(&idx) = id_to_idx.get(sym_id) {
+                if let Ok(edges) = store.get_edges_for_node(*sym_id) {
+                    for edge in &edges {
+                        let other_id = if edge.src_id == *sym_id { edge.dst_id } else { edge.src_id };
+                        if let Some(&other_idx) = id_to_idx.get(&other_id) {
+                            adjacency[idx].push((other_idx, edge.confidence));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Label propagation with seeds from existing assignments
+        let mut labels: Vec<u64> = (0..node_count as u64).collect();
+        // Seed: if a symbol has an existing community neighbor, start with that community's hash
+        for (idx, sym_id) in subgraph_symbol_ids.iter().enumerate() {
+            if let Some(comm_id) = existing_assignments.get(sym_id) {
+                labels[idx] = comm_id.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+            }
+        }
+
+        let active_nodes: Vec<usize> = (0..node_count)
+            .filter(|&i| !adjacency[i].is_empty())
+            .collect();
+
+        let mut changed = true;
+        let mut iteration = 0;
+        while changed && iteration < config.max_iterations {
+            changed = false;
+            iteration += 1;
+            for &node_idx in &active_nodes {
+                let neighbors = &adjacency[node_idx];
+                let current_label = labels[node_idx];
+                let mut scratch: Vec<(u64, f64)> = Vec::with_capacity(neighbors.len());
+                for &(neighbor_idx, weight) in neighbors {
+                    let nlabel = labels[neighbor_idx];
+                    if let Some(entry) = scratch.iter_mut().find(|(l, _)| *l == nlabel) {
+                        entry.1 += weight;
+                    } else {
+                        scratch.push((nlabel, weight));
+                    }
+                }
+                if scratch.is_empty() { continue; }
+                let mut best_label = current_label;
+                let mut best_weight = 0.0;
+                for &(label, weight) in &scratch {
+                    if weight > best_weight || (weight == best_weight && label < best_label) {
+                        best_weight = weight;
+                        best_label = label;
+                    }
+                }
+                if best_label != current_label {
+                    labels[node_idx] = best_label;
+                    changed = true;
+                }
+            }
+        }
+
+        // Group by label
+        let mut groups: FxHashMap<u64, Vec<i64>> = FxHashMap::default();
+        for (idx, &label) in labels.iter().enumerate() {
+            groups.entry(label).or_default().push(subgraph_symbol_ids[idx]);
+        }
+
+        // Build community IDs and memberships
+        let mut communities = Vec::new();
+        let mut memberships = FxHashMap::default();
+        for (idx, (_label, members)) in groups.iter().enumerate() {
+            let comm_id = format!("community_{}", idx);
+            for member_id in members {
+                memberships.insert(*member_id, comm_id.clone());
+            }
+            communities.push(Community {
+                id: comm_id,
+                label: format!("Community {}", idx),
+                cohesion: 0.0,
+                symbol_count: members.len(),
+                keywords: vec![],
+            });
+        }
+
+        Ok(CommunityDetectionResult {
+            communities,
+            memberships,
+            stats: CommunityStats {
+                total_communities: groups.len(),
+                modularity: 0.0,
+                nodes_processed: node_count,
+                iterations: iteration,
+            },
+        })
+    }
+
+    /// Build a full CommunityDetectionResult from symbol→community assignments.
+    fn build_detection_result(
+        store: &GraphStore,
+        symbol_to_community: &FxHashMap<i64, String>,
+        community_symbols: &FxHashMap<String, Vec<i64>>,
+        _config: &CommunityConfig,
+    ) -> rusqlite::Result<CommunityDetectionResult> {
+        let mut communities = Vec::new();
+        let mut memberships = FxHashMap::default();
+
+        for (comm_id, members) in community_symbols {
+            let keywords = extract_community_keywords_from_ids(store, members);
+            let cohesion = 0.0; // Simplified for incremental
+
+            for member_id in members {
+                memberships.insert(*member_id, comm_id.clone());
+            }
+
+            communities.push(Community {
+                id: comm_id.clone(),
+                label: keywords.first().cloned().unwrap_or_else(|| comm_id.clone()),
+                cohesion,
+                symbol_count: members.len(),
+                keywords,
+            });
+        }
+
+        communities.sort_by(|a, b| b.symbol_count.cmp(&a.symbol_count));
+
+        Ok(CommunityDetectionResult {
+            communities,
+            memberships,
+            stats: CommunityStats {
+                total_communities: community_symbols.len(),
+                modularity: 0.0,
+                nodes_processed: symbol_to_community.len(),
+                iterations: 0,
+            },
+        })
+    }
+
+    /// Get all community memberships from the store.
+    fn get_all_memberships(store: &GraphStore) -> rusqlite::Result<Vec<(i64, String)>> {
+        let mut stmt = store.conn().prepare(
+            "SELECT symbol_id, community_id FROM community_memberships"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Extract keywords from a set of symbol IDs.
+    fn extract_community_keywords_from_ids(
+        store: &GraphStore,
+        member_ids: &[i64],
+    ) -> Vec<String> {
+        let mut name_freq: FxHashMap<String, usize> = FxHashMap::default();
+        for sym_id in member_ids {
+            if let Ok(Some(sym)) = store.get_symbol_by_id(*sym_id) {
+                for part in sym.qualified_name.split(['.', ':', '\\', '/']) {
+                    let trimmed = part.trim();
+                    if trimmed.len() > 2 && !trimmed.chars().all(|c| c.is_numeric()) {
+                        *name_freq.entry(trimmed.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut keywords: Vec<(String, usize)> = name_freq.into_iter().collect();
+        keywords.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        keywords.into_iter().take(5).map(|(k, _)| k).collect()
+    }
+
     #[test]
     fn test_empty_graph() {
         let store = GraphStore::open_in_memory().unwrap();
@@ -547,4 +853,3 @@ mod tests {
         // Single node with no edges — may or may not form a community depending on min_size
         assert!(result.stats.nodes_processed <= 1);
     }
-}

@@ -25,7 +25,9 @@ env_logger.workspace = true
 rmcp = { version = "1.7.0", features = ["server"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 schemars = { version = "1.0", optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
 
 [features]
-default = []
+default = ["webhook"]
+webhook = ["dep:ureq"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars", "atree-engine/mcp"]

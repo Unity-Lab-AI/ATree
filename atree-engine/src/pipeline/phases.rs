@@ -89,6 +89,73 @@ impl PipelinePhase for CrossFilePhase {
         // This needs &parsed_files_guard, not &mut, so we do it while the lock is held.
         let import_graph = crate::resolver::import_graph::ImportGraph::from_parsed_files(&parsed_files_guard);
 
+        // ── Evidence Lifecycle (Stages 1-4) ──────────────────────────────────
+        // Collect evidence from all parsed files, dedupe, enrich, calibrate, commit.
+        // This runs while we still have the parsed_files lock (read-only access to evidence).
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 52,
+            message: "Extracting evidence...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        perf_timer!("Evidence lifecycle");
+        {
+            let mut evidence_lifecycle = crate::evidence::lifecycle::EvidenceLifecycle::new();
+
+            // Collect all evidence candidates from all parsed files.
+            let all_candidates: Vec<crate::evidence::EvidenceCandidate> = parsed_files_guard
+                .iter()
+                .flat_map(|pf| pf.evidence.clone())
+                .collect();
+
+            let total_candidates = all_candidates.len();
+
+            // Stage 1: Normalize (canonicalize, attach scope chain).
+            let evidence: Vec<crate::evidence::Evidence> = all_candidates
+                .into_iter()
+                .map(|c| c.into_evidence())
+                .collect();
+            evidence_lifecycle.normalize(evidence);
+
+            // Stage 2: Deduplicate (content-addressed identity).
+            let (total, merged) = evidence_lifecycle.dedupe();
+
+            // Stage 3: Enrich (graph binding via symbol_id_map + file_id_map).
+            let file_id_map: rustc_hash::FxHashMap<u64, i64> = parsed_files_guard
+                .iter()
+                .filter_map(|pf| {
+                    let file_db_id = store.get_file_by_id(pf.id as i64).ok().flatten().map(|f| f.id)?;
+                    Some((pf.id, file_db_id))
+                })
+                .collect();
+            evidence_lifecycle.enrich(&global_symbol_id_map, &file_id_map);
+
+            // Stage 4: Calibrate confidence.
+            evidence_lifecycle.calibrate_all();
+
+            // Stage 5: Commit to SQLite.
+            let committed_count = evidence_lifecycle.commit_all();
+
+            // Persist committed evidence to the store.
+            let committed_evidence: Vec<&crate::evidence::Evidence> = evidence_lifecycle
+                .by_state(crate::evidence::lifecycle::EvidenceState::Committed);
+
+            if !committed_evidence.is_empty() {
+                let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+                let owned: Vec<crate::evidence::Evidence> = committed_evidence.iter().map(|ev| (*ev).clone()).collect();
+                match ev_store.insert_batch(&owned) {
+                    Ok(n) => log::info!("[evidence] Committed {} evidence units ({} candidates, {} merged, {} records)",
+                        committed_count, total_candidates, merged, n),
+                    Err(e) => eprintln!("[evidence] Warning: evidence batch insert failed: {}", e),
+                }
+            } else {
+                log::info!("[evidence] No committed evidence to persist ({} candidates, {} merged)",
+                    total_candidates, merged);
+            }
+        }
+
         // Drop the lock before scope resolution, which needs &mut.
         drop(parsed_files_guard);
 
@@ -144,6 +211,92 @@ impl PipelinePhase for CrossFilePhase {
 
         let resolved_calls = sr_stats.resolved_sites;
 
+        // ── Pattern Mining + Constraint Synthesis (Layers 2-3) ────────────────
+        // Mine patterns from committed evidence, synthesize constraints.
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 58,
+            message: "Mining patterns and synthesizing constraints...".to_string(),
+            detail: None,
+            stats: None,
+        });
+        perf_timer!("Pattern mining + constraint synthesis");
+        {
+            // Re-open store reference for evidence querying.
+            // (store is moved into shared below, so we use it first).
+            let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+
+            // Fetch ALL committed evidence across all kinds for pattern mining.
+            let all_kinds = [
+                crate::evidence::EvidenceKind::SymbolDeclaration,
+                crate::evidence::EvidenceKind::FunctionCall,
+                crate::evidence::EvidenceKind::ImportEdge,
+                crate::evidence::EvidenceKind::TypeRelation,
+                crate::evidence::EvidenceKind::DataFlow,
+            ];
+            let all_evidence_records: Vec<crate::evidence::storage::EvidenceRecord> = all_kinds
+                .iter()
+                .filter_map(|k| ev_store.by_kind(*k).ok())
+                .flatten()
+                .collect();
+
+            if !all_evidence_records.is_empty() {
+                let pattern_config = crate::patterns::PatternMiningConfig::default();
+                let constraint_config = crate::constraints::ConstraintSynthesisConfig::default();
+
+                // Convert records to Evidence for mining.
+                let mining_evidence: Vec<crate::evidence::Evidence> = all_evidence_records
+                    .iter()
+                    .map(|rec| record_to_evidence(rec.clone()))
+                    .collect();
+
+                let patterns = crate::patterns::mine_patterns(&mining_evidence, &pattern_config);
+                let constraints = crate::constraints::synthesize_constraints(
+                    &mining_evidence, &patterns, &constraint_config,
+                );
+
+                // Persist patterns to SQLite.
+                if !patterns.is_empty() {
+                    let pat_store = crate::patterns::PatternStore::new(store.conn());
+                    if let Err(e) = pat_store.init_tables() {
+                        eprintln!("[patterns] Warning: failed to init pattern tables: {}", e);
+                    }
+                    for pat in &patterns {
+                        let _ = store.conn().execute(
+                            "INSERT OR REPLACE INTO patterns (id, name, description, motif, frequency, dispersion, stability, entropy, overall_score) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            rusqlite::params![
+                                &pat.id, &pat.name, &pat.description,
+                                &format!("{:?}", pat.motif),
+                                pat.score.frequency as i64,
+                                pat.score.dispersion, pat.score.stability,
+                                pat.score.entropy, pat.score.overall,
+                            ],
+                        );
+                    }
+                    log::info!("[patterns] Mined and persisted {} patterns", patterns.len());
+                }
+
+                // Persist constraints to SQLite.
+                if !constraints.is_empty() {
+                    let con_store = crate::constraints::ConstraintStore::new(store.conn());
+                    if let Err(e) = con_store.init_tables() {
+                        eprintln!("[constraints] Warning: failed to init constraint tables: {}", e);
+                    }
+                    for con in &constraints {
+                        let _ = store.conn().execute(
+                            "INSERT OR REPLACE INTO constraints (id, name, description, kind, confidence, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            rusqlite::params![
+                                &con.id, &con.name, &con.description,
+                                con.kind.as_str(), con.confidence,
+                                if con.active { 1i64 } else { 0 },
+                            ],
+                        );
+                    }
+                    log::info!("[constraints] Synthesized and persisted {} constraints", constraints.len());
+                }
+            }
+        }
+
         // Store the graph store, symbol ID map, and scope resolution stats.
         *shared.store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
         *shared.symbol_id_map.lock().unwrap_or_else(|e| e.into_inner()) = global_symbol_id_map;
@@ -163,6 +316,56 @@ impl PipelinePhase for CrossFilePhase {
             resolved_calls,
             resolved_imports,
         })
+    }
+}
+
+/// Convert an EvidenceRecord (flat DB row) back to an Evidence for pattern mining.
+/// This is a lossy conversion — graph links are not restored from the flat record.
+/// For production pattern mining, operate directly on Evidence in memory before commit.
+pub fn record_to_evidence(rec: crate::evidence::storage::EvidenceRecord) -> crate::evidence::Evidence {
+    use crate::evidence::*;
+    let imports: Vec<String> = serde_json::from_str(&rec.imports).unwrap_or_default();
+    let scope_chain: Vec<String> = serde_json::from_str(&rec.scope_chain).unwrap_or_default();
+    let tags: Vec<String> = serde_json::from_str(&rec.tags).unwrap_or_default();
+    let kind = rec.kind.parse().unwrap_or(EvidenceKind::HeuristicInference);
+    let target_type = match rec.target_type.as_str() {
+        "primitive" => TargetType::Primitive,
+        "pattern" => TargetType::Pattern,
+        "constraint" => TargetType::Constraint,
+        _ => TargetType::Symbol,
+    };
+    let state = rec.state.parse().unwrap_or(crate::evidence::EvidenceState::Committed);
+    Evidence {
+        id: EvidenceId(rec.id),
+        kind,
+        source: EvidenceSource {
+            file: rec.file,
+            span: SourceSpan {
+                start_line: rec.start_line,
+                start_col: rec.start_col,
+                end_line: rec.end_line,
+                end_col: rec.end_col,
+            },
+            language: rec.language,
+        },
+        target: EvidenceTarget { target_type, ref_id: rec.target_ref },
+        content: EvidenceContent { raw: rec.raw, normalized: rec.normalized },
+        context: EvidenceContext {
+            enclosing_symbol: rec.enclosing_symbol,
+            imports,
+            scope_chain,
+        },
+        metadata: EvidenceMetadata {
+            extractor: rec.extractor,
+            confidence: rec.confidence,
+            stability: rec.stability,
+            entropy: rec.entropy,
+            timestamp_ms: rec.timestamp_ms,
+            commit: rec.commit,
+        },
+        links: EvidenceLinks::default(),
+        tags,
+        state,
     }
 }
 

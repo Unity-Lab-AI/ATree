@@ -21,7 +21,10 @@ pub mod embeddings;
 pub mod type_env;
 pub mod pipeline;
 pub mod evidence;
+pub mod evidence_path;
 pub mod evidence_bundle;
+pub mod patterns;
+pub mod constraints;
 pub mod perf;
 
 #[cfg(feature = "mcp")]
@@ -430,12 +433,17 @@ fn try_steal<T: Send>(stealers: &[Stealer<T>]) -> Option<T> {
 }
 
 fn reserve_slot(node_count: &AtomicUsize, max_nodes: usize) -> bool {
-    let prev = node_count.fetch_add(1, Ordering::Relaxed);
-    if prev >= max_nodes {
-        node_count.fetch_sub(1, Ordering::Relaxed);
-        false
-    } else {
-        true
+    loop {
+        let prev = node_count.load(Ordering::Relaxed);
+        if prev >= max_nodes {
+            return false;
+        }
+        if node_count
+            .compare_exchange(prev, prev + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
     }
 }
 
@@ -913,6 +921,20 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             }
         }
 
+        // Build abstraction layers (file-graph, module-graph) for large-repo navigation.
+        // These pre-computed views collapse thousands of symbol edges into a manageable
+        // number of file/file and module/module edges, enabling fast scoped queries.
+        {
+            let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref store) = *store_guard {
+                perf_timer!("Abstraction layers");
+                if let Err(e) = store.build_abstraction_layers() {
+                    eprintln!("[WARN] Failed to build abstraction layers: {}", e);
+                }
+            }
+            drop(store_guard);
+        }
+
         // Extract git history (commits, file_commits, authors) and persist to the store.
         #[cfg(feature = "git")]
         let git_stats = {
@@ -1065,10 +1087,13 @@ pub fn build_graph_incremental(
     let mut changed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // ── Step 4: Remove deleted files ──
+    let ev_store_removed = crate::evidence::storage::EvidenceStore::new(store.conn());
     for (path, _) in &indexed_files {
         if !current_paths.contains(path) {
             store.remove_file_data(path)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            // Also clean up FTS5 index entries for this file.
+            let _ = ev_store_removed.remove_file_from_fts(path);
             incremental.files_removed += 1;
             changed_paths.insert(path.clone());
         }
@@ -1265,6 +1290,44 @@ pub fn build_graph_incremental(
         let scope_resolution_stats = run_incremental_scope_resolution(
             &store, &mut parsed_files, &global_symbol_id_map,
         )?;
+
+        // ── Step 7b: Evidence lifecycle for changed files ──
+        // Collect evidence from newly parsed files, run full lifecycle, commit to store.
+        if !parsed_files.is_empty() {
+            let mut evidence_lifecycle = crate::evidence::lifecycle::EvidenceLifecycle::new();
+            let all_new_evidence: Vec<crate::evidence::Evidence> = parsed_files
+                .iter()
+                .flat_map(|pf| pf.evidence.clone())
+                .map(|c| c.into_evidence())
+                .collect();
+            evidence_lifecycle.normalize(all_new_evidence);
+            evidence_lifecycle.dedupe();
+
+            // Build file_id_map for enrichment.
+            let file_id_map: rustc_hash::FxHashMap<u64, i64> = parsed_files
+                .iter()
+                .filter_map(|pf| {
+                    store.get_file(&pf.path).ok().flatten().map(|f| (pf.id, f.id))
+                })
+                .collect();
+            evidence_lifecycle.enrich(&global_symbol_id_map, &file_id_map);
+            evidence_lifecycle.calibrate_all();
+
+            // Feedback: for evidence that already exists in the store (same ID),
+            // update confidence/stability instead of inserting conflicting records.
+            let committed = evidence_lifecycle.committed();
+            let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+            for ev in committed {
+                if let Ok(Some(existing)) = ev_store.get(&ev.id) {
+                    // Feedback: boost stability (seen again), keep higher confidence.
+                    let new_stability = (existing.stability + 0.1).min(1.0);
+                    let new_confidence = ev.metadata.confidence.max(existing.confidence);
+                    let _ = ev_store.update_confidence(&ev.id, new_confidence, new_stability);
+                } else {
+                    let _ = ev_store.insert_batch(&[ev.clone()]);
+                }
+            }
+        }
 
         // ── Step 8: Re-resolve imports for changed files ──
         // Also re-resolve imports in files that import FROM changed files
@@ -1477,10 +1540,54 @@ fn run_incremental_semantic_phases(
         store, parsed_files, symbol_id_map,
     ).unwrap_or_default();
 
-    // Re-run community and process detection on the full store.
-    let _ = crate::community::detect_communities(
-        store, &crate::community::CommunityConfig::default(),
-    );
+    // Collect DB symbol IDs for changed files (needed for incremental community updates)
+    let mut changed_symbol_ids = Vec::new();
+    for pf in parsed_files {
+        if let Ok(Some(file_rec)) = store.get_file(&pf.path) {
+            if let Ok(syms) = store.get_symbols_by_file(file_rec.id) {
+                for sym in &syms {
+                    changed_symbol_ids.push(sym.id);
+                }
+            }
+        }
+    }
+
+    // Incremental community update: only re-cluster affected communities
+    if !changed_symbol_ids.is_empty() && changed_symbol_ids.len() < 1000 {
+        // Use incremental update for small changes
+        let incremental_config = crate::community::CommunityConfig {
+            max_iterations: 10, // Fewer iterations for incremental
+            min_size: 3,
+            edge_kinds: vec!["CALLS".to_string(), "ACCESSES".to_string()],
+        };
+        match crate::community::update_communities_incremental(
+            store, &changed_symbol_ids, &incremental_config,
+        ) {
+            Ok(result) => {
+                if let Err(e) = crate::community::store_memberships(store, &result) {
+                    eprintln!("[communities] Warning: failed to store incremental memberships: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("[communities] Warning: incremental update failed, falling back: {}", e);
+                // Fallback to full recompute
+                if let Ok(result) = crate::community::detect_communities(store, &crate::community::CommunityConfig::default()) {
+                    let _ = crate::community::store_memberships(store, &result);
+                }
+            }
+        }
+    } else if !changed_symbol_ids.is_empty() {
+        // Too many changes — full recompute
+        match crate::community::detect_communities(store, &crate::community::CommunityConfig::default()) {
+            Ok(result) => {
+                if let Err(e) = crate::community::store_memberships(store, &result) {
+                    eprintln!("[communities] Warning: failed to store memberships: {}", e);
+                }
+            }
+            Err(e) => eprintln!("[communities] Warning: detection failed: {}", e),
+        }
+    }
+
     let _ = crate::process::detect_processes(
         store, &crate::process::ProcessConfig::default(),
     );
@@ -3471,6 +3578,74 @@ func main() {
         assert!(names.contains(&"NewPrinter"), "NewPrinter function not found");
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn diagnostic_go_extraction_detail() {
+        // Diagnostic: print exactly what Go extracts for the fixture file
+        use crate::lang::get_provider_for_extension;
+        use crate::syntax::SyntaxEngine;
+        let content = std::fs::read_to_string(env!("CARGO_MANIFEST_DIR").to_owned() + "/../tests/fixtures/go/service.go")
+            .or_else(|_| std::fs::read_to_string("tests/fixtures/go/service.go"))
+            .unwrap();
+        let provider = get_provider_for_extension("go").unwrap();
+        let mut engine = SyntaxEngine::new();
+        let (captures, raw_scopes, type_bindings) = engine.extract_captures_and_scopes(provider, &content);
+
+        // Write diagnostic output to a temp file
+        use std::io::Write;
+        let mut diag = std::fs::File::create("/tmp/atree_go_diag.txt").unwrap();
+        writeln!(diag, "=== Go Captures ({} total) ===", captures.len()).unwrap();
+        for c in &captures {
+            writeln!(diag, "  {:?} '{}' @ line {}", c.tag, c.name, c.range.start_point.row + 1).unwrap();
+        }
+        writeln!(diag, "=== Go Scopes ({} total) ===", raw_scopes.len()).unwrap();
+        for s in &raw_scopes {
+            writeln!(diag, "  {:?} @ {}-{}", s.kind, s.line_start + 1, s.line_end + 1).unwrap();
+        }
+        writeln!(diag, "=== Go Type Bindings ({} total) ===", type_bindings.len()).unwrap();
+        for b in &type_bindings {
+            writeln!(diag, "  {}: {} @ line {}", b.var_name, b.type_text, b.line + 1).unwrap();
+        }
+
+        let file_id = 1u64;
+        let file_hash = crate::syntax::hash_content(&content);
+        let parsed = ParsedFile::from_captures_with_scopes(
+            file_id, "service.go", provider.id(), file_hash,
+            captures, raw_scopes, type_bindings,
+        );
+
+        writeln!(diag, "=== Go ParsedFile ===").unwrap();
+        writeln!(diag, "  symbols: {}", parsed.symbols.len()).unwrap();
+        for s in &parsed.symbols {
+            writeln!(diag, "    {} ({:?}) @ line {} scope={:?} owner={:?}", s.name, s.kind, s.line, s.scope_id, s.owner_id).unwrap();
+        }
+        writeln!(diag, "  calls: {}", parsed.calls.len()).unwrap();
+        for c in &parsed.calls {
+            writeln!(diag, "    {} @ line {} receiver={:?}", c.callee_name, c.line, c.receiver).unwrap();
+        }
+        let file_id = 1u64;
+        writeln!(diag, "  assignments: {}", parsed.assignments.len()).unwrap();
+        for a in &parsed.assignments {
+            writeln!(diag, "    {} @ line {} receiver={:?}", a.name, a.line, a.receiver).unwrap();
+        }
+        writeln!(diag, "  heritage: {}", parsed.heritage.len()).unwrap();
+        for h in &parsed.heritage {
+            writeln!(diag, "    {} -> {} @ line {}", h.class_name, h.target_name, h.line).unwrap();
+        }
+        drop(diag);
+
+        // Verify key assertions
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"User"), "User struct not found in symbols: {:?}", names);
+        assert!(names.contains(&"Repository"), "Repository interface not found");
+        assert!(names.contains(&"UserService"), "UserService struct not found");
+        assert!(names.contains(&"NewUserService"), "NewUserService function not found");
+        assert!(names.contains(&"FindByID"), "FindByID method not found");
+
+        // These are the ones the user says are empty
+        assert!(!parsed.imports.is_empty(), "Go imports should not be empty");
+        assert!(!parsed.calls.is_empty(), "Go calls should not be empty");
     }
 
     #[test]

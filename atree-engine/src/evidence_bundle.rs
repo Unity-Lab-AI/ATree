@@ -20,7 +20,7 @@
 //! With a default budget of 2000 tokens, that's ~16 steps across all paths.
 //! The bundle truncates lowest-confidence paths first.
 
-use crate::evidence::{
+use crate::evidence_path::{
     EvidencePath, EvidenceVia,
     find_evidence_paths, EvidenceConfig,
 };
@@ -553,7 +553,7 @@ pub fn trace_path_evidence(
         return Ok(format!("{} → {} (same symbol)\n  {}:{}\n", from_name, to_name, file, line));
     }
 
-    let paths = crate::evidence::find_path_between(store, &graph, from_id, to_id, config);
+    let paths = crate::evidence_path::find_path_between(store, &graph, from_id, to_id, config);
 
     if paths.is_empty() {
         return Ok(format!(
@@ -731,7 +731,7 @@ pub fn impact_evidence(
     let mut evidence_paths = Vec::new();
     if show_upstream {
         for (caller_id, _, _, _) in d1_callers.iter().take(5) {
-            let paths = crate::evidence::find_path_between(
+            let paths = crate::evidence_path::find_path_between(
                 store, &graph, *caller_id, sym.id, evidence_config,
             );
             if let Some(best) = paths.first() {
@@ -1247,7 +1247,7 @@ mod tests {
     fn test_estimate_path_tokens() {
         let path = EvidencePath {
             steps: vec![
-                crate::evidence::Evidence {
+                crate::evidence_path::Evidence {
                     node_id: "n1".into(),
                     label: "main".into(),
                     file_path: "src/main.rs".into(),
@@ -1255,7 +1255,7 @@ mod tests {
                     relevance: 0.9,
                     via: EvidenceVia::TextMatch,
                 },
-                crate::evidence::Evidence {
+                crate::evidence_path::Evidence {
                     node_id: "n2".into(),
                     label: "handle_request".into(),
                     file_path: "src/handler.rs".into(),
@@ -1268,7 +1268,7 @@ mod tests {
             cost: 1.0,
             explanation: "test".into(),
             directions: vec![],
-            quality: crate::evidence::PathQuality::default(),
+            quality: crate::evidence_path::PathQuality::default(),
         };
         let tokens = estimate_path_tokens(&path, false);
         assert!(tokens > 0);
@@ -1285,24 +1285,24 @@ mod tests {
     fn test_truncate_to_budget() {
         let paths = vec![
             EvidencePath {
-                steps: vec![crate::evidence::Evidence {
+                steps: vec![crate::evidence_path::Evidence {
                     node_id: "n1".into(), label: "a".into(),
                     file_path: "f.rs".into(), line: 1,
                     relevance: 0.9, via: EvidenceVia::TextMatch,
                 }],
                 confidence: 0.9, cost: 0.0, explanation: "high".into(),
                 directions: vec![],
-                quality: crate::evidence::PathQuality::default(),
+                quality: crate::evidence_path::PathQuality::default(),
             },
             EvidencePath {
-                steps: vec![crate::evidence::Evidence {
+                steps: vec![crate::evidence_path::Evidence {
                     node_id: "n2".into(), label: "b".into(),
                     file_path: "f.rs".into(), line: 2,
                     relevance: 0.5, via: EvidenceVia::TextMatch,
                 }],
                 confidence: 0.5, cost: 0.0, explanation: "low".into(),
                 directions: vec![],
-                quality: crate::evidence::PathQuality::default(),
+                quality: crate::evidence_path::PathQuality::default(),
             },
         ];
 
@@ -1336,7 +1336,7 @@ mod tests {
             query: "auth".into(),
             paths: vec![
                 EvidencePath {
-                    steps: vec![crate::evidence::Evidence {
+                    steps: vec![crate::evidence_path::Evidence {
                         node_id: "n1".into(),
                         label: "login".into(),
                         file_path: "src/auth.rs".into(),
@@ -1348,11 +1348,11 @@ mod tests {
                     cost: 0.0,
                     explanation: "Direct match for 'login'".into(),
                     directions: vec![],
-                    quality: crate::evidence::PathQuality::default(),
+                    quality: crate::evidence_path::PathQuality::default(),
                 },
                 EvidencePath {
                     steps: vec![
-                        crate::evidence::Evidence {
+                        crate::evidence_path::Evidence {
                             node_id: "n1".into(),
                             label: "login".into(),
                             file_path: "src/auth.rs".into(),
@@ -1360,7 +1360,7 @@ mod tests {
                             relevance: 0.95,
                             via: EvidenceVia::TextMatch,
                         },
-                        crate::evidence::Evidence {
+                        crate::evidence_path::Evidence {
                             node_id: "n2".into(),
                             label: "validate_token".into(),
                             file_path: "src/auth.rs".into(),
@@ -1373,7 +1373,7 @@ mod tests {
                     cost: 1.0,
                     explanation: "Found via 1 hop, cost 1.00".into(),
                     directions: vec![true],
-                    quality: crate::evidence::PathQuality::default(),
+                    quality: crate::evidence_path::PathQuality::default(),
                 },
             ],
             confidence: 0.835,

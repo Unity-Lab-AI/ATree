@@ -1,5 +1,5 @@
 [workspace]
-members = ["atree-engine", "atree-cli"]
+members = ["atree-engine", "atree-cli", "atree-web"]
 resolver = "2"
 
 [workspace.package]

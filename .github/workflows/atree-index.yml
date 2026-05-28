@@ -1,0 +1,195 @@
+# ATree CI/CD — Index repositories and surface code intelligence in pull requests.
+#
+# This workflow:
+# 1. Indexes the repository with ATree's semantic analysis engine
+# 2. Runs impact analysis on changed symbols
+# 3. Posts a summary comment on PRs with blast radius and risk assessment
+# 4. Optionally starts the web server for visual review
+#
+# Usage:
+#   - Add to .github/workflows/atree-index.yml
+#   - Set ATREE_DB_CACHE_KEY to control cache invalidation
+#   - Set ATREE_WEB_URL to link to a running web UI instance
+
+name: ATree Code Intelligence
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  ATREE_VERSION: "latest"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  index-and-analyze:
+    name: Index & Analyze
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git blame/change analysis
+
+      - name: Cache ATree index
+        uses: actions/cache@v4
+        with:
+          path: .atree/
+          key: atree-${{ runner.os }}-${{ hashFiles('**/*.rs', '**/*.py', '**/*.ts', '**/*.js', '**/*.go', '**/*.java', '**/*.c', '**/*.cpp', '**/*.h', '**/*.hpp') }}
+          restore-keys: |
+            atree-${{ runner.os }}-
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install ATree
+        run: |
+          if [ "${{ env.ATREE_VERSION }}" = "latest" ]; then
+            # Build from source (recommended for CI reproducibility)
+            git clone --depth 1 https://github.com/unityailab/atree.git /tmp/atree-src 2>/dev/null || true
+            if [ -d /tmp/atree-src ]; then
+              cd /tmp/atree-src
+              cargo build --release --bin atree --features mcp 2>/dev/null || cargo build --release --bin atree
+              cp target/release/atree /usr/local/bin/atree 2>/dev/null || true
+            fi
+          fi
+          which atree && atree --version || echo "atree binary not available, using cargo run"
+
+      - name: Index Repository
+        id: index
+        timeout-minutes: 10
+        run: |
+          echo "::group::Building ATree index..."
+          mkdir -p .atree
+
+          # Determine the command to use
+          if command -v atree &> /dev/null; then
+            ATREE_CMD="atree"
+          else
+            ATREE_CMD="cargo run --release -p atree-cli --"
+          fi
+
+          $ATREE_CMD --semantic \
+            --db .atree/index.sqlite \
+            --root . \
+            --json \
+            --graph-phases \
+            2>&1 | tee .atree/index-output.txt
+
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: Analyze PR Changes
+        if: github.event_name == 'pull_request'
+        id: analyze
+        timeout-minutes: 5
+        run: |
+          ATREE_CMD="atree"
+          if ! command -v atree &> /dev/null; then
+            ATREE_CMD="cargo run -p atree-cli --"
+          fi
+
+          DB="--db .atree/index.sqlite"
+
+          echo "::group::Impact Analysis"
+          echo "## ATree Code Intelligence Report" > .atree/report.md
+          echo "" >> .atree/report.md
+
+          # Get changed files
+          CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD 2>/dev/null || git diff --name-only HEAD~1...HEAD)
+          echo "### Changed Files" >> .atree/report.md
+          echo '```' >> .atree/report.md
+          echo "$CHANGED" >> .atree/report.md
+          echo '```' >> .atree/report.md
+          echo "" >> .atree/report.md
+
+          # Analyze impacted symbols
+          echo "### Symbol Impact Analysis" >> .atree/report.md
+          HAS_HIGH_IMPACT=false
+
+          for f in $CHANGED; do
+            if [[ "$f" =~ \.(rs|py|ts|js|go|java|c|cpp|h|hpp|rb|php|swift|kt)$ ]]; then
+              # Get symbols from the changed file
+              SYMBOLS=$($ATREE_CMD query symbols -- --db .atree/index.sqlite "$f" 2>/dev/null | grep -oP '^\s+\K\w+' | head -20 || true)
+              if [ -n "$SYMBOLS" ]; then
+                echo "**$f**:" >> .atree/report.md
+                for sym in $SYMBOLS; do
+                  IMPACT=$($ATREE_CMD query impact "$sym" 3 $DB 2>/dev/null || echo "N/A")
+                  CALLER_COUNT=$(echo "$IMPACT" | grep -c "←" || echo "0")
+                  RISK="LOW"
+                  if [ "$CALLER_COUNT" -gt 5 ]; then RISK="HIGH"; HAS_HIGH_IMPACT=true; elif [ "$CALLER_COUNT" -gt 2 ]; then RISK="MEDIUM"; fi
+                  echo "- \`$sym\` — **$RISK** ($CALLER_COUNT callers)" >> .atree/report.md
+                done
+                echo "" >> .atree/report.md
+              fi
+            fi
+          done
+
+          # Overall risk
+          echo "### Risk Summary" >> .atree/report.md
+          if [ "$HAS_HIGH_IMPACT" = true ]; then
+            echo "🔴 **HIGH RISK** — Changes affect symbols with many dependents. Review carefully." >> .atree/report.md
+          else
+            echo "🟢 **LOW RISK** — Changes have limited blast radius." >> .atree/report.md
+          fi
+
+          # Web UI link
+          if [ -n "${{ secrets.ATREE_WEB_URL }}" ]; then
+            echo "" >> .atree/report.md
+            echo "📊 [Open in ATree Web UI](${{ secrets.ATREE_WEB_URL }})" >> .atree/report.md
+          fi
+
+          echo "::endgroup::"
+
+          # Output the report
+          cat .atree/report.md
+
+      - name: Post PR Comment
+        if: github.event_name == 'pull_request' && steps.index.outputs.exit_code == '0'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: atree-analysis
+          path: .atree/report.md
+
+      - name: Upload Index Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atree-index-${{ github.sha }}
+          path: .atree/index.sqlite
+          retention-days: 7
+
+  # Optional: Start web server for visual review (self-hosted or with ngrok/webhook)
+  web-preview:
+    name: Visual Graph Preview
+    runs-on: ubuntu-latest
+    needs: index-and-analyze
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download index
+        uses: actions/download-artifact@v4
+        with:
+          name: atree-index-${{ github.sha }}
+          path: .atree/
+
+      - name: Start ATree Web Server
+        if: false  # Enable by setting to true and configuring ATREE_WEB_* secrets
+        timeout-minutes: 5
+        run: |
+          # Start the web server in background
+          cargo run -p atree-web -- --db .atree/index.sqlite --port 3020 &
+          sleep 3
+
+          # Optionally expose via ngrok or cloudflared
+          # curl -s http://localhost:3020/api/health
+          echo "Web server running at http://localhost:3020"

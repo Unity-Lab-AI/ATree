@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATree — Code Intelligence Graph</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+        #canvas { width: 100vw; height: 100vh; display: block; }
+        #info { position: fixed; top: 16px; left: 16px; background: rgba(15, 23, 42, 0.9); border: 1px solid #334155; border-radius: 8px; padding: 16px; font-size: 13px; max-width: 320px; }
+        #info h1 { font-size: 16px; margin-bottom: 8px; color: #6366f1; }
+        #info .stat { color: #94a3b8; margin: 4px 0; }
+        #info .stat span { color: #e2e8f0; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="info">
+        <h1>ATree Code Intelligence</h1>
+        <div class="stat">Status: <span id="status">Connecting...</span></div>
+        <div class="stat">Nodes: <span id="nodes">0</span></div>
+        <div class="stat">Edges: <span id="edges">0</span></div>
+    </div>
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let scale = 1, offsetX = 0, offsetY = 0, dragging = false, lastX, lastY;
+
+        function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; draw(); }
+        window.addEventListener('resize', resize); resize();
+
+        canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+        canvas.addEventListener('mouseup', () => dragging = false);
+        canvas.addEventListener('mousemove', e => { if (!dragging) return; offsetX += e.clientX - lastX; offsetY += e.clientY - lastY; lastX = e.clientX; lastY = e.clientY; draw(); });
+        canvas.addEventListener('wheel', e => { e.preventDefault(); scale *= e.deltaY > 0 ? 0.9 : 1.1; scale = Math.max(0.1, Math.min(10, scale)); draw(); });
+
+        function draw() {
+            ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.save(); ctx.translate(offsetX, offsetY); ctx.scale(scale, scale);
+            // Draw placeholder
+            ctx.fillStyle = '#6366f1'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText('ATree Graph View', canvas.width / 2 / scale - offsetX / scale, canvas.height / 2 / scale - offsetY / scale);
+            ctx.fillStyle = '#94a3b8'; ctx.font = '14px sans-serif';
+            ctx.fillText('Index a repository with: atree --semantic --db .atree/index.sqlite --root .', canvas.width / 2 / scale - offsetX / scale, canvas.height / 2 / scale - offsetY / scale + 30);
+            ctx.restore();
+        }
+        draw();
+
+        // Health check
+        fetch('/api/health').then(r => r.json()).then(d => {
+            document.getElementById('status').textContent = d.status === 'ok' ? 'Connected' : 'Error';
+            document.getElementById('status').style.color = d.status === 'ok' ? '#22c55e' : '#ef4444';
+        }).catch(() => { document.getElementById('status').textContent = 'No server'; });
+
+        // SSE for real-time events
+        if (typeof EventSource !== 'undefined') {
+            const es = new EventSource('/api/events');
+            es.onmessage = e => { try { const evt = JSON.parse(e.data); console.log('Graph event:', evt); } catch(_) {} };
+        }
+    </script>
+</body>
+</html>

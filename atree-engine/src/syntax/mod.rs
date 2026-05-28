@@ -45,8 +45,7 @@ pub fn hash_content(content: &str) -> u64 {
 }
 
 /// Classified call form — how the call site is structured in the AST.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CallForm {
     /// Free/unqualified call: `foo()`
     Free,
@@ -139,7 +138,9 @@ impl SyntaxEngine {
         let mut matches = self.cursor.matches(&query, tree.root_node(), content.as_bytes());
 
         let mut captures = Vec::new();
-        let mut seen = std::collections::HashSet::<(String, usize, usize)>::new();
+        // Includes capture index to avoid deduplicating captures at the same position
+        // but with different tags (e.g., ImportSource + ImportWrapper at same byte range).
+        let mut seen = std::collections::HashSet::<(String, usize, usize, usize)>::new();
 
         while let Some(m) = matches.next() {
             // Collect all captures in this match with their metadata.
@@ -185,7 +186,7 @@ impl SyntaxEngine {
                     })
                     .map(|c| c.node);
 
-                for (_, tag) in &semantic_captures {
+                for &(capture_idx, ref tag) in &semantic_captures {
                     match tag {
                         CaptureTag::CallWrapper
                         | CaptureTag::ImportWrapper
@@ -196,6 +197,7 @@ impl SyntaxEngine {
                         name_text.to_string(),
                         name_range.start_byte,
                         name_range.end_byte,
+                        capture_idx,
                     );
                     if seen.insert(key) {
                         let (call_form, receiver) = if *tag == CaptureTag::CallName {
@@ -208,7 +210,8 @@ impl SyntaxEngine {
                             name: name_text.to_string(),
                             range: name_range,
                             call_form,
-                            receiver, related_name: None,
+                            receiver,
+                            related_name: None,
                         });
                     }
                 }
@@ -217,7 +220,7 @@ impl SyntaxEngine {
                 for &(idx, ref tag) in &semantic_captures {
                     let c = m.captures.iter().find(|c| c.index as usize == idx).unwrap();
                     let text = &content[c.node.start_byte()..c.node.end_byte()];
-                    let key = (text.to_string(), c.node.start_byte(), c.node.end_byte());
+                    let key = (text.to_string(), c.node.start_byte(), c.node.end_byte(), idx);
                     if seen.insert(key) {
                         captures.push(RawCapture {
                             tag: *tag,

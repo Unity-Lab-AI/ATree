@@ -80,6 +80,9 @@ impl GraphStore {
         // busy_timeout: wait up to 10 seconds for locks before failing,
         // preventing "database is locked" errors under concurrent access.
         self.conn.execute_batch("PRAGMA busy_timeout = 10000;")?;
+        // foreign_keys: enforce REFERENCES constraints. Without this,
+        // deletions of parent rows silently leave orphaned child rows.
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(())
     }
 
@@ -92,6 +95,26 @@ impl GraphStore {
             log::info!("Running schema migration: v0 -> v1 (initial schema)");
             self.init_schema_tables()?;
             self.conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
+        if current_version < 2 {
+            log::info!("Running schema migration: v1 -> v2 (abstraction layers)");
+            self.init_schema_v2()?;
+            self.conn.execute_batch("PRAGMA user_version = 2;")?;
+        }
+        if current_version < 3 {
+            log::info!("Running schema migration: v2 -> v3 (community persistence)");
+            self.init_schema_v3()?;
+            self.conn.execute_batch("PRAGMA user_version = 3;")?;
+        }
+        if current_version < 4 {
+            log::info!("Running schema migration: v3 -> v4 (evidence storage)");
+            self.init_schema_v4()?;
+            self.conn.execute_batch("PRAGMA user_version = 4;")?;
+        }
+        if current_version < 5 {
+            log::info!("Running schema migration: v4 -> v5 (patterns + constraints)");
+            self.init_schema_v5()?;
+            self.conn.execute_batch("PRAGMA user_version = 5;")?;
         }
         Ok(())
     }
@@ -203,8 +226,665 @@ impl GraphStore {
             CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id);
             CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id);
             CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(edge_kind);
+
+            -- ── Abstraction layer: file-level graph ──────────────────────────
+            -- Stores pre-computed file→file edges for fast large-repo navigation.
+            CREATE TABLE IF NOT EXISTS file_graph_edges (
+                id INTEGER PRIMARY KEY,
+                src_file_id INTEGER NOT NULL REFERENCES files(id),
+                dst_file_id INTEGER NOT NULL REFERENCES files(id),
+                edge_kind TEXT NOT NULL DEFAULT 'CALLS',
+                weight INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(src_file_id, dst_file_id, edge_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_graph_src ON file_graph_edges(src_file_id);
+            CREATE INDEX IF NOT EXISTS idx_file_graph_dst ON file_graph_edges(dst_file_id);
+
+            -- ── Abstraction layer: module-level graph ────────────────────────
+            -- Stores pre-computed module/package→package edges.
+            CREATE TABLE IF NOT EXISTS module_graph_edges (
+                id INTEGER PRIMARY KEY,
+                src_module TEXT NOT NULL,
+                dst_module TEXT NOT NULL,
+                edge_kind TEXT NOT NULL DEFAULT 'CALLS',
+                weight INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(src_module, dst_module, edge_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_module_graph_src ON module_graph_edges(src_module);
+            CREATE INDEX IF NOT EXISTS idx_module_graph_dst ON module_graph_edges(dst_module);
+
+            -- ── Graph metadata ──────────────────────────────────────────────
+            -- Stores repo-size classification and recommended view settings.
+            CREATE TABLE IF NOT EXISTS graph_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         ")?;
         Ok(())
+    }
+
+    /// Add abstraction layer tables (migration v1 -> v2).
+    fn init_schema_v2(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS file_graph_edges (
+                id INTEGER PRIMARY KEY,
+                src_file_id INTEGER NOT NULL REFERENCES files(id),
+                dst_file_id INTEGER NOT NULL REFERENCES files(id),
+                edge_kind TEXT NOT NULL DEFAULT 'CALLS',
+                weight INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(src_file_id, dst_file_id, edge_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_graph_src ON file_graph_edges(src_file_id);
+            CREATE INDEX IF NOT EXISTS idx_file_graph_dst ON file_graph_edges(dst_file_id);
+
+            CREATE TABLE IF NOT EXISTS module_graph_edges (
+                id INTEGER PRIMARY KEY,
+                src_module TEXT NOT NULL,
+                dst_module TEXT NOT NULL,
+                edge_kind TEXT NOT NULL DEFAULT 'CALLS',
+                weight INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(src_module, dst_module, edge_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_module_graph_src ON module_graph_edges(src_module);
+            CREATE INDEX IF NOT EXISTS idx_module_graph_dst ON module_graph_edges(dst_module);
+
+            CREATE TABLE IF NOT EXISTS graph_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        ")?;
+        Ok(())
+    }
+
+    /// Add evidence storage tables (migration v3 -> v4).
+    fn init_schema_v4(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS evidence (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                file TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_col INTEGER NOT NULL,
+                language TEXT NOT NULL DEFAULT '',
+                target_type TEXT NOT NULL DEFAULT 'symbol',
+                target_ref TEXT NOT NULL DEFAULT '',
+                raw TEXT NOT NULL DEFAULT '',
+                normalized TEXT NOT NULL DEFAULT '',
+                enclosing_symbol TEXT,
+                imports TEXT NOT NULL DEFAULT '[]',
+                scope_chain TEXT NOT NULL DEFAULT '[]',
+                extractor TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                stability REAL NOT NULL DEFAULT 1.0,
+                entropy REAL NOT NULL DEFAULT 0.0,
+                timestamp_ms INTEGER NOT NULL DEFAULT 0,
+                git_commit TEXT,
+                state TEXT NOT NULL DEFAULT 'EXTRACTED',
+                tags TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_kind ON evidence(kind);
+            CREATE INDEX IF NOT EXISTS idx_evidence_file ON evidence(file);
+            CREATE INDEX IF NOT EXISTS idx_evidence_state ON evidence(state);
+            CREATE INDEX IF NOT EXISTS idx_evidence_confidence ON evidence(confidence);
+
+            -- FTS5 virtual table for full-text search over evidence content.
+            -- Shadow table: fts5 manages its own storage; VIRTUAL TABLE is the query interface.
+            CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
+                kind,
+                raw,
+                normalized,
+                file,
+                language,
+                target_ref,
+                tags
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence_edges (
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                FOREIGN KEY (from_id) REFERENCES evidence(id),
+                FOREIGN KEY (to_id) REFERENCES evidence(id),
+                PRIMARY KEY (from_id, to_id, edge_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ev_edges_from ON evidence_edges(from_id);
+            CREATE INDEX IF NOT EXISTS idx_ev_edges_to ON evidence_edges(to_id);
+        ")?;
+        Ok(())
+    }
+
+    /// Add pattern and constraint tables (migration v4 -> v5).
+    fn init_schema_v5(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS patterns (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                motif TEXT NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 0,
+                dispersion REAL NOT NULL DEFAULT 0.0,
+                stability REAL NOT NULL DEFAULT 1.0,
+                entropy REAL NOT NULL DEFAULT 0.0,
+                overall_score REAL NOT NULL DEFAULT 0.0,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            );
+
+            CREATE TABLE IF NOT EXISTS pattern_evidence (
+                pattern_id TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                PRIMARY KEY (pattern_id, evidence_id),
+                FOREIGN KEY (pattern_id) REFERENCES patterns(id),
+                FOREIGN KEY (evidence_id) REFERENCES evidence(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pattern_evidence_pid ON pattern_evidence(pattern_id);
+
+            CREATE TABLE IF NOT EXISTS constraints (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.7,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            );
+
+            CREATE TABLE IF NOT EXISTS constraint_violations (
+                constraint_id TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                detected_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+                PRIMARY KEY (constraint_id, evidence_id),
+                FOREIGN KEY (constraint_id) REFERENCES constraints(id),
+                FOREIGN KEY (evidence_id) REFERENCES evidence(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cv_cid ON constraint_violations(constraint_id);
+        ")?;
+        Ok(())
+    }
+
+    /// Add community persistence tables (migration v2 -> v3).
+    fn init_schema_v3(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS communities (
+                id INTEGER PRIMARY KEY,
+                community_id TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL DEFAULT '',
+                cohesion REAL NOT NULL DEFAULT 0.0,
+                symbol_count INTEGER NOT NULL DEFAULT 0,
+                keywords TEXT NOT NULL DEFAULT '[]',
+                modularity REAL NOT NULL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_communities_count ON communities(symbol_count DESC);
+
+            CREATE TABLE IF NOT EXISTS community_memberships (
+                symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+                community_id TEXT NOT NULL,
+                PRIMARY KEY (symbol_id, community_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_comm_memberships_cid ON community_memberships(community_id);
+        ")?;
+        Ok(())
+    }
+
+    // =================================================================
+    // Community persistence
+    // =================================================================
+
+    /// Persist community detection results to the store.
+    /// Clears existing memberships first so incremental re-indexing doesn't violate FK constraints.
+    pub fn store_communities(&self, result: &crate::community::CommunityDetectionResult) -> rusqlite::Result<usize> {
+        // Clear old data to avoid FK violations during re-indexing
+        self.conn.execute("DELETE FROM community_memberships", [])?;
+        self.conn.execute("DELETE FROM communities", [])?;
+
+        let mut count = 0;
+        for community in &result.communities {
+            let keywords_json = serde_json::to_string(&community.keywords).unwrap_or_default();
+            self.conn.execute(
+                "INSERT INTO communities (community_id, label, cohesion, symbol_count, keywords, modularity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    &community.id,
+                    &community.label,
+                    community.cohesion,
+                    community.symbol_count as i64,
+                    keywords_json,
+                    result.stats.modularity,
+                ],
+            )?;
+            count += 1;
+        }
+        // Store memberships
+        for (symbol_id, community_id) in &result.memberships {
+            self.conn.execute(
+                "INSERT INTO community_memberships (symbol_id, community_id) VALUES (?1, ?2)",
+                rusqlite::params![symbol_id, community_id],
+            )?;
+        }
+        Ok(count)
+    }
+
+    /// Get all communities sorted by size (largest first).
+    pub fn get_communities(&self) -> rusqlite::Result<Vec<(String, String, f64, usize, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT community_id, label, cohesion, symbol_count, keywords
+             FROM communities ORDER BY symbol_count DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let keywords_json: String = row.get(4)?;
+            let keywords: Vec<String> = serde_json::from_str(&keywords_json).unwrap_or_default();
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, i64>(3)? as usize,
+                keywords,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Get community membership for a symbol.
+    pub fn get_symbol_community(&self, symbol_id: i64) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT community_id FROM community_memberships WHERE symbol_id = ?1"
+        )?;
+        let mut rows = stmt.query_map([symbol_id], |row| row.get(0))?;
+        rows.next().transpose()
+    }
+
+    /// Get all symbols in a community.
+    pub fn get_community_symbols(&self, community_id: &str) -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_id FROM community_memberships WHERE community_id = ?1"
+        )?;
+        let rows = stmt.query_map([community_id], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Get inter-community edges (community→community) with aggregated weights.
+    pub fn get_community_graph_edges(&self) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare("
+            SELECT cm1.community_id, cm2.community_id, e.edge_kind, COUNT(*) as weight
+            FROM edges e
+            JOIN community_memberships cm1 ON cm1.symbol_id = e.src_id
+            JOIN community_memberships cm2 ON cm2.symbol_id = e.dst_id
+            WHERE cm1.community_id != cm2.community_id
+            GROUP BY cm1.community_id, cm2.community_id, e.edge_kind
+            ORDER BY weight DESC
+        ")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Get enriched cluster metadata including API boundaries, dominant imports, and coupling.
+    /// Returns: (community_id, label, cohesion, symbol_count, keywords,
+    ///           api_boundary_count, dominant_imports_json, coupling_score, internal_edge_count, external_edge_count)
+    pub fn get_community_details(&self, community_id: &str) -> rusqlite::Result<Option<(String, String, f64, usize, Vec<String>, usize, Vec<String>, f64, i64, i64)>> {
+        // Get basic community info
+        let (comm_id, label, cohesion, symbol_count, keywords) = {
+            let mut stmt = self.conn.prepare(
+                "SELECT community_id, label, cohesion, symbol_count, keywords FROM communities WHERE community_id = ?1"
+            )?;
+            let mut rows = stmt.query_map([community_id], |row| {
+                let kw_json: String = row.get(4)?;
+                let keywords: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, i64>(3)? as usize,
+                    keywords,
+                ))
+            })?;
+            match rows.next() {
+                Some(Ok(r)) => r,
+                _ => return Ok(None),
+            }
+        };
+
+        let member_ids = self.get_community_symbols(community_id)?;
+        if member_ids.is_empty() {
+            return Ok(Some((community_id.to_string(), label, cohesion, 0, keywords, 0, vec![], 0.0, 0, 0)));
+        }
+
+        let member_set: rustc_hash::FxHashSet<i64> = member_ids.iter().copied().collect();
+
+        // API boundary: exported symbols that are called from outside the community
+        let mut api_boundary_count = 0usize;
+        let mut dominant_imports: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut internal_edges = 0i64;
+        let mut external_edges = 0i64;
+
+        for sym_id in &member_ids {
+            // Check if symbol is exported and has external callers
+            if let Ok(Some(sym)) = self.get_symbol_by_id(*sym_id) {
+                if sym.is_exported {
+                    if let Ok(edges) = self.get_edges_for_node(*sym_id) {
+                        let has_external_caller = edges.iter().any(|e| {
+                            let other = if e.src_id == *sym_id { e.dst_id } else { e.src_id };
+                            !member_set.contains(&other) && e.edge_kind == "CALLS"
+                        });
+                        if has_external_caller {
+                            api_boundary_count += 1;
+                        }
+                    }
+                }
+
+                // Count imports from this symbol's file
+                if let Ok(Some(file_id)) = self.get_file_id_for_symbol(*sym_id) {
+                    if let Ok(imports) = self.get_imports_by_file(file_id) {
+                        for imp in &imports {
+                            *dominant_imports.entry(imp.source.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            // Count internal vs external edges
+            if let Ok(edges) = self.get_edges_for_node(*sym_id) {
+                for e in &edges {
+                    let other = if e.src_id == *sym_id { e.dst_id } else { e.src_id };
+                    if member_set.contains(&other) {
+                        internal_edges += 1;
+                    } else {
+                        external_edges += 1;
+                    }
+                }
+            }
+        }
+
+        // Top imports
+        let mut imports_vec: Vec<(String, usize)> = dominant_imports.into_iter().collect();
+        imports_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_imports: Vec<String> = imports_vec.into_iter().take(5).map(|(s, _)| s).collect();
+
+        // Coupling score: ratio of external edges to total edges
+        let total_edges = internal_edges + external_edges;
+        let coupling = if total_edges > 0 {
+            external_edges as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        Ok(Some((
+            comm_id,
+            label,
+            cohesion,
+            symbol_count,
+            keywords,
+            api_boundary_count,
+            top_imports,
+            coupling,
+            internal_edges / 2, // each internal edge counted twice
+            external_edges,
+        )))
+    }
+
+    // =================================================================
+    // Abstraction layers — pre-computed for large-repo navigation
+    // =================================================================
+
+    /// Build file-level and module-level abstraction graphs from the raw symbol graph.
+    ///
+    /// This collapses thousands of symbol-level edges into a manageable number of
+    /// file→file and module→module edges. Called once after the pipeline finishes.
+    ///
+    /// For a 10K-file repo with 200K symbol edges, this typically produces:
+    /// - ~5K file→file edges (10x reduction)
+    /// - ~200 module→module edges (1000x reduction)
+    pub fn build_abstraction_layers(&self) -> rusqlite::Result<()> {
+        // ── File-level graph ──────────────────────────────────────────────
+        // Aggregate symbol edges into file→file edges, counting weight.
+        self.conn.execute_batch("
+            DELETE FROM file_graph_edges;
+            INSERT INTO file_graph_edges (src_file_id, dst_file_id, edge_kind, weight)
+            SELECT s1.file_id, s2.file_id, e.edge_kind, COUNT(*)
+            FROM edges e
+            JOIN symbols s1 ON s1.id = e.src_id
+            JOIN symbols s2 ON s2.id = e.dst_id
+            WHERE s1.file_id != s2.file_id
+            GROUP BY s1.file_id, s2.file_id, e.edge_kind;
+        ")?;
+
+        // ── Module-level graph ────────────────────────────────────────────
+        // Derive module from the file path (parent directory of the file).
+        // For src/foo/bar.rs, module = "src/foo".
+        // SQLite has no REVERSE, so we use a recursive CTE to find the last '/'.
+        self.conn.execute_batch("
+            DELETE FROM module_graph_edges;
+            WITH RECURSIVE
+            last_slash(path, pos) AS (
+                SELECT path, 0 FROM files
+                UNION ALL
+                SELECT path, INSTR(SUBSTR(path, pos + 1), '/') + pos
+                FROM last_slash
+                WHERE INSTR(SUBSTR(path, pos + 1), '/') > 0
+            ),
+            modules(path, module) AS (
+                SELECT path,
+                    CASE
+                        WHEN pos > 0 THEN SUBSTR(path, 1, pos - 1)
+                        ELSE '.'
+                    END
+                FROM last_slash
+                WHERE pos = (SELECT MAX(ls.pos) FROM last_slash ls WHERE ls.path = last_slash.path)
+            )
+            INSERT INTO module_graph_edges (src_module, dst_module, edge_kind, weight)
+            SELECT m1.module, m2.module, e.edge_kind, COUNT(*)
+            FROM edges e
+            JOIN symbols s1 ON s1.id = e.src_id
+            JOIN symbols s2 ON s2.id = e.dst_id
+            JOIN files f1 ON f1.id = s1.file_id
+            JOIN files f2 ON f2.id = s2.file_id
+            JOIN modules m1 ON m1.path = f1.path
+            JOIN modules m2 ON m2.path = f2.path
+            WHERE m1.module != m2.module
+            GROUP BY m1.module, m2.module, e.edge_kind;
+        ")?;
+
+        // ── Graph metadata ────────────────────────────────────────────────
+        let file_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
+        let symbol_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let edge_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+        let file_edge_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM file_graph_edges", [], |r| r.get(0)).unwrap_or(0);
+        let module_edge_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM module_graph_edges", [], |r| r.get(0)).unwrap_or(0);
+
+        let size_class = if file_count < 100 {
+            "small"
+        } else if file_count < 1000 {
+            "medium"
+        } else if file_count < 10000 {
+            "large"
+        } else {
+            "xlarge"
+        };
+
+        let default_view = match size_class {
+            "small" => "full",
+            "medium" => "full",
+            "large" => "file",
+            _ => "module",
+        };
+
+        let max_layout_nodes = match size_class {
+            "small" => 5000,
+            "medium" => 2000,
+            "large" => 1000,
+            _ => 500,
+        };
+
+        let insert_meta = |key: &str, value: &str| -> rusqlite::Result<()> {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO graph_metadata (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+            Ok(())
+        };
+        insert_meta("size_class", size_class)?;
+        insert_meta("default_view", default_view)?;
+        insert_meta("max_layout_nodes", &max_layout_nodes.to_string())?;
+        insert_meta("file_count", &file_count.to_string())?;
+        insert_meta("symbol_count", &symbol_count.to_string())?;
+        insert_meta("edge_count", &edge_count.to_string())?;
+        insert_meta("file_edge_count", &file_edge_count.to_string())?;
+        insert_meta("module_edge_count", &module_edge_count.to_string())?;
+
+        log::info!(
+            "Abstraction layers built: {} files, {} symbols, {} edges → {} file-edges, {} module-edges (size_class={}, default_view={})",
+            file_count, symbol_count, edge_count, file_edge_count, module_edge_count, size_class, default_view
+        );
+
+        Ok(())
+    }
+
+    /// Get graph metadata value by key.
+    pub fn get_graph_metadata(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM graph_metadata WHERE key = ?1")?;
+        let mut rows = stmt.query_map([key], |row| row.get(0))?;
+        rows.next().transpose()
+    }
+
+    /// Get all file-level graph edges (for file-level view).
+    pub fn get_file_graph_edges(&self) -> rusqlite::Result<Vec<(i64, i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_file_id, dst_file_id, edge_kind, weight FROM file_graph_edges ORDER BY weight DESC"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// Get all module-level graph edges (for module-level view).
+    pub fn get_module_graph_edges(&self) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_module, dst_module, edge_kind, weight FROM module_graph_edges ORDER BY weight DESC"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// Get a scoped subgraph: all symbols and edges within N hops of a starting symbol.
+    /// Returns (nodes, edges) as JSON-serializable values.
+    pub fn get_symbol_neighborhood(&self, symbol_id: i64, max_depth: usize) -> rusqlite::Result<(Vec<SymbolRecord>, Vec<EdgeRecord>)> {
+        // Verify the symbol exists; file_id not needed for BFS.
+        match self.conn.query_row(
+            "SELECT 1 FROM symbols WHERE id = ?1", [symbol_id], |r| r.get::<_, i64>(0)
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok((vec![], vec![])),
+            Err(e) => return Err(e),
+        };
+
+        // BFS to find all symbol IDs within N hops.
+        // Prepare statements once outside the loop to avoid per-symbol prepare/execute overhead.
+        let mut visited = rustc_hash::FxHashSet::default();
+        let mut current_level = vec![symbol_id];
+        visited.insert(symbol_id);
+
+        let mut outgoing_stmt = self.conn.prepare("SELECT dst_id FROM edges WHERE src_id = ?1")?;
+        let mut incoming_stmt = self.conn.prepare("SELECT src_id FROM edges WHERE dst_id = ?1")?;
+
+        for _ in 0..max_depth {
+            if current_level.is_empty() { break; }
+            let mut next_level = Vec::new();
+            for &id in &current_level {
+                let rows = outgoing_stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+                for row in rows {
+                    let dst = row?;
+                    if visited.insert(dst) {
+                        next_level.push(dst);
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        // Also get incoming edges (callers)
+        let mut current_level = vec![symbol_id];
+        for _ in 0..max_depth {
+            if current_level.is_empty() { break; }
+            let mut next_level = Vec::new();
+            for &id in &current_level {
+                let rows = incoming_stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+                for row in rows {
+                    let src = row?;
+                    if visited.insert(src) {
+                        next_level.push(src);
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        // Fetch all visited symbols
+        let all_ids: Vec<i64> = visited.into_iter().collect();
+        let mut symbols = Vec::new();
+        for chunk in all_ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id FROM symbols WHERE ID IN ({})",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| Ok(SymbolRecord {
+                id: row.get(0)?, file_id: row.get(1)?, name: row.get(2)?,
+                qualified_name: row.get(3)?, kind: row.get(4)?,
+                line: row.get::<_, i64>(5)? as usize, col: row.get::<_, i64>(6)? as usize,
+                is_exported: row.get::<_, i64>(7)? != 0, scope_id: row.get(8)?, owner_symbol_id: row.get(9)?,
+            }))?;
+            for row in rows { symbols.push(row?); }
+        }
+
+        // Fetch edges between visited symbols
+        let id_set: rustc_hash::FxHashSet<i64> = all_ids.iter().cloned().collect();
+        let mut edges = Vec::new();
+        for &id in &all_ids {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id = ?1"
+            )?;
+            let rows = stmt.query_map([id], |row| Ok(EdgeRecord {
+                id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
+                edge_kind: row.get(3)?, confidence: row.get(4)?,
+                file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
+            }))?;
+            for row in rows {
+                let e = row?;
+                if id_set.contains(&e.dst_id) {
+                    edges.push(e);
+                }
+            }
+        }
+
+        Ok((symbols, edges))
+    }
+
+    /// Get all symbols and edges for a specific file (file-scoped view).
+    pub fn get_file_subgraph(&self, file_id: i64) -> rusqlite::Result<(Vec<SymbolRecord>, Vec<EdgeRecord>)> {
+        let symbols = self.get_symbols_by_file(file_id)?;
+
+        let symbol_ids: Vec<i64> = symbols.iter().map(|s| s.id).collect();
+        let mut edges = Vec::new();
+
+        for &id in &symbol_ids {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
+                 FROM edges WHERE src_id = ?1 OR dst_id = ?1"
+            )?;
+            let rows = stmt.query_map([id], |row| Ok(EdgeRecord {
+                id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
+                edge_kind: row.get(3)?, confidence: row.get(4)?,
+                file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
+            }))?;
+            for row in rows { edges.push(row?); }
+        }
+
+        Ok((symbols, edges))
     }
 
     // =================================================================
@@ -525,14 +1205,23 @@ impl GraphStore {
 
     /// Remove a file and ALL its associated data (symbols, scopes, imports, calls, edges, heritage).
     /// Used during incremental scanning when a file has changed.
+    ///
+    /// Deletes edges by symbol ID (not just file_id) because cross-file edges
+    /// may reference this file's symbols but carry a different file_id.
     pub fn remove_file_data(&self, path: &str) -> rusqlite::Result<()> {
         if let Some(file) = self.get_file(path)? {
             let tx = self.conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM edges WHERE file_id = ?1", [file.id])?;
+            // Delete edges where THIS file's symbols are either source or destination.
+            // The per-file file_id filter misses cross-file edges; the symbol-based
+            // deletions catch all edges involving this file's symbols.
+            tx.execute("DELETE FROM edges WHERE src_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file.id])?;
+            tx.execute("DELETE FROM edges WHERE dst_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file.id])?;
             tx.execute("DELETE FROM calls WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM heritage WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM imports WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM exports WHERE file_id = ?1", [file.id])?;
+            // Delete community memberships before symbols (FK constraint)
+            tx.execute("DELETE FROM community_memberships WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file.id])?;
             tx.execute("DELETE FROM symbols WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM scopes WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM files WHERE id = ?1", [file.id])?;
@@ -565,6 +1254,7 @@ impl GraphStore {
         tx.execute("DELETE FROM calls WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM exports WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM imports WHERE file_id = ?1", [file_id])?;
+        tx.execute("DELETE FROM community_memberships WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file_id])?;
         tx.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM scopes WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
@@ -611,6 +1301,41 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// Search symbols by name pattern (substring match, case-insensitive).
+    /// Returns matching symbols ordered by relevance (exact > prefix > substring).
+    pub fn search_symbols(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<SymbolRecord>> {
+        let pattern = format!("%{}%", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbols
+             WHERE name LIKE ?1 OR qualified_name LIKE ?1
+             ORDER BY
+               CASE WHEN name = ?2 THEN 0
+                    WHEN name LIKE ?3 THEN 1
+                    ELSE 2 END,
+               name
+             LIMIT ?4"
+        )?;
+        let exact = query.to_string();
+        let prefix = format!("{}%", query);
+        let rows = stmt.query_map(
+            params![pattern, exact, prefix, limit as i64],
+            |row| Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                line: row.get::<_, i64>(5)? as usize,
+                col: row.get::<_, i64>(6)? as usize,
+                is_exported: row.get::<_, i64>(7)? != 0,
+                scope_id: row.get(8)?,
+                owner_symbol_id: row.get(9)?,
+            }),
+        )?;
+        rows.collect()
+    }
+
     /// Get a single symbol by its ID.
     pub fn get_symbol_by_id(&self, symbol_id: i64) -> rusqlite::Result<Option<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
@@ -632,7 +1357,8 @@ impl GraphStore {
         rows.next().transpose()
     }
 
-    /// Get all symbols across all files.
+    /// Get all symbols across all files. Uses chunked loading to bound memory;
+    /// for very large indexes, prefer paginated queries via `get_symbols_paginated`.
     pub fn get_all_symbols(&self) -> rusqlite::Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
@@ -651,6 +1377,31 @@ impl GraphStore {
             owner_symbol_id: row.get(9)?,
         }))?;
         rows.collect()
+    }
+
+    /// Get symbols with pagination (for large indexes). Returns (symbols, has_more).
+    pub fn get_symbols_paginated(&self, offset: usize, limit: usize) -> rusqlite::Result<(Vec<SymbolRecord>, bool)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbols ORDER BY id LIMIT ?1 OFFSET ?2"
+        )?;
+        let limit_plus_one = (limit + 1) as i64;
+        let rows = stmt.query_map(params![limit_plus_one, offset as i64], |row| Ok(SymbolRecord {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            kind: row.get(4)?,
+            line: row.get::<_, i64>(5)? as usize,
+            col: row.get::<_, i64>(6)? as usize,
+            is_exported: row.get::<_, i64>(7)? != 0,
+            scope_id: row.get(8)?,
+            owner_symbol_id: row.get(9)?,
+        }))?;
+        let all: Vec<SymbolRecord> = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = all.len() > limit;
+        let symbols = all.into_iter().take(limit).collect();
+        Ok((symbols, has_more))
     }
 
     /// Get all symbols for a file.

@@ -30,6 +30,7 @@ use std::time::Instant;
 
 pub mod phases;
 pub use phases::{
+    record_to_evidence,
     CrossFilePhase, CrossFileOutput,
     RoutesPhase, RoutesOutput,
     ToolsPhase, ToolsOutput,

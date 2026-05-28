@@ -68,9 +68,29 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ResolutionStatsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct EvidencePathInput { pub query: String, #[serde(default = "dd")] pub max_depth: u32, #[serde(default = "dbw")] pub beam_width: u32, #[serde(default = "dme")] pub max_evidence: u32, #[serde(default)] pub include_content: bool, pub task_context: Option<String>, pub goal: Option<String> }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GraphFocusInput { pub node_ids: Vec<String>, #[serde(default = "gfl")] pub label: String, #[serde(default = "gfs")] pub source: String, #[serde(default)] pub zoom: Option<f64>, #[serde(default = "gfd")] pub anim_duration_ms: Option<u64>, pub web_url: Option<String> }
+
+fn gfl() -> String { "Agent focus".to_string() }
+fn gfs() -> String { "mcp_tool".to_string() }
+fn gfd() -> Option<u64> { Some(600) }
+
 fn dl() -> u32 { 5 } fn dms() -> u32 { 10 } fn dd() -> u32 { 3 }
 fn ddr() -> bool { true } fn dvt() -> String { "all".to_string() }
 fn dbw() -> u32 { 5 } fn dme() -> u32 { 10 }
+fn dsl() -> u32 { 20 }
+fn dmp() -> u32 { 3 }
+
+// ── New tool input types (evidence/patterns/constraints) ─────────────────────
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct EvidenceSearchInput { pub query: String, #[serde(default = "dsl")] pub limit: u32, pub kind: Option<String>, pub file: Option<String>, #[serde(default)] pub min_confidence: Option<f64> }
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PatternMineInput { #[serde(default = "dmp")] pub min_frequency: u32, #[serde(default)] pub max_patterns: Option<u32> }
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ConstraintCheckInput { pub symbol: Option<String>, pub kind: Option<String> }
 
 // =====================================================================
 // MCP Server
@@ -145,7 +165,7 @@ impl ATreeMcpServer {
         // room for code snippets (~80 tokens per snippet).
         let token_budget = if input.include_content { 5000 } else { 3000 };
 
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: input.max_seeds as usize,
             beam_width: 5,
             max_depth: 4,
@@ -208,7 +228,7 @@ impl ATreeMcpServer {
             .map_err(|e| ErrorData::internal_error(format!("Context query failed: {}", e), None))?;
 
         // Part 2: Evidence paths showing how this symbol connects to the codebase.
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: 10,
             beam_width: 5,
             max_depth: 4,
@@ -245,7 +265,7 @@ impl ATreeMcpServer {
 
         let enriched_query = build_enriched_query(&input.query, input.task_context.as_deref(), input.goal.as_deref());
 
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: 10,
             beam_width: input.beam_width as usize,
             max_depth: input.max_depth as usize,
@@ -283,7 +303,7 @@ impl ATreeMcpServer {
             .map_err(|e| ErrorData::internal_error(format!("Explain failed: {}", e), None))?;
 
         // Part 2: Evidence paths originating from this symbol (reuse the graph).
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: 10,
             beam_width: 5,
             max_depth: 4,
@@ -307,7 +327,7 @@ impl ATreeMcpServer {
     fn handle_impact_evidence(&self, input: ImpactInput) -> Result<String, ErrorData> {
         let store = self.open_store()?;
 
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: 5,
             beam_width: 3,
             max_depth: 4,
@@ -329,7 +349,7 @@ impl ATreeMcpServer {
     fn handle_trace_path_evidence(&self, input: TracePathInput) -> Result<String, ErrorData> {
         let store = self.open_store()?;
 
-        let evidence_config = crate::evidence::EvidenceConfig {
+        let evidence_config = crate::evidence_path::EvidenceConfig {
             max_seeds: 5,
             beam_width: 5,
             max_depth: 6,
@@ -342,6 +362,71 @@ impl ATreeMcpServer {
             .map_err(|e| ErrorData::internal_error(format!("Trace path failed: {}", e), None))?;
 
         Ok(text)
+    }
+
+    /// Handle the `graph_focus` tool — POST to the ATree web server to shift visual focus.
+    fn handle_graph_focus(&self, input: GraphFocusInput) -> Result<String, ErrorData> {
+        let web_url = input.web_url.as_deref().unwrap_or("http://localhost:3020");
+
+        // Resolve symbol names to node IDs using the store
+        let store = self.open_store()?;
+        let mut resolved_node_ids = Vec::new();
+
+        for node_id in &input.node_ids {
+            // Try as-is first (may already be a node ID like "sym:123")
+            if node_id.starts_with("sym:") || node_id.starts_with("file:") {
+                resolved_node_ids.push(node_id.clone());
+                continue;
+            }
+            // Try to resolve as a symbol name
+            if let Ok(syms) = store.get_symbols_by_name(node_id) {
+                for sym in &syms {
+                    resolved_node_ids.push(format!("sym:{}", sym.id));
+                }
+            }
+        }
+
+        if resolved_node_ids.is_empty() {
+            return Ok("No matching nodes found for the given identifiers.".to_string());
+        }
+
+        // Build the focus event payload
+        let payload = serde_json::json!({
+            "event_type": "focus_node",
+            "node_ids": resolved_node_ids,
+            "label": input.label,
+            "source": input.source,
+            "zoom": input.zoom,
+            "anim_duration_ms": input.anim_duration_ms,
+        });
+
+        // POST to the web server
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| ErrorData::internal_error(format!("HTTP client error: {}", e), None))?;
+
+        let resp = client
+            .post(format!("{}/api/graph/focus", web_url))
+            .json(&payload)
+            .send()
+            .map_err(|e| ErrorData::internal_error(format!("Failed to connect to ATree web at {}: {}", web_url, e), None))?;
+
+        if resp.status().is_success() {
+            let result: serde_json::Value = resp.json()
+                .map_err(|e| ErrorData::internal_error(format!("Bad response: {}", e), None))?;
+            let recipients = result.get("recipients").and_then(|v| v.as_u64()).unwrap_or(0);
+            Ok(format!(
+                "Graph focus shifted to {} node(s). {} browser(s) updated.\nOpen {} to see the visual graph.",
+                resolved_node_ids.len(), recipients, web_url
+            ))
+        } else {
+            Err(ErrorData::internal_error(format!(
+                "ATree web server returned {}: {}",
+                resp.status(),
+                resp.text().unwrap_or_default()
+            ), None))
+        }
     }
 }
 
@@ -390,6 +475,11 @@ impl ServerHandler for ATreeMcpServer {
                     let input: ImpactInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
                     self.handle_impact_evidence(input)?
+                }
+                "graph_focus" => {
+                    let input: GraphFocusInput = serde_json::from_value(serde_json::Value::Object(args))
+                        .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    self.handle_graph_focus(input)?
                 }
                 // Fall through to CLI subprocess for all other tools.
                 _ => {
@@ -457,6 +547,10 @@ impl ServerHandler for ATreeMcpServer {
             Self::tool("find_uncovered_symbols", "Find symbols with no test coverage.", schema_for!(UncoveredInput)),
             Self::tool("resolution_stats", "Show resolution quality stats — call/import resolution rates per language, top unresolved patterns, and confidence distribution.", schema_for!(ResolutionStatsInput)),
             Self::tool("evidence_path", "Find evidence paths for a query using A* + beam search over the layered code graph. Returns token-bounded, confidence-ranked evidence paths.", schema_for!(EvidencePathInput)),
+            Self::tool("evidence_search", "Full-text search over committed evidence. Searches raw content, normalized text, file paths, kinds, and tags using FTS5. Returns matching evidence with confidence scores and relevance ranks. Use for: 'find all function calls related to X', 'show evidence in file Y', 'high-confidence type relations'.", schema_for!(EvidenceSearchInput)),
+            Self::tool("pattern_mine", "Mine recurring patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion × stability. Returns patterns with evidence IDs and composite scores. Use for: 'what call patterns are common', 'show architectural motifs', 'find recurring import-declaration-call chains'.", schema_for!(PatternMineInput)),
+            Self::tool("constraint_check", "Synthesize and check constraints from evidence patterns. Detects forbidden transitions (evidence contradictions), required properties (stable pattern components), and architectural violations. Returns active constraints with confidence and violation counts. Use for: 'what rules emerge from the codebase', 'check if symbol X violates constraints', 'show architectural invariants'.", schema_for!(ConstraintCheckInput)),
+            Self::tool("graph_focus", "Shift the visual graph focus to specific nodes in real-time. Triggers a smooth camera animation on the ATree web UI and highlights the target nodes. Use after query/context/impact to show the agent what it found visually.", schema_for!(GraphFocusInput)),
         ];
         Ok(ListToolsResult { tools, next_cursor: None, meta: None })
     }
@@ -833,6 +927,115 @@ impl ATreeMcpServer {
                 if input.max_evidence != 10 { a.push(&me); }
                 if let Some(db) = db { a.push("--db"); a.push(db); }
                 self.run_atree(&a)?
+            }
+            "evidence_search" => {
+                let input: EvidenceSearchInput = serde_json::from_value(serde_json::Value::Object(args))
+                    .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                let store = self.open_store()?;
+                let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+                let results = ev_store.search(&input.query, input.limit as usize)
+                    .map_err(|e| ErrorData::internal_error(format!("Evidence search failed: {}", e), None))?;
+                if results.is_empty() {
+                    "No evidence found matching the query.".to_string()
+                } else {
+                    let mut out = format!("Evidence Search Results ({} matches):\n\n", results.len());
+                    for rec in results {
+                        out.push_str(&format!(
+                            "[{:.2}] {} {} @ {} (lang={})\n",
+                            rec.rank, rec.kind, rec.target_ref, rec.file, rec.language
+                        ));
+                    }
+                    out
+                }
+            }
+            "pattern_mine" => {
+                let input: PatternMineInput = serde_json::from_value(serde_json::Value::Object(args))
+                    .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                let store = self.open_store()?;
+                let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+                // Fetch all committed evidence across all kinds.
+                let all_records: Vec<crate::evidence::storage::EvidenceRecord> = [
+                    crate::evidence::EvidenceKind::SymbolDeclaration,
+                    crate::evidence::EvidenceKind::FunctionCall,
+                    crate::evidence::EvidenceKind::ImportEdge,
+                    crate::evidence::EvidenceKind::TypeRelation,
+                ].iter()
+                    .filter_map(|k| ev_store.by_kind(*k).ok())
+                    .flatten()
+                    .collect();
+                let evidence: Vec<crate::evidence::Evidence> = all_records.into_iter()
+                    .map(|rec| {
+                        use crate::evidence::*;
+                        let imports: Vec<String> = serde_json::from_str(&rec.imports).unwrap_or_default();
+                        let scope_chain: Vec<String> = serde_json::from_str(&rec.scope_chain).unwrap_or_default();
+                        let tags: Vec<String> = serde_json::from_str(&rec.tags).unwrap_or_default();
+                        let kind = rec.kind.parse().unwrap_or(EvidenceKind::HeuristicInference);
+                        Evidence {
+                            id: EvidenceId(rec.id), kind,
+                            source: EvidenceSource { file: rec.file.clone(), span: SourceSpan { start_line: rec.start_line, start_col: rec.start_col, end_line: rec.end_line, end_col: rec.end_col }, language: rec.language },
+                            target: EvidenceTarget { target_type: TargetType::Symbol, ref_id: rec.target_ref },
+                            content: EvidenceContent { raw: rec.raw, normalized: rec.normalized },
+                            context: EvidenceContext { enclosing_symbol: rec.enclosing_symbol, imports, scope_chain },
+                            metadata: crate::evidence::EvidenceMetadata { extractor: rec.extractor, confidence: rec.confidence, stability: rec.stability, entropy: rec.entropy, timestamp_ms: rec.timestamp_ms, commit: rec.commit },
+                            links: crate::evidence::EvidenceLinks::default(), tags,
+                            state: crate::evidence::EvidenceState::Committed,
+                        }
+                    })
+                    .collect();
+                let config = crate::patterns::PatternMiningConfig { min_frequency: input.min_frequency as usize, ..Default::default() };
+                let patterns = crate::patterns::mine_patterns(&evidence, &config);
+                let max = input.max_patterns.unwrap_or(50) as usize;
+                let out_patterns: Vec<_> = patterns.into_iter().take(max).collect();
+                if out_patterns.is_empty() {
+                    "No patterns found matching the criteria (try lowering min_frequency).".to_string()
+                } else {
+                    let mut out = format!("Mined {} patterns:\n\n", out_patterns.len());
+                    for p in &out_patterns {
+                        out.push_str(&format!(
+                            "[{}] {} — freq={}, disp={:.2}, stab={:.2}, score={:.3}\n  {}\n  evidence: {} units\n\n",
+                            p.id, p.name, p.score.frequency, p.score.dispersion, p.score.stability, p.score.overall,
+                            p.description, p.evidence_ids.len()
+                        ));
+                    }
+                    out
+                }
+            }
+            "constraint_check" => {
+                let input: ConstraintCheckInput = serde_json::from_value(serde_json::Value::Object(args))
+                    .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                let store = self.open_store()?;
+                let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
+                // Gather evidence for constraint synthesis.
+                let all_records: Vec<crate::evidence::storage::EvidenceRecord> = [
+                    crate::evidence::EvidenceKind::SymbolDeclaration,
+                    crate::evidence::EvidenceKind::FunctionCall,
+                    crate::evidence::EvidenceKind::ImportEdge,
+                ].iter()
+                    .filter_map(|k| ev_store.by_kind(*k).ok())
+                    .flatten()
+                    .collect();
+                let evidence: Vec<crate::evidence::Evidence> = all_records.into_iter()
+                    .map(|rec| crate::pipeline::phases::record_to_evidence(rec))
+                    .collect();
+                // Mine patterns first, then synthesize constraints.
+                let pattern_config = crate::patterns::PatternMiningConfig::default();
+                let patterns = crate::patterns::mine_patterns(&evidence, &pattern_config);
+                let constraint_config = crate::constraints::ConstraintSynthesisConfig::default();
+                let constraints = crate::constraints::synthesize_constraints(&evidence, &patterns, &constraint_config);
+                // If symbol filter provided, check violations for that symbol.
+                let mut out = format!("Synthesized {} constraints from {} evidence units and {} patterns.\n\n",
+                    constraints.len(), evidence.len(), patterns.len());
+                for c in &constraints {
+                    let status = if c.active { "ACTIVE" } else { "inactive" };
+                    out.push_str(&format!(
+                        "[{}] {} ({}) conf={:.2}\n  {}\n\n",
+                        status, c.name, c.kind.as_str(), c.confidence, c.description
+                    ));
+                }
+                if let Some(ref sym) = input.symbol {
+                    out.push_str(&format!("Note: Symbol '{}' not yet checked against constraints (violations coming in next iteration).\n", sym));
+                }
+                out
             }
             unknown => {
                 return Err(ErrorData::invalid_params(

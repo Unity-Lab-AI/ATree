@@ -148,6 +148,18 @@ enum QueryCommand {
     /// Integrated co-change: combines static call-graph coupling with git co-change
     /// history. More reliable than either signal alone.
     SmartCoChange { symbol: String, limit: usize },
+    /// Query evidence by kind (SYMBOL_DECLARATION, FUNCTION_CALL, etc.) with confidence filter
+    QueryEvidence { kind: Option<String>, file: Option<String>, min_confidence: f64, limit: usize },
+    /// Show evidence statistics (counts by kind, confidence distribution)
+    EvidenceStats,
+    /// Mine recurring patterns from the evidence graph. Returns motifs ranked by score.
+    PatternMine { min_frequency: usize, max_patterns: usize },
+    /// Run impact analysis on a pattern (all evidence participating in the pattern)
+    PatternImpact { pattern_id: String },
+    /// Check constraints synthesized from evidence patterns
+    ConstraintCheck { symbol: Option<String> },
+    /// List active constraints with confidence scores
+    ListConstraints { min_confidence: f64 },
 }
 
 #[derive(Debug)]
@@ -184,6 +196,31 @@ struct Args {
     group: Option<GroupScanArgs>,
     /// When true, start the MCP server instead of scanning/querying.
     mcp_server: bool,
+    /// CI/CD pipeline scan mode
+    pub pipeline: Option<PipelineScanArgs>,
+}
+
+#[derive(Debug)]
+struct PipelineScanArgs {
+    /// Repository root to scan
+    pub root: PathBuf,
+    /// Output formats: "sarif", "json", "text"
+    #[allow(dead_code)]
+    pub output_format: String,
+    /// SARIF/JSON output path (stdout if not set)
+    pub output_path: Option<PathBuf>,
+    /// Fail the pipeline if impact score exceeds this threshold
+    pub fail_threshold: Option<String>,
+    /// Webhook URL to POST results to
+    pub webhook_url: Option<String>,
+    /// DB path for the index
+    pub db_path: Option<PathBuf>,
+    /// Threads
+    pub threads: usize,
+    /// Enable graph analytics phases
+    pub graph_phases: bool,
+    /// Run incremental scan
+    pub incremental: bool,
 }
 
 impl Default for Args {
@@ -212,6 +249,7 @@ impl Default for Args {
             query: None,
             group: None,
             mcp_server: false,
+            pipeline: None,
         }
     }
 }
@@ -371,6 +409,84 @@ fn parse_args() -> Args {
                 // Start MCP server for AI agent integration (used by Crush and other MCP hosts).
                 // Requires --db <path> to specify which index to serve.
                 args.mcp_server = true;
+            }
+            "pipeline" => {
+                // CI/CD pipeline intelligence hook.
+                // Usage: atree pipeline scan [OPTIONS]
+                i += 1;
+                if i >= cli_args.len() {
+                    eprintln!("Error: 'pipeline' requires a subcommand: scan{}", help());
+                    eprintln!("  atree pipeline scan --root . --db .atree/index.sqlite --format sarif");
+                    std::process::exit(2);
+                }
+                match cli_args[i].as_str() {
+                    "scan" => {
+                        let mut root = PathBuf::from(".");
+                        let mut output_format = "text".to_string();
+                        let mut output_path = None;
+                        let mut fail_threshold = None;
+                        let mut webhook_url = None;
+                        let mut db_path = None;
+                        let mut threads = ThreadSpec::Auto;
+                        let mut graph_phases = true;
+                        let mut incremental = true;
+                        i += 1;
+                        while i < cli_args.len() {
+                            match cli_args[i].as_str() {
+                                "--root" | "-r" => {
+                                    root = PathBuf::from(take_value(&cli_args, i));
+                                    if let Ok(canonical) = root.canonicalize() { root = canonical; }
+                                    i += 1;
+                                }
+                                "--format" | "-f" => {
+                                    output_format = take_value(&cli_args, i).to_string();
+                                    i += 1;
+                                }
+                                "--output" | "-o" => {
+                                    output_path = Some(PathBuf::from(take_value(&cli_args, i)));
+                                    i += 1;
+                                }
+                                "--fail-threshold" => {
+                                    fail_threshold = Some(take_value(&cli_args, i).to_string());
+                                    i += 1;
+                                }
+                                "--webhook-url" => {
+                                    webhook_url = Some(take_value(&cli_args, i).to_string());
+                                    i += 1;
+                                }
+                                "--db" => {
+                                    db_path = Some(PathBuf::from(take_value(&cli_args, i)));
+                                    i += 1;
+                                }
+                                "--threads" => {
+                                    threads = parse_threads(take_value(&cli_args, i));
+                                    i += 1;
+                                }
+                                "--no-graph-phases" => { graph_phases = false; }
+                                "--full" => { incremental = false; }
+                                _ => break,
+                            }
+                            i += 1;
+                        }
+                        let resolved_threads = resolve_threads(&threads);
+                        let db = db_path.unwrap_or_else(|| root.join(".atree/index.sqlite"));
+                        args.pipeline = Some(PipelineScanArgs {
+                            root,
+                            output_format,
+                            output_path,
+                            fail_threshold,
+                            webhook_url,
+                            db_path: Some(db),
+                            threads: resolved_threads,
+                            graph_phases,
+                            incremental,
+                        });
+                    }
+                    other => {
+                        eprintln!("Error: unknown pipeline subcommand '{}'. Valid: scan{}", other, help());
+                        std::process::exit(2);
+                    }
+                }
             }
             "query" => {
                 // Parse subcommand: atree query <subcommand> [args] --db <path>
@@ -754,6 +870,46 @@ fn parse_args() -> Args {
                         if limit != 10 { i += 1; }
                         args.query = Some(QueryCommand::SmartCoChange { symbol, limit });
                     }
+                    "query-evidence" => {
+                        let kind = cli_args.get(i+1).filter(|s| !s.starts_with("--")).map(|s| s.to_string());
+                        if kind.is_some() { i += 1; }
+                        let file = cli_args.get(i+1).filter(|s| !s.starts_with("--")).map(|s| s.to_string());
+                        if file.is_some() { i += 1; }
+                        let min_confidence = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        if min_confidence != 0.0 { i += 1; }
+                        let limit = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(100);
+                        if limit != 100 { i += 1; }
+                        args.query = Some(QueryCommand::QueryEvidence { kind, file, min_confidence, limit });
+                    }
+                    "evidence-stats" => {
+                        args.query = Some(QueryCommand::EvidenceStats);
+                    }
+                    "pattern-mine" => {
+                        let min_frequency = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(3);
+                        if min_frequency != 3 { i += 1; }
+                        let max_patterns = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(50);
+                        if max_patterns != 50 { i += 1; }
+                        args.query = Some(QueryCommand::PatternMine { min_frequency, max_patterns });
+                    }
+                    "pattern-impact" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query pattern-impact' requires a pattern ID{}", help());
+                            std::process::exit(2);
+                        }
+                        let pattern_id = cli_args[i].clone();
+                        args.query = Some(QueryCommand::PatternImpact { pattern_id });
+                    }
+                    "constraint-check" => {
+                        let symbol = cli_args.get(i+1).filter(|s| !s.starts_with("--")).map(|s| s.to_string());
+                        if symbol.is_some() { i += 1; }
+                        args.query = Some(QueryCommand::ConstraintCheck { symbol });
+                    }
+                    "list-constraints" => {
+                        let min_confidence = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                        if min_confidence != 0.5 { i += 1; }
+                        args.query = Some(QueryCommand::ListConstraints { min_confidence });
+                    }
                     other => {
                         eprintln!("Error: unknown query subcommand '{}'. Run 'atree query --help' for full list.", other);
                         std::process::exit(2);
@@ -826,6 +982,10 @@ Options:
                              query search <text>     Full-text search
                              query stats             Index statistics
       mcp-server             Start MCP server for AI agent integration (requires --db)
+      pipeline scan          CI/CD pipeline intelligence scan (index + analysis + report)
+                             Options: --root . --db .atree/index.sqlite --format sarif|json|text
+                                       --output report.sarif --fail-threshold 0.8
+                                       --webhook-url http://localhost:3020/api/webhook/push
       --json                 Emit a JSON report on stdout (status still goes to stderr)
       --print-schema         Print the bundled JSON Schema (Draft 7) on stdout and exit
   -h, --help                 Show this help
@@ -3657,7 +3817,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 std::process::exit(1);
             });
 
-            let config = atree_engine::evidence::EvidenceConfig {
+            let config = atree_engine::evidence_path::EvidenceConfig {
                 max_seeds: 10,
                 beam_width: *beam_width,
                 max_depth: *max_depth,
@@ -3665,7 +3825,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 ..Default::default()
             };
 
-            let paths = atree_engine::evidence::find_evidence_paths(&store, &graph, &query, &config);
+            let paths = atree_engine::evidence_path::find_evidence_paths(&store, &graph, &query, &config);
 
             if paths.is_empty() {
                 eprintln!("No evidence paths found for '{}'", query);
@@ -3679,13 +3839,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 println!("  {}", path.explanation);
                 for (j, step) in path.steps.iter().enumerate() {
                     let via = match &step.via {
-                        atree_engine::evidence::EvidenceVia::TextMatch => "text",
-                        atree_engine::evidence::EvidenceVia::CallChain => "calls",
-                        atree_engine::evidence::EvidenceVia::Inheritance => "inherit",
-                        atree_engine::evidence::EvidenceVia::ImportChain => "import",
-                        atree_engine::evidence::EvidenceVia::DataFlow => "data",
-                        atree_engine::evidence::EvidenceVia::Containment => "contains",
-                        atree_engine::evidence::EvidenceVia::Semantic => "semantic",
+                        atree_engine::evidence_path::EvidenceVia::TextMatch => "text",
+                        atree_engine::evidence_path::EvidenceVia::CallChain => "calls",
+                        atree_engine::evidence_path::EvidenceVia::Inheritance => "inherit",
+                        atree_engine::evidence_path::EvidenceVia::ImportChain => "import",
+                        atree_engine::evidence_path::EvidenceVia::DataFlow => "data",
+                        atree_engine::evidence_path::EvidenceVia::Containment => "contains",
+                        atree_engine::evidence_path::EvidenceVia::Semantic => "semantic",
                     };
                     println!("  {}. {}  {}:{}  [{:.3}] via {}",
                         j + 1, step.label, step.file_path, step.line, step.relevance, via);
@@ -3895,6 +4055,198 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 println!("  {:<60}  {:>4} co-commits  [{}]", file, count, signal);
             }
         }
+        QueryCommand::QueryEvidence { kind, file, min_confidence, limit } => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required for evidence queries"); std::process::exit(1); }
+            };
+            let ev_store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let evidence_store = atree_engine::evidence::storage::EvidenceStore::new(ev_store.conn());
+            let records = if let Some(kind_str) = kind {
+                let kind: atree_engine::evidence::EvidenceKind = match kind_str.parse() {
+                    Ok(k) => k,
+                    Err(e) => { eprintln!("Error: invalid evidence kind '{}': {}", kind_str, e); std::process::exit(1); }
+                };
+                match evidence_store.by_kind(kind) {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("Error querying evidence: {}", e); std::process::exit(1); }
+                }
+            } else if let Some(f) = file {
+                match evidence_store.by_file(f) {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("Error querying evidence for file '{}': {}", f, e); std::process::exit(1); }
+                }
+            } else {
+                eprintln!("Error: query-evidence requires --kind or --file"); std::process::exit(1);
+            };
+            let filtered: Vec<_> = records.iter()
+                .filter(|r| r.confidence >= *min_confidence)
+                .take(*limit)
+                .collect();
+            if filtered.is_empty() {
+                println!("No evidence found matching criteria.");
+            } else {
+                println!("Evidence ({} of {} matching):", filtered.len().min(*limit), records.len());
+                for rec in &filtered {
+                    println!("  [{}] {} @ {}:{}-{}:{:.2}",
+                        rec.kind, rec.target_ref, rec.file, rec.start_line, rec.end_line, rec.confidence);
+                }
+            }
+        }
+        QueryCommand::EvidenceStats => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required for evidence stats"); std::process::exit(1); }
+            };
+            let ev_store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let evidence_store = atree_engine::evidence::storage::EvidenceStore::new(ev_store.conn());
+            let total = match evidence_store.count() {
+                Ok(n) => n,
+                Err(e) => { eprintln!("Error counting evidence: {}", e); std::process::exit(1); }
+            };
+            println!("Evidence Statistics:");
+            println!("  Total evidence units: {}", total);
+            let by_state = match evidence_store.count_by_state() {
+                Ok(s) => s,
+                Err(e) => { eprintln!("Error counting by state: {}", e); std::process::exit(1); }
+            };
+            for (state, count) in &by_state {
+                println!("  {:12} {}", state, count);
+            }
+        }
+        QueryCommand::PatternMine { min_frequency, max_patterns } => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required for pattern mining"); std::process::exit(1); }
+            };
+            let store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s, Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let ev_store = atree_engine::evidence::storage::EvidenceStore::new(store.conn());
+            // Fetch all committed evidence.
+            let all_kinds = [
+                atree_engine::evidence::EvidenceKind::SymbolDeclaration,
+                atree_engine::evidence::EvidenceKind::FunctionCall,
+                atree_engine::evidence::EvidenceKind::ImportEdge,
+                atree_engine::evidence::EvidenceKind::TypeRelation,
+            ];
+            let records: Vec<_> = all_kinds.iter()
+                .filter_map(|k| ev_store.by_kind(*k).ok())
+                .flatten()
+                .collect();
+            let evidence: Vec<_> = records.iter()
+                .map(|r| atree_engine::pipeline::phases::record_to_evidence(r.clone()))
+                .collect();
+            let config = atree_engine::patterns::PatternMiningConfig {
+                min_frequency: *min_frequency, min_dispersion: 0.1, min_stability: 0.5,
+            };
+            let patterns = atree_engine::patterns::mine_patterns(&evidence, &config);
+            let patterns: Vec<_> = patterns.into_iter().take(*max_patterns).collect();
+            if patterns.is_empty() {
+                println!("No patterns found (try lowering --min-frequency).");
+            } else {
+                println!("Mined {} patterns:", patterns.len());
+                for p in &patterns {
+                    println!("  [{}] {} — score={:.3}", p.id, p.name, p.score.overall);
+                    println!("    {}", p.description);
+                    println!("    freq={}, disp={:.2}, stab={:.2}", p.score.frequency, p.score.dispersion, p.score.stability);
+                }
+            }
+        }
+        QueryCommand::PatternImpact { pattern_id } => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required"); std::process::exit(1); }
+            };
+            let store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s, Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let conn = store.conn();
+            // Look up the pattern.
+            let pattern_name: String = match conn.query_row(
+                "SELECT name FROM patterns WHERE id = ?1", [&pattern_id], |r| r.get(0)
+            ) {
+                Ok(n) => n,
+                Err(_) => { eprintln!("Pattern '{}' not found. Run 'atree query pattern-mine' first.", pattern_id); std::process::exit(1); }
+            };
+            // Count participating evidence.
+            let evidence_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pattern_evidence WHERE pattern_id = ?1", [&pattern_id], |r| r.get(0)
+            ).unwrap_or(0);
+            println!("Pattern: {} ({})", pattern_name, pattern_id);
+            println!("  Participating evidence units: {}", evidence_count);
+        }
+        QueryCommand::ConstraintCheck { symbol: _ } => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required"); std::process::exit(1); }
+            };
+            let store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s, Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let conn = store.conn();
+            let constraints: Vec<(String, String, f64, i64)> = {
+                match conn.prepare("SELECT name, kind, confidence, active FROM constraints ORDER BY confidence DESC") {
+                    Ok(mut stmt) => {
+                        let rows = stmt.query_map([], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?, r.get::<_, i64>(3)?))
+                        });
+                        match rows {
+                            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+                            Err(_) => vec![],
+                        }
+                    }
+                    Err(_) => { println!("No constraints found. Run a full index with --graph-phases first."); std::process::exit(0); }
+                }
+            };
+            if constraints.is_empty() {
+                println!("No constraints found. Run a full index with --graph-phases first.");
+            } else {
+                println!("Synthesized Constraints:");
+                for (name, kind, conf, active) in &constraints {
+                    let status = if *active == 1 { "ACTIVE" } else { "inactive" };
+                    println!("  [{}] {} ({}) conf={:.2}", status, name, kind, conf);
+                }
+            }
+        }
+        QueryCommand::ListConstraints { min_confidence } => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required"); std::process::exit(1); }
+            };
+            let store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s, Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let conn = store.conn();
+            let constraints: Vec<(String, String, f64)> = {
+                match conn.prepare("SELECT name, kind, confidence FROM constraints WHERE confidence >= ?1 ORDER BY confidence DESC") {
+                    Ok(mut stmt) => {
+                        let rows = stmt.query_map([min_confidence], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+                        });
+                        match rows {
+                            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+                            Err(_) => vec![],
+                        }
+                    }
+                    Err(_) => { println!("No constraints found."); std::process::exit(0); }
+                }
+            };
+            if constraints.is_empty() {
+                println!("No constraints with confidence >= {} found.", min_confidence);
+            } else {
+                println!("Constraints (confidence >= {}):", min_confidence);
+                for (name, kind, conf) in &constraints {
+                    println!("  {:<40} {:<25} {:.2}", name, kind, conf);
+                }
+            }
+        }
     }
     std::process::exit(0);
 }
@@ -3965,6 +4317,31 @@ fn main() {
     // Handle query subcommands — no scan needed, just query the existing DB.
     if let Some(ref cmd) = args.query {
         execute_query(cmd, &args, None);
+    }
+
+    // ── CI/CD Pipeline mode ──────────────────────────────────────────────
+    // When `atree pipeline scan` is used, run the scan + analysis and emit
+    // structured output (SARIF/JSON/text) for CI/CD consumption.
+    if let Some(ref pipeline_args) = args.pipeline {
+        let pipeline_opts = ScanOptions {
+            root: pipeline_args.root.clone(),
+            max_depth: 999,
+            max_nodes: 100_000,
+            include_files: true,
+            threads: pipeline_args.threads,
+            tree_mode: false,
+            semantic: true,
+            db_path: pipeline_args.db_path.clone(),
+            incremental: pipeline_args.incremental,
+            embeddings: false,
+            repo_label: None,
+            graph_phases: pipeline_args.graph_phases,
+        };
+        let scan = build_graph(&pipeline_opts).unwrap_or_else(|e| {
+            eprintln!("Error: pipeline scan failed: {}", e);
+            std::process::exit(1);
+        });
+        execute_pipeline(pipeline_args, &scan, &pipeline_opts);
     }
 
     let start_time = Instant::now();
@@ -4333,4 +4710,217 @@ fn print_summary_box(args: &Args, threads: usize, elapsed: std::time::Duration, 
     let _ = writeln!(out, "│  * marker       : Nodes on the optimal A* navigation path");
     let _ = writeln!(out, "{}{}", color_title, box_bot);
     let _ = writeln!(out, "{}", color_reset);
+}
+
+/// Execute a CI/CD pipeline scan: index the repo, run analysis, emit structured output.
+fn execute_pipeline(
+    pipeline: &PipelineScanArgs,
+    scan: &atree_engine::ScanResult,
+    _opts: &atree_engine::ScanOptions,
+) -> ! {
+    let output = match pipeline.output_format.as_str() {
+        "sarif" => generate_sarif_output(scan),
+        "json" => generate_pipeline_json(scan),
+        _ => generate_pipeline_text(scan),
+    };
+
+    // Write output
+    if let Some(ref path) = pipeline.output_path {
+        if let Err(e) = std::fs::write(path, &output) {
+            eprintln!("Error writing output to {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+        eprintln!("[PIPELINE] Output written to {}", path.display());
+    } else {
+        println!("{}", output);
+    }
+
+    // POST to webhook if configured
+    if let Some(ref webhook_url) = pipeline.webhook_url {
+        eprintln!("[PIPELINE] POSTing results to {}...", webhook_url);
+        // Use a simple blocking HTTP client for webhook delivery
+        match ureq::post(webhook_url)
+            .set("Content-Type", "application/json")
+            .send_string(&output)
+        {
+            Ok(resp) => eprintln!("[PIPELINE] Webhook delivered: {}", resp.status()),
+            Err(e) => eprintln!("[PIPELINE] Webhook failed: {}", e),
+        }
+    }
+
+    // Evaluate fail threshold
+    if let Some(ref threshold) = pipeline.fail_threshold {
+        let score = compute_risk_score(scan);
+        let threshold_val: f64 = threshold.parse().unwrap_or(0.8);
+        if score > threshold_val {
+            eprintln!("[PIPELINE] FAIL: risk score {:.2} exceeds threshold {:.2}", score, threshold_val);
+            std::process::exit(2);
+        } else {
+            eprintln!("[PIPELINE] PASS: risk score {:.2} within threshold {:.2}", score, threshold_val);
+        }
+    }
+
+    std::process::exit(0);
+}
+
+fn generate_sarif_output(scan: &atree_engine::ScanResult) -> String {
+    // Generate SARIF (Static Analysis Results Interchange Format) output
+    // This is the standard format consumed by GitHub Code Scanning, GitLab, etc.
+    let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
+    let resolved = scan.store_stats.resolved_calls as usize;
+    let unresolved = total_calls - resolved;
+
+    let mut results = Vec::new();
+
+    // Report unresolved calls as SARIF results
+    if unresolved > 0 {
+        results.push(serde_json::json!({
+            "ruleId": "atree/unresolved-call",
+            "level": "warning",
+            "message": {
+                "text": format!("{} unresolved call(s) detected in codebase", unresolved)
+            },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": ".", "uriBaseId": "%SRCROOT%" }
+                }
+            }]
+        }));
+    }
+
+    let sarif = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "atree",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://github.com/unityailab/atree",
+                    "rules": [
+                        {
+                            "id": "atree/unresolved-call",
+                            "shortDescription": { "text": "Unresolved function call" },
+                            "fullDescription": { "text": "A function call that could not be resolved to a known symbol" },
+                            "defaultConfiguration": { "level": "warning" }
+                        },
+                        {
+                            "id": "atree/impact-hotspot",
+                            "shortDescription": { "text": "High-impact code change" },
+                            "fullDescription": { "text": "A symbol with many dependents that may cause widespread breakage" },
+                            "defaultConfiguration": { "level": "error" }
+                        }
+                    ]
+                }
+            },
+            "results": results,
+            "artifacts": scan.parsed_files.iter().map(|f| {
+                serde_json::json!({
+                    "location": { "uri": f.path }
+                })
+            }).collect::<Vec<_>>()
+        }]
+    });
+
+    serde_json::to_string_pretty(&sarif).unwrap_or_default()
+}
+
+fn generate_pipeline_json(scan: &atree_engine::ScanResult) -> String {
+    let total_defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
+    let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
+    let resolved = scan.store_stats.resolved_calls as usize;
+    let unresolved = total_calls - resolved;
+    let risk_score = compute_risk_score(scan);
+
+    let json = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "summary": {
+            "files_scanned": scan.parsed_files.len(),
+            "symbols_extracted": total_defs,
+            "calls_detected": total_calls,
+            "calls_resolved": resolved,
+            "calls_unresolved": unresolved,
+            "resolution_rate": if total_calls > 0 { resolved as f64 / total_calls as f64 } else { 1.0 },
+            "risk_score": risk_score,
+            "store": {
+                "files": scan.store_stats.files,
+                "symbols": scan.store_stats.symbols,
+                "edges": scan.store_stats.edges,
+            }
+        },
+        "files": scan.parsed_files.iter().map(|f| {
+            serde_json::json!({
+                "path": f.path,
+                "language": format!("{:?}", f.language),
+                "symbols": f.symbols.len(),
+                "calls": f.calls.len(),
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    serde_json::to_string_pretty(&json).unwrap_or_default()
+}
+
+fn generate_pipeline_text(scan: &atree_engine::ScanResult) -> String {
+    let total_defs: usize = scan.parsed_files.iter().map(|f| f.symbols.len()).sum();
+    let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
+    let resolved = scan.store_stats.resolved_calls as usize;
+    let unresolved = total_calls - resolved;
+    let risk_score = compute_risk_score(scan);
+
+    let mut out = String::new();
+    out.push_str("═══ ATree Pipeline Scan Report ═══\n");
+    out.push_str(&format!("Version: {}\n", env!("CARGO_PKG_VERSION")));
+    out.push('\n');
+    out.push_str(&format!("Files scanned:    {}\n", scan.parsed_files.len()));
+    out.push_str(&format!("Symbols extracted: {}\n", total_defs));
+    out.push_str(&format!("Calls detected:    {}\n", total_calls));
+    out.push_str(&format!("Calls resolved:    {} ({:.1}%)\n", resolved, if total_calls > 0 { 100.0 * resolved as f64 / total_calls as f64 } else { 100.0 }));
+    out.push_str(&format!("Calls unresolved:  {}\n", unresolved));
+    out.push_str(&format!("Risk score:        {:.2}\n", risk_score));
+    out.push('\n');
+    out.push_str(&format!("Store: {} files, {} symbols, {} edges\n",
+        scan.store_stats.files, scan.store_stats.symbols, scan.store_stats.edges));
+    out.push_str(&format!("Graph density: {:.2} edges/symbol\n\n",
+        if scan.store_stats.symbols > 0 { scan.store_stats.edges as f64 / scan.store_stats.symbols as f64 } else { 0.0 }));
+
+    // Top-level symbols (entry points)
+    let entry_points: Vec<&atree_engine::semantic::Symbol> = scan.parsed_files.iter()
+        .flat_map(|f| f.symbols.iter())
+        .filter(|s| s.is_exported)
+        .collect();
+    if !entry_points.is_empty() {
+        out.push_str(&format!("── Public API Surface ({} symbols) ──\n", entry_points.len()));
+        for sym in entry_points.iter().take(30) {
+            out.push_str(&format!("  {} ({:?})\n", sym.name, sym.kind));
+        }
+        if entry_points.len() > 30 {
+            out.push_str(&format!("  ... and {} more\n", entry_points.len() - 30));
+        }
+    }
+
+    out
+}
+
+/// Compute a risk score (0.0 - 1.0) based on the ratio of unresolved calls
+/// and the density of the call graph.
+fn compute_risk_score(scan: &atree_engine::ScanResult) -> f64 {
+    let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
+    let resolved = scan.store_stats.resolved_calls as usize;
+    let unresolved = total_calls.saturating_sub(resolved);
+
+    if total_calls == 0 { return 0.0; }
+
+    // Factor 1: unresolved call ratio (weight: 0.6)
+    let unresolved_ratio = unresolved as f64 / total_calls as f64;
+
+    // Factor 2: graph density (edges per symbol) — higher density = more coupling
+    let symbols = scan.store_stats.symbols as f64;
+    let edges = scan.store_stats.edges as f64;
+    let density = if symbols > 0.0 {
+        (edges / symbols).min(10.0) / 10.0 // normalize to 0-1
+    } else { 0.0 };
+
+    let score = unresolved_ratio * 0.6 + density * 0.4;
+    score.min(1.0)
 }

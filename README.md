@@ -543,6 +543,9 @@ atree mcp-server --db .atree/index.sqlite
 | `context` | 360-degree symbol view — all edge types with confidence scores |
 | `impact` | Blast radius analysis with weighted risk scoring |
 | `evidence_path` | A* + beam search evidence paths over the code graph |
+| `evidence_search` | Full-text search over committed evidence (FTS5). Searches raw content, normalized text, file paths, kinds, and tags. |
+| `pattern_mine` | Mine recurring patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion × stability. |
+| `constraint_check` | Synthesize and check constraints from evidence patterns. Detects forbidden transitions (evidence contradictions), required properties (stable pattern components), and architectural violations. |
 | `explain_symbol` | Full symbol explanation with evidence paths |
 | `trace_call_path` | A* pathfinding between two symbols |
 
@@ -586,10 +589,23 @@ Each worker accumulates results into thread-local `FxHashMap` instances, elimina
 The semantic engine runs a DAG of analysis phases over the parsed files:
 
 1. **Scan/Parse** — parallel tree-sitter extraction across all source files
-2. **Cross-file** — batch SQLite insert, scope resolution (C3 MRO, receiver-bound, free-call), edge persistence
-3. **Git history** — commit log walk, per-file change tracking, author aggregation
-4. **Graph analytics** — community detection (label propagation), process tracing (BFS call chains)
-5. **Search index** — BM25 FTS5 index + optional semantic embeddings
+2. **Evidence Extraction** — AST captures → `EvidenceCandidate[]` (13 evidence kinds: SYMBOL_DECLARATION, FUNCTION_CALL, IMPORT_EDGE, TYPE_RELATION, etc.)
+3. **Evidence Lifecycle** — normalize (canonicalize content) → dedupe (content-addressed identity) → enrich (symbol resolution) → calibrate (confidence scoring) → commit (SQLite persistence)
+4. **Cross-file** — batch SQLite insert, scope resolution (C3 MRO, receiver-bound, free-call), edge persistence
+5. **Pattern Mining** — 2-gram co-occurrence mining from the evidence graph, scoring (frequency × dispersion × stability × entropy)
+6. **Constraint Synthesis** — forbidden transitions from evidence contradictions, required properties from stable patterns, violation detection
+7. **Git history** — commit log walk, per-file change tracking, author aggregation
+8. **Graph analytics** — community detection (label propagation), process tracing (BFS call chains)
+9. **Search index** — BM25 FTS5 index + optional semantic embeddings
+
+### 4-Layer Epistemic Model
+
+```
+Layer 0: PRIMITIVES   — Deterministic execution surface (symbols, scopes, calls, heritage)
+Layer 1: EVIDENCE     — Observation layer (atomic, verifiable, content-addressed)
+Layer 2: PATTERNS     — Inductive compression (subgraph motifs, recurring structures)
+Layer 3: CONSTRAINTS  — Policy + invariants (forbidden transitions, required properties)
+```
 
 The entire scan-time hot path is `unsafe`-free Rust over `std::fs` syscalls.
 

@@ -201,6 +201,8 @@ pub struct ParsedFile {
     pub http_clients: Vec<HttpClient>,
     /// Type bindings extracted from AST: variable/parameter name → type text.
     pub type_bindings: Vec<crate::syntax::TypeBinding>,
+    /// Evidence candidates extracted from AST (pre-dedup, pre-calibration).
+    pub evidence: Vec<crate::evidence::EvidenceCandidate>,
 }
 
 // =====================================================================
@@ -352,7 +354,7 @@ impl ParsedFile {
         let mut seen_decorators = std::collections::HashSet::<(String, usize)>::new();
         let mut seen_http = std::collections::HashSet::<(String, usize)>::new();
 
-        for c in captures {
+        for c in &captures {
             let line = c.range.start_point.row;
             let col = c.range.start_point.column;
             match c.tag {
@@ -446,8 +448,8 @@ impl ParsedFile {
                         calls.push(Call {
                             file_id: id,
                             caller_scope_id,
-                            callee_name: c.name,
-                            receiver: c.receiver,
+                            callee_name: c.name.clone(),
+                            receiver: c.receiver.clone(),
                             call_form: c.call_form,
                             resolved_symbol_id: None,
                             confidence: Confidence::Unresolved,
@@ -484,7 +486,7 @@ impl ParsedFile {
                             file_id: id,
                             class_name: String::new(), // filled by resolver
                             heritage_kind: hkind,
-                            target_name: c.name,
+                            target_name: c.name.clone(),
                             resolved_symbol_id: None,
                             confidence: Confidence::Unresolved,
                             line,
@@ -496,7 +498,7 @@ impl ParsedFile {
                     if seen_assignments.insert(key) {
                         assignments.push(Assignment {
                             file_id: id,
-                            name: c.name,
+                            name: c.name.clone(),
                             receiver: None,
                             line,
                         });
@@ -507,7 +509,7 @@ impl ParsedFile {
                     if seen_decorators.insert(key) {
                         decorators.push(Decorator {
                             file_id: id,
-                            name: c.name,
+                            name: c.name.clone(),
                             line,
                         });
                     }
@@ -517,7 +519,7 @@ impl ParsedFile {
                     if seen_http.insert(key) {
                         http_clients.push(HttpClient {
                             file_id: id,
-                            name: c.name,
+                            name: c.name.clone(),
                             url: None,
                             line,
                         });
@@ -526,6 +528,86 @@ impl ParsedFile {
                 CaptureTag::Unknown | CaptureTag::CallWrapper | CaptureTag::ImportWrapper | CaptureTag::HeritageWrapper | CaptureTag::TypeAnnotation => {}
             }
         }
+
+        // ── Go-specific: link methods to receiver types ────────────────────
+        // In Go, method_declaration nodes are top-level (not nested inside struct scopes).
+        // The receiver type (e.g., "*UserService") is in the method's parameter_list.
+        // We must build a MethodOwner map: method_symbol_id → struct_symbol_id.
+        if lang == crate::lang::LanguageId::Go {
+            // Build a map: struct_name → symbol_id for all structs/interfaces in this file
+            let struct_name_to_id: rustc_hash::FxHashMap<&str, u64> = symbols.iter()
+                .filter(|s| matches!(s.kind, CaptureTag::DefinitionStruct | CaptureTag::DefinitionInterface))
+                .map(|s| (s.name.as_str(), s.id))
+                .collect();
+
+            // Build a map: method_symbol_id → owner_symbol_id
+            let mut method_owners: rustc_hash::FxHashMap<u64, u64> = rustc_hash::FxHashMap::default();
+            for sym in symbols.iter() {
+                if matches!(sym.kind, CaptureTag::DefinitionMethod) {
+                    // Find the type binding for the receiver parameter on the same line
+                    for tb in &type_bindings {
+                        if tb.line == sym.line && tb.var_name != sym.name {
+                            // Strip pointer prefix: "*UserService" → "UserService"
+                            let receiver_type = tb.type_text.trim_start_matches('*');
+                            if let Some(&owner_id) = struct_name_to_id.get(receiver_type) {
+                                method_owners.insert(sym.id, owner_id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Apply owner IDs to symbols and scopes
+            for sym in symbols.iter_mut() {
+                if let Some(&owner_id) = method_owners.get(&sym.id) {
+                    sym.owner_id = Some(owner_id);
+                }
+            }
+            for sym in symbols.iter() {
+                if let Some(&owner_id) = method_owners.get(&sym.id) {
+                    if let Some(sid) = sym.scope_id {
+                        if let Some(scope) = scopes.iter_mut().find(|sc| sc.id == sid) {
+                            scope.owner_symbol_id = Some(owner_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Deduplicate struct symbols ─────────────────────────────────────
+        // Some queries (especially Go) may capture both a named type_spec and
+        // a wrapper. Keep only the one with the clean name (not the full body text).
+        // Deduplicate: remove symbols with overly long names (wrapper captures)
+        symbols.retain(|s| s.name.len() <= 60);
+        // Then deduplicate by (name, line)
+        let mut seen: rustc_hash::FxHashSet<(String, usize)> = rustc_hash::FxHashSet::default();
+        symbols.retain(|s| seen.insert((s.name.clone(), s.line)));
+
+        // Extract evidence from AST captures after all symbols/scopes/imports are resolved.
+        let scope_names: Vec<String> = scopes.iter()
+            .filter(|s| matches!(s.kind,
+                ScopeKind::Module | ScopeKind::Function | ScopeKind::Class |
+                ScopeKind::Interface | ScopeKind::Struct | ScopeKind::Enum |
+                ScopeKind::Trait | ScopeKind::Impl | ScopeKind::Method |
+                ScopeKind::Constructor | ScopeKind::Namespace))
+            .filter_map(|s| {
+                symbols.iter()
+                    .find(|sym| sym.scope_id == Some(s.id))
+                    .map(|sym| sym.name.clone())
+            })
+            .collect();
+
+        let file_imports: Vec<String> = imports.iter().map(|i| i.source.clone()).collect();
+
+        let evidence = crate::evidence::extraction::extract_from_captures(
+            &captures,
+            path,
+            &format!("{:?}", lang),
+            &scope_names,
+            &file_imports,
+            None,
+        );
 
         Self {
             id,
@@ -543,10 +625,9 @@ impl ParsedFile {
             decorators,
             http_clients,
             type_bindings,
+            evidence,
         }
     }
-
-    /// Convert to flat output format for JSON serialization
     pub fn to_output(&self) -> ParsedFileOutput {
         ParsedFileOutput {
             path: self.path.clone(),
