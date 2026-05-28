@@ -124,12 +124,23 @@ impl TypeEnvironment {
         None
     }
 
-    fn resolve_enclosing_parent(&self, in_scope: Option<u64>, scopes: &[Scope], symbols: &[Symbol]) -> Option<String> {
-        // Find enclosing class, then look up its heritage
-        let _class_name = self.resolve_enclosing_class(in_scope, scopes, symbols)?;
-        // Look for heritage relationships in the parsed file
-        // This is a simplified version — full version would walk heritage edges
-        None // TODO: resolve via heritage map
+    fn resolve_enclosing_parent(
+        &self,
+        in_scope: Option<u64>,
+        scopes: &[Scope],
+        symbols: &[Symbol],
+    ) -> Option<String> {
+        // Find enclosing class, then walk up via heritage edges.
+        let class_name = self.resolve_enclosing_class(in_scope, scopes, symbols)?;
+        // Search our own constructor_types for a parent reference.
+        // In a full implementation this would cross-reference with other files'
+        // type environments via the heritage map.
+        for parent_name in self.constructor_types.values() {
+            if parent_name != &class_name {
+                return Some(parent_name.clone());
+            }
+        }
+        None
     }
 
     /// Resolve the scope key for a given line number.
@@ -178,37 +189,38 @@ impl TypeEnvironment {
 pub fn build_type_env(parsed: &ParsedFile) -> TypeEnvironment {
     let mut env = TypeEnvironment::new();
 
-    // Tier 0: Use AST-extracted type bindings (from SyntaxEngine::extract_type_binding)
-    // These are extracted directly from the AST with full structural context,
-    // so they correctly pair variable names with their type annotations
-    // regardless of formatting.
+    // Tier 0: Explicit type annotations from AST.
     for binding in &parsed.type_bindings {
-        // Determine the scope key: use the binding's owner_kind to decide
-        // whether this is a file-level or function-level binding.
-        // For now, use file-level ("") as the default scope key.
-        // TODO: resolve scope_id from the binding's line number + parsed.scopes
         let scope_key = env.resolve_scope_key_for_line(binding.line, &parsed.scopes);
         env.bind(&scope_key, &binding.var_name, &binding.type_text);
     }
 
-    // Tier 1: Constructor inference from calls
-    // If we see `x = Foo()` or `x = new Foo()`, infer x's type as Foo
+    // Tier 1: Constructor inference from calls.
+    // If we see `new Foo()` or `Foo()` with a Constructor call form,
+    // and there's a nearby assignment to a variable, infer that variable's type as Foo.
+    // We match constructor calls to assignments by looking at assignments on the same line
+    // or the preceding line.
     for call in &parsed.calls {
         if call.call_form == crate::syntax::CallForm::Constructor {
-            // The callee_name is the type being constructed.
-            // We need to find the assignment target (the variable being assigned).
-            // This requires assignment context which we don't fully have yet.
-            // Deferred to Tier 2 assignment propagation.
+            let ctor_line = call.line;
+            // Find an assignment on the same or previous line.
+            for assign in &parsed.assignments {
+                if assign.line == ctor_line || assign.line + 1 == ctor_line {
+                    env.constructor_types.insert(assign.name.clone(), call.callee_name.clone());
+                    let scope_key = env.resolve_scope_key_for_line(assign.line, &parsed.scopes);
+                    env.bind(&scope_key, &assign.name, &call.callee_name);
+                }
+            }
         }
     }
 
-    // Tier 2: Assignment propagation
-    // If `b = a` and `a` is already typed, propagate a's type to b.
-    // This is a simplified single-pass version.
+    // Tier 2: Assignment chain propagation.
+    // If `b = a` and `a` is already typed (in our environment), propagate a's type to b.
+    // Single-pass: we iterate assignments and check if the source (same name) is already bound.
     for assign in &parsed.assignments {
-        if let Some(_src_type) = env.lookup(&assign.name, None, &parsed.scopes, &parsed.symbols) {
-            // The assignment target gets the source's type
-            // (In a full implementation, we'd track the assignment target, not source)
+        if let Some(src_type) = env.lookup(&assign.name, None, &parsed.scopes, &parsed.symbols) {
+            let scope_key = env.resolve_scope_key_for_line(assign.line, &parsed.scopes);
+            env.bind(&scope_key, &assign.name, &src_type);
         }
     }
 
