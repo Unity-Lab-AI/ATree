@@ -1199,68 +1199,35 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::Routes => {
-            // Query edges table for route-like patterns (ROUTE edges are persisted
-            // during semantic scan by detect_and_persist_routes).
             let conn = store.conn();
-            // First try the edges table (populated by semantic scan)
+            // Query the dedicated routes table (populated by semantic scan).
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.file_path, s.line, e.edge_kind, e.confidence,
-                        s2.name as handler_name, s2.file_path as handler_file, s2.line as handler_line
-                 FROM edges e
-                 JOIN symbols s ON s.id = e.src_id
-                 LEFT JOIN symbols s2 ON s2.id = e.dst_id
-                 WHERE e.edge_kind = 'ROUTE'
-                 ORDER BY s.file_path, s.line"
+                "SELECT r.method, r.path, r.file_path, r.line, r.framework, COALESCE(s.name, '') as handler_name
+                 FROM routes r
+                 LEFT JOIN symbols s ON s.id = r.handler_symbol_id
+                 ORDER BY r.file_path, r.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let rows: Vec<_> = stmt.query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,  // route name
-                    row.get::<_, String>(1)?,  // file
-                    row.get::<_, i64>(2)?,     // line
-                    row.get::<_, String>(3)?,  // edge_kind
-                    row.get::<_, f64>(4)?,     // confidence
-                    row.get::<_, Option<String>>(5)?, // handler name
-                    row.get::<_, Option<String>>(6)?, // handler file
-                    row.get::<_, Option<i64>>(7)?,    // handler line
+                    row.get::<_, String>(0)?,  // method
+                    row.get::<_, String>(1)?,  // path
+                    row.get::<_, String>(2)?,  // file_path
+                    row.get::<_, i64>(3)?,     // line
+                    row.get::<_, String>(4)?,  // framework
+                    row.get::<_, String>(5)?,  // handler_name
                 ))
             }).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
             if rows.is_empty() {
-                // Fallback: query symbols table for Route-kind symbols
-                let mut stmt2 = match conn.prepare(
-                    "SELECT s.name, s.file_path, s.line, 'ROUTE' as kind, 1.0
-                     FROM symbols s
-                     WHERE s.kind = 'Route'
-                     ORDER BY s.file_path, s.line"
-                ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-                let rows2: Vec<_> = stmt2.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, f64>(4)?,
-                        Option::<String>::None,
-                        Option::<String>::None,
-                        Option::<i64>::None,
-                    ))
-                }).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
-
-                if rows2.is_empty() {
-                    println!("  (no routes found — run 'atree --semantic --db <path> --root <repo>' to detect routes)");
-                } else {
-                    println!("  {} route(s) found:", rows2.len());
-                    for (name, file, line, kind, conf, _, _, _) in &rows2 {
-                        println!("  {}  {}  {}:{}  [{:.2}]", kind, name, file, line, conf);
-                    }
-                }
+                println!("  (no routes found — run 'atree --semantic --db <path> --root <repo>' to detect routes)");
             } else {
                 println!("  {} route(s) found:", rows.len());
-                for (name, file, line, kind, conf, hname, hfile, hline) in &rows {
-                    let handler = match (hname, hfile, hline) {
-                        (Some(hn), Some(hf), Some(hl)) => format!(" → {} ({}:{})", hn, hf, hl),
-                        _ => String::new(),
+                for (method, path, file, line, framework, handler) in &rows {
+                    let handler_str = if handler.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" → {}", handler)
                     };
-                    println!("  {}  {}  {}:{}  [{:.2}]{}", kind, name, file, line, conf, handler);
+                    println!("  {}  {}  {}:{}  [{}]{}", method, path, file, line, framework, handler_str);
                 }
             }
         }

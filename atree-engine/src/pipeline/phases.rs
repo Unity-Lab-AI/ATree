@@ -708,6 +708,20 @@ store.conn().unchecked_transaction();
                     let _ = tx.commit();
                 }
             }
+
+            // Persist to dedicated routes table.
+            let mut routes_to_persist: Vec<(i64, crate::routes::Route)> = Vec::new();
+            let mut file_ids_to_replace: Vec<i64> = Vec::new();
+            for (_file_idx, handler_db_id, file_routes) in &persist_data {
+                let file_id = if *handler_db_id != 0 {
+                    store.get_file_id_for_symbol(*handler_db_id).unwrap_or(None).unwrap_or(0)
+                } else { 0 };
+                if file_id != 0 { file_ids_to_replace.push(file_id); }
+                for route in file_routes {
+                    routes_to_persist.push((*handler_db_id, route.clone()));
+                }
+            }
+            let _ = store.persist_routes(&routes_to_persist, &file_ids_to_replace);
         }
         drop(store_guard);
         drop(symbol_id_map_guard);

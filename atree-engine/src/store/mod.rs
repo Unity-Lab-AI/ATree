@@ -116,6 +116,11 @@ impl GraphStore {
             self.init_schema_v5()?;
             self.conn.execute_batch("PRAGMA user_version = 5;")?;
         }
+        if current_version < 6 {
+            log::info!("Running schema migration: v5 -> v6 (routes table)");
+            self.init_schema_v6()?;
+            self.conn.execute_batch("PRAGMA user_version = 6;")?;
+        }
         Ok(())
     }
 
@@ -353,6 +358,7 @@ impl GraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_ev_edges_from ON evidence_edges(from_id);
             CREATE INDEX IF NOT EXISTS idx_ev_edges_to ON evidence_edges(to_id);
+
         ")?;
         Ok(())
     }
@@ -401,6 +407,24 @@ impl GraphStore {
                 FOREIGN KEY (evidence_id) REFERENCES evidence(id)
             );
             CREATE INDEX IF NOT EXISTS idx_cv_cid ON constraint_violations(constraint_id);
+        ")?;
+        Ok(())
+    }
+
+    /// Add routes table (migration v5 -> v6).
+    fn init_schema_v6(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS routes (
+                id INTEGER PRIMARY KEY,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                framework TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                handler_symbol_id INTEGER REFERENCES symbols(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_routes_file ON routes(file_path);
+            CREATE INDEX IF NOT EXISTS idx_routes_path ON routes(path);
         ")?;
         Ok(())
     }
@@ -1908,4 +1932,87 @@ pub struct StoreStats {
     pub resolved_calls: i64,
     pub files_inserted: i64,
     pub files_reused: i64,
+}
+
+// =================================================================
+// Route persistence
+// =================================================================
+
+impl GraphStore {
+    /// Persist detected routes to the store, replacing old routes for the given files.
+    /// `file_ids_to_replace`: set of file IDs whose routes should be cleared before inserting.
+    pub fn persist_routes(
+        &self,
+        routes: &[(i64, crate::routes::Route)], // (handler_symbol_id, route)
+        file_ids_to_replace: &[i64],
+    ) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Clear old routes for the files being re-indexed
+        if !file_ids_to_replace.is_empty() {
+            let placeholders = file_ids_to_replace.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM routes WHERE file_path IN (SELECT path FROM files WHERE id IN ({}))", placeholders);
+            let params: Vec<&(dyn rusqlite::ToSql)> = file_ids_to_replace.iter().map(|id| id as &(dyn rusqlite::ToSql)).collect();
+            tx.execute(&sql, params.as_slice())?;
+        }
+        let mut count = 0;
+        let mut stmt = tx.prepare(
+            "INSERT INTO routes (method, path, file_path, framework, line, handler_symbol_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        )?;
+        for (handler_db_id, route) in routes {
+            stmt.execute(params![
+                &route.method,
+                &route.path,
+                &route.file_path,
+                &route.framework,
+                route.line as i64,
+                *handler_db_id,
+            ])?;
+            count += 1;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Query all routes, optionally filtered by path substring.
+    pub fn get_routes(&self, path_filter: Option<&str>) -> rusqlite::Result<Vec<(String, String, String, i64, String, String)>> {
+        let sql = match path_filter {
+            Some(_) => "SELECT r.method, r.path, r.file_path, r.line, r.framework, COALESCE(s.name, '') as handler_name
+                         FROM routes r LEFT JOIN symbols s ON s.id = r.handler_symbol_id
+                         WHERE r.path LIKE ?1
+                         ORDER BY r.file_path, r.line",
+            None => "SELECT r.method, r.path, r.file_path, r.line, r.framework, COALESCE(s.name, '') as handler_name
+                     FROM routes r LEFT JOIN symbols s ON s.id = r.handler_symbol_id
+                     ORDER BY r.file_path, r.line",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows: rusqlite::Result<Vec<(String, String, String, i64, String, String)>> = if let Some(filter) = path_filter {
+            let pattern = format!("%{}%", filter);
+            let mapped = stmt.query_map([pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            mapped.collect()
+        } else {
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            mapped.collect()
+        };
+        rows
+    }
 }

@@ -150,6 +150,29 @@ impl ATreeMcpServer {
 
     // ── In-process evidence handlers ───────────────────────────────────
 
+    /// Handle the `route_map` tool using in-process store query.
+    fn handle_route_map_evidence(&self, input: RouteMapInput) -> Result<String, ErrorData> {
+        let store = self.open_store()?;
+        let path_filter = input.route.as_deref();
+        let routes = store.get_routes(path_filter)
+            .map_err(|e| ErrorData::internal_error(format!("Route query failed: {}", e), None))?;
+        if routes.is_empty() {
+            Ok("No routes found.".to_string())
+        } else {
+            let mut out = format!("{} route(s) found:\n\n", routes.len());
+            for (method, path, file, line, framework, handler) in &routes {
+                let handler_str = if handler.is_empty() {
+                    String::new()
+                } else {
+                    let h: &String = handler;
+                    format!(" → {}", h)
+                };
+                out.push_str(&format!("  {}  {}  {}:{}  [{}]{}\n", method, path, file, line, framework, handler_str));
+            }
+            Ok(out)
+        }
+    }
+
     /// Handle the `query` tool using evidence bundles.
     fn handle_query_evidence(&self, input: QueryInput) -> Result<String, ErrorData> {
         let store = self.open_store()?;
@@ -480,6 +503,11 @@ impl ServerHandler for ATreeMcpServer {
                     let input: GraphFocusInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
                     self.handle_graph_focus(input)?
+                }
+                "route_map" => {
+                    let input: RouteMapInput = serde_json::from_value(serde_json::Value::Object(args))
+                        .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    self.handle_route_map_evidence(input)?
                 }
                 // Fall through to CLI subprocess for all other tools.
                 _ => {
