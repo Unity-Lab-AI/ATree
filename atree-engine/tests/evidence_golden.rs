@@ -4,9 +4,13 @@
 //! across multiple languages, with correct kinds, spans, and content.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static GOLDEN_ID: AtomicU64 = AtomicU64::new(0);
 
 fn create_project(files: &[(&str, &str)]) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("atree_golden_{}", std::process::id()));
+    let id = GOLDEN_ID.fetch_add(1, Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("atree_golden_{}_{}", std::process::id(), id));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     for (name, content) in files {
