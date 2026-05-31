@@ -1,8 +1,8 @@
 # ATree Production-Readiness Audit
 
 ## Score: 9.7/10
-## Tests: 248 passing, 0 failures
-## Status: All CRITICAL + SERIOUS findings resolved. 6 P2 items deferred.
+## Tests: 280 passing, 0 failures
+## Status: All CRITICAL + SERIOUS findings resolved. 3 P2 items deferred.
 
 ---
 
@@ -61,7 +61,9 @@ Web `/api/search` now uses FTS5 index; layout endpoint wired; webhook canonicali
 1. ~~**Dart missing captures**~~ — FIXED in `lang/dart.rs` (calls, methods, constructors, fields, imports, heritage)
 2. **Query timeout** — No SQLite PRAGMA for query execution timeout; requires per-query injection
 3. **`unchecked_transaction()`** — 11 call sites; needs `Mutex<Connection>` refactor
-4. **`type_env` output not consumed** — `build_type_envs()` runs in pipeline but `TypeEnvOutput` is never read by downstream phases. Type bindings are inferred but not persisted to DB or used for scope resolution.
+4. ~~**`type_env` output not consumed**~~ — FIXED: type_env enrichment now runs inline in cross_file phase before scope resolution. Enriched bindings (Tier 1 constructor inference, Tier 2 assignment propagation) are merged into ParsedFile.type_bindings with owner_kind="type_env_inferred".
+5. **Query timeout** — Deferred: rusqlite 0.31's progress_handler not externally accessible. soft_heap_limit (512MB) provides OOM guard.
+6. **`unchecked_transaction()`** — 8 call sites use direct conn().unchecked_transaction() with safety comments. Not a bug (no nested transactions), but could be refactored to use begin_tx() wrapper.
 5. ~~**Container support**~~ — FIXED: Dockerfile added
 6. **MCP auth/rate limiting** — Out of scope for local stdio MCP
 
