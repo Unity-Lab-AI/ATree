@@ -353,7 +353,7 @@ mod tests {
             is_exported: true, scope_id: None, owner_symbol_id: None,
         }).unwrap();
 
-        let logout_id = store.insert_symbol(&crate::store::SymbolRecord {
+        let _logout_id = store.insert_symbol(&crate::store::SymbolRecord {
             id: 0, file_id, name: "logout".into(), qualified_name: "auth::logout".into(),
             kind: "DefinitionFunction".into(), line: 10, col: 0,
             is_exported: true, scope_id: None, owner_symbol_id: None,

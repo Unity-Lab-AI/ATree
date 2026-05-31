@@ -344,6 +344,7 @@ struct TieBreakKey {
 
 impl BindingOrigin {
     /// Priority value for tie-breaking (lower = stronger).
+    #[allow(dead_code)]
     fn priority(&self) -> u8 {
         match self {
             BindingOrigin::Local => 0,

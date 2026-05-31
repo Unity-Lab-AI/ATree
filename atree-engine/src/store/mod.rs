@@ -16,10 +16,79 @@ use std::path::Path;
 use serde::{Serialize, Deserialize};
 
 /// Maximum time to wait for the advisory file lock (seconds).
-const LOCK_TIMEOUT_SECS: u64 = 10;
+/// Allowed tables and their permitted columns for cypher queries.
+pub const ALLOWED_TABLES: &[(&str, &[&str])] = &[
+    ("files", &["id", "path", "hash", "language", "mtime", "indexed_at", "repo_label"]),
+    ("symbols", &["id", "file_id", "name", "qualified_name", "kind", "line", "col", "is_exported", "scope_id", "owner_symbol_id"]),
+    ("scopes", &["id", "file_id", "parent_id", "owner_symbol_id", "kind", "line_start", "line_end"]),
+    ("imports", &["id", "file_id", "source", "imported_name", "local_name", "resolved_file_id", "confidence"]),
+    ("exports", &["id", "file_id", "exported_name", "symbol_id", "is_default"]),
+    ("heritage", &["id", "file_id", "child_symbol_id", "parent_symbol_id", "parent_name", "heritage_kind", "confidence", "line"]),
+    ("calls", &["id", "file_id", "caller_scope_id", "callee_name", "receiver", "resolved_symbol_id", "confidence", "line", "col"]),
+    ("edges", &["id", "src_id", "dst_id", "edge_kind", "confidence", "file_id", "line"]),
+];
 
-/// Current schema version. Bump when adding migrations.
-const SCHEMA_VERSION: i32 = 1;
+/// Validate a cypher query against the allowlist.
+///
+/// Rejects:
+/// - References to sqlite_master, sqlite_temp_master, pg_catalog, information_schema
+/// - PRAGMA statements
+/// - INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH
+/// - Semicolons (multi-statement injection)
+/// - Comments that could mask injected SQL
+/// - Tables not in the allowlist
+pub fn validate_cypher_query(query: &str) -> Result<(), String> {
+    let lower = query.to_lowercase();
+
+    // Block dangerous patterns. Multi-word and special-char patterns use
+    // substring matching; single-word keywords use word-boundary matching
+    // to avoid false positives (e.g. "selection" containing "select").
+    let blocked_substr = [
+        "sqlite_master", "sqlite_temp_master", "pg_catalog", "information_schema",
+        ";", "--", "/*", "*/",
+    ];
+    for pat in &blocked_substr {
+        if lower.contains(pat) {
+            return Err(format!("Query contains forbidden pattern: '{}'", pat));
+        }
+    }
+
+    // Single-word keywords: check with word boundaries (alphanumeric/underscore delimited).
+    let blocked_words = [
+        "insert", "update", "delete", "drop", "alter", "create",
+        "attach", "detach", "replace", "pragma", "union",
+    ];
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '_').collect();
+    for word in &words {
+        if blocked_words.contains(word) {
+            return Err(format!("Query contains forbidden keyword: '{}'", word));
+        }
+    }
+
+    // Must start with SELECT or WITH.
+    let trimmed = lower.trim();
+    if !trimmed.starts_with("select") && !trimmed.starts_with("with") {
+        return Err("Only SELECT and WITH queries are allowed".to_string());
+    }
+
+    let table_names: std::collections::HashSet<&str> = ALLOWED_TABLES.iter().map(|(t, _)| *t).collect();
+    let sql_keywords = ["select", "from", "where", "join", "left", "right", "inner",
+        "outer", "on", "and", "or", "not", "in", "is", "null", "as", "group",
+        "order", "by", "limit", "offset", "having", "union", "all", "distinct",
+        "case", "when", "then", "else", "end", "exists", "between", "like",
+        "count", "sum", "avg", "min", "max", "asc", "desc", "using",
+        "with", "recursive", "cast", "coalesce"];
+    for word in &words {
+        if word.is_empty() { continue; }
+        if sql_keywords.contains(word) { continue; }
+        if table_names.contains(word) { continue; }
+        if word.chars().next().map_or(false, |c| c.is_alphabetic()) && word.len() > 1 {
+            return Err(format!("Query references unknown identifier: '{}'", word));
+        }
+    }
+
+    Ok(())
+}
 
 /// Persistent graph store backed by SQLite.
 pub struct GraphStore {
@@ -64,6 +133,39 @@ impl GraphStore {
         &self.conn
     }
 
+    /// Begin a transaction, returning an error if one is already active.
+    /// This is a safe wrapper around `unchecked_transaction()` that avoids
+    /// panicking if called within an existing transaction.
+    fn begin_tx(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.unchecked_transaction()
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to begin transaction (possible nested call)");
+                e
+            })
+    }
+
+    /// Run WAL checkpoint and ANALYZE to keep the database performant.
+    ///
+    /// Call this periodically (e.g. after large batch writes or on a timer).
+    /// WAL checkpoint truncates the write-ahead log; ANALYZE updates table
+    /// statistics so the query planner chooses good indexes.
+    pub fn maintenance(&self) -> rusqlite::Result<()> {
+        tracing::debug!("Running DB maintenance: WAL checkpoint + ANALYZE");
+        // PASSIVE checkpoint: moves data from WAL to main DB without blocking readers.
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        // ANALYZE: gather statistics on all tables for the query planner.
+        self.conn.execute_batch("ANALYZE;")?;
+        tracing::info!("DB maintenance complete");
+        Ok(())
+    }
+
+    /// Try running maintenance, logging errors instead of failing.
+    pub fn maintenance_or_warn(&self) {
+        if let Err(e) = self.maintenance() {
+            tracing::warn!(error = %e, "DB maintenance failed");
+        }
+    }
+
     /// Initialize SQLite PRAGMAs for safe, performant operation.
     ///
     /// Uses `synchronous = NORMAL` (not OFF) to prevent data corruption on
@@ -83,6 +185,9 @@ impl GraphStore {
         // foreign_keys: enforce REFERENCES constraints. Without this,
         // deletions of parent rows silently leave orphaned child rows.
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // soft_heap_limit: abort queries that would use more than 512MB of heap.
+        // This prevents accidental OOM from large JOINs or unbounded queries.
+        self.conn.execute_batch("PRAGMA soft_heap_limit = 536870912;")?;
         Ok(())
     }
 
@@ -120,6 +225,11 @@ impl GraphStore {
             log::info!("Running schema migration: v5 -> v6 (routes table)");
             self.init_schema_v6()?;
             self.conn.execute_batch("PRAGMA user_version = 6;")?;
+        }
+        if current_version < 7 {
+            log::info!("Running schema migration: v6 -> v7 (missing indexes)");
+            self.init_schema_v7()?;
+            self.conn.execute_batch("PRAGMA user_version = 7;")?;
         }
         Ok(())
     }
@@ -425,6 +535,21 @@ impl GraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_routes_file ON routes(file_path);
             CREATE INDEX IF NOT EXISTS idx_routes_path ON routes(path);
+        ")?;
+        Ok(())
+    }
+
+    /// Add missing indexes for performance (migration v6 -> v7).
+    fn init_schema_v7(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_symbols_owner ON symbols(owner_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_src_kind ON edges(src_id, edge_kind);
+            CREATE INDEX IF NOT EXISTS idx_edges_dst_kind ON edges(dst_id, edge_kind);
+            CREATE INDEX IF NOT EXISTS idx_exports_symbol ON exports(symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_heritage_parent ON heritage(parent_name);
+            CREATE INDEX IF NOT EXISTS idx_calls_scope ON calls(caller_scope_id);
+            CREATE INDEX IF NOT EXISTS idx_evidence_target ON evidence(target_ref);
+            CREATE INDEX IF NOT EXISTS idx_evidence_enclosing ON evidence(enclosing_symbol);
         ")?;
         Ok(())
     }
@@ -774,6 +899,27 @@ impl GraphStore {
         rows.next().transpose()
     }
 
+    /// Get symbol counts by kind (for schema resource).
+    pub fn get_symbol_kind_counts(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, COUNT(*) FROM symbols GROUP BY kind ORDER BY COUNT(*) DESC"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.collect()
+    }
+
+    /// Get all graph metadata as a key-value map.
+    pub fn get_all_graph_metadata(&self) -> rusqlite::Result<Option<rustc_hash::FxHashMap<String, String>>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM graph_metadata")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut map = rustc_hash::FxHashMap::default();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        if map.is_empty() { Ok(None) } else { Ok(Some(map)) }
+    }
+
     /// Get all file-level graph edges (for file-level view).
     pub fn get_file_graph_edges(&self) -> rusqlite::Result<Vec<(i64, i64, String, i64)>> {
         let mut stmt = self.conn.prepare(
@@ -855,8 +1001,7 @@ impl GraphStore {
                 placeholders
             );
             let mut stmt = self.conn.prepare(&query)?;
-            let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| Ok(SymbolRecord {
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok(SymbolRecord {
                 id: row.get(0)?, file_id: row.get(1)?, name: row.get(2)?,
                 qualified_name: row.get(3)?, kind: row.get(4)?,
                 line: row.get::<_, i64>(5)? as usize, col: row.get::<_, i64>(6)? as usize,
@@ -865,14 +1010,14 @@ impl GraphStore {
             for row in rows { symbols.push(row?); }
         }
 
-        // Fetch edges between visited symbols
+        // Fetch edges between visited symbols — batch query to avoid N+1.
         let id_set: rustc_hash::FxHashSet<i64> = all_ids.iter().cloned().collect();
         let mut edges = Vec::new();
-        for &id in &all_ids {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id = ?1"
-            )?;
-            let rows = stmt.query_map([id], |row| Ok(EdgeRecord {
+        if !all_ids.is_empty() {
+            let placeholders = all_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(all_ids.iter()), |row| Ok(EdgeRecord {
                 id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
                 edge_kind: row.get(3)?, confidence: row.get(4)?,
                 file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
@@ -895,12 +1040,15 @@ impl GraphStore {
         let symbol_ids: Vec<i64> = symbols.iter().map(|s| s.id).collect();
         let mut edges = Vec::new();
 
-        for &id in &symbol_ids {
-            let mut stmt = self.conn.prepare(
+        if !symbol_ids.is_empty() {
+            let placeholders = symbol_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
                 "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
-                 FROM edges WHERE src_id = ?1 OR dst_id = ?1"
-            )?;
-            let rows = stmt.query_map([id], |row| Ok(EdgeRecord {
+                 FROM edges WHERE src_id IN ({0}) OR dst_id IN ({0})",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids.iter()), |row| Ok(EdgeRecord {
                 id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
                 edge_kind: row.get(3)?, confidence: row.get(4)?,
                 file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
@@ -929,7 +1077,8 @@ impl GraphStore {
         parsed_files: &[crate::semantic::ParsedFile],
         repo_label: Option<&str>,
     ) -> rusqlite::Result<rustc_hash::FxHashMap<u64, i64>> {
-        let tx = self.conn.unchecked_transaction()?;
+        let _t0 = std::time::Instant::now();
+        let tx = self.begin_tx()?;
         let mut global_symbol_id_map: rustc_hash::FxHashMap<u64, i64> =
             rustc_hash::FxHashMap::default();
 
@@ -977,7 +1126,7 @@ impl GraphStore {
                 format!("{:?}", file.language),
                 0i64, now, repo_label,
             ]) {
-                eprintln!("[batch] file insert failed for {}: {}", file.path, e);
+                tracing::warn!(file = %file.path, error = %e, "Batch file insert failed");
                 continue;
             };
             // Get the file rowid. last_insert_rowid() works for INSERT,
@@ -1011,7 +1160,7 @@ impl GraphStore {
                 ]) {
                     Ok(_) => scope_id_map.push(tx.last_insert_rowid()),
                     Err(e) => {
-                        eprintln!("[batch] scope insert failed at line {} (file_id={}): {}", scope.line_start, file_id, e);
+                        tracing::warn!(file_id, line = scope.line_start, error = %e, "Batch scope insert failed");
                         scope_id_map.push(0);
                     }
                 }
@@ -1030,7 +1179,7 @@ impl GraphStore {
                     sym.owner_id.map(|v| v as i64),
                 ]) {
                     Ok(_) => { global_symbol_id_map.insert(sym.id, tx.last_insert_rowid()); }
-                    Err(e) => { eprintln!("[batch] symbol insert failed for {}: {}", sym.name, e); }
+                    Err(e) => { tracing::warn!(symbol = %sym.name, error = %e, "Batch symbol insert failed"); }
                 }
             }
 
@@ -1097,7 +1246,8 @@ impl GraphStore {
         &self,
         edges: &[crate::store::EdgeRecord],
     ) -> rusqlite::Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let _t0 = std::time::Instant::now();
+        let tx = self.begin_tx()?;
         let mut stmt = tx.prepare(
             "INSERT INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
@@ -1119,7 +1269,6 @@ impl GraphStore {
         if count as i64 != expected {
             log::warn!("[batch] edge insert: {}/{} persisted ({} failed)", count, expected, expected - count as i64);
         }
-
         Ok(count)
     }
 
@@ -1234,7 +1383,7 @@ impl GraphStore {
     /// may reference this file's symbols but carry a different file_id.
     pub fn remove_file_data(&self, path: &str) -> rusqlite::Result<()> {
         if let Some(file) = self.get_file(path)? {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = self.begin_tx()?;
             // Delete edges where THIS file's symbols are either source or destination.
             // The per-file file_id filter misses cross-file edges; the symbol-based
             // deletions catch all edges involving this file's symbols.
@@ -1244,6 +1393,12 @@ impl GraphStore {
             tx.execute("DELETE FROM heritage WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM imports WHERE file_id = ?1", [file.id])?;
             tx.execute("DELETE FROM exports WHERE file_id = ?1", [file.id])?;
+            // Delete evidence edges and evidence linked to this file.
+            tx.execute("DELETE FROM evidence_edges WHERE from_id IN (SELECT id FROM evidence WHERE file = ?1)", [file.path.as_str()])?;
+            tx.execute("DELETE FROM evidence_edges WHERE to_id IN (SELECT id FROM evidence WHERE file = ?1)", [file.path.as_str()])?;
+            tx.execute("DELETE FROM evidence WHERE file = ?1", [file.path.as_str()])?;
+            // Delete routes for this file.
+            tx.execute("DELETE FROM routes WHERE file_path = ?1", [file.path.as_str()])?;
             // Delete community memberships before symbols (FK constraint)
             tx.execute("DELETE FROM community_memberships WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file.id])?;
             tx.execute("DELETE FROM symbols WHERE file_id = ?1", [file.id])?;
@@ -1273,12 +1428,24 @@ impl GraphStore {
 
     /// Delete a file and all its associated records.
     pub fn delete_file(&self, file_id: i64) -> rusqlite::Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM edges WHERE file_id = ?1", [file_id])?;
+        let tx = self.begin_tx()?;
+        // Delete edges by symbol_id (not file_id) to catch cross-file edges.
+        tx.execute("DELETE FROM edges WHERE src_id IN (SELECT id FROM symbols WHERE file_id = ?1) OR dst_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file_id])?;
         tx.execute("DELETE FROM calls WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM exports WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM imports WHERE file_id = ?1", [file_id])?;
+        tx.execute("DELETE FROM heritage WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM community_memberships WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file_id])?;
+        // Delete evidence edges and evidence linked to this file.
+        // evidence_edges uses from_id/to_id (both FK to evidence.id).
+        tx.execute("DELETE FROM evidence_edges WHERE from_id IN (SELECT id FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1))", [file_id])?;
+        tx.execute("DELETE FROM evidence_edges WHERE to_id IN (SELECT id FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1))", [file_id])?;
+        tx.execute("DELETE FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1)", [file_id])?;
+        // Clean up orphaned pattern/constraint evidence links.
+        tx.execute("DELETE FROM pattern_evidence WHERE evidence_id NOT IN (SELECT id FROM evidence)", [])?;
+        tx.execute("DELETE FROM constraint_violations WHERE evidence_id NOT IN (SELECT id FROM evidence)", [])?;
+        // Delete routes by file_path.
+        tx.execute("DELETE FROM routes WHERE file_path IN (SELECT path FROM files WHERE id = ?1)", [file_id])?;
         tx.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM scopes WHERE file_id = ?1", [file_id])?;
         tx.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
@@ -1325,9 +1492,36 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// Get all symbols, paginated. Use for bulk operations where you need
+    /// to control memory usage via the limit parameter.
+    pub fn get_all_symbols_paginated(&self, limit: usize) -> rusqlite::Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbols ORDER BY id LIMIT ?1"
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| Ok(SymbolRecord {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            kind: row.get(4)?,
+            line: row.get::<_, i64>(5)? as usize,
+            col: row.get::<_, i64>(6)? as usize,
+            is_exported: row.get::<_, i64>(7)? != 0,
+            scope_id: row.get(8)?,
+            owner_symbol_id: row.get(9)?,
+        }))?;
+        rows.collect()
+    }
+
     /// Search symbols by name pattern (substring match, case-insensitive).
     /// Returns matching symbols ordered by relevance (exact > prefix > substring).
     pub fn search_symbols(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<SymbolRecord>> {
+        // Try FTS5 first for O(log n) indexed search; fall back to LIKE for
+        // stores that haven't had the FTS5 index populated.
+        if let Some(results) = self.search_symbols_fts(query, limit).ok() {
+            if !results.is_empty() { return Ok(results); }
+        }
         let pattern = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
@@ -1344,6 +1538,45 @@ impl GraphStore {
         let prefix = format!("{}%", query);
         let rows = stmt.query_map(
             params![pattern, exact, prefix, limit as i64],
+            |row| Ok(SymbolRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                line: row.get::<_, i64>(5)? as usize,
+                col: row.get::<_, i64>(6)? as usize,
+                is_exported: row.get::<_, i64>(7)? != 0,
+                scope_id: row.get(8)?,
+                owner_symbol_id: row.get(9)?,
+            }),
+        )?;
+        rows.collect()
+    }
+
+    /// Search symbols using the FTS5 index. Returns Ok(None) if the FTS5 table
+    /// doesn't exist or the query fails; caller should fall back to LIKE search.
+    fn search_symbols_fts(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<SymbolRecord>> {
+        // Build FTS5 query: each word gets prefix matching, joined with OR.
+        let fts_query = query.split_whitespace()
+            .map(|w| {
+                let sanitized: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+                if sanitized.is_empty() { String::new() } else { format!("{}*", sanitized) }
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if fts_query.is_empty() { return Ok(vec![]); }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbol_search ss
+             JOIN symbols s ON s.id = ss.rowid
+             WHERE symbol_search MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(
+            params![fts_query, limit as i64],
             |row| Ok(SymbolRecord {
                 id: row.get(0)?,
                 file_id: row.get(1)?,
@@ -1379,6 +1612,44 @@ impl GraphStore {
             owner_symbol_id: row.get(9)?,
         }))?;
         rows.next().transpose()
+    }
+
+    /// Batch-load file records by IDs. Avoids N+1 queries when rendering graph layouts.
+    pub fn get_files_by_ids(&self, ids: &[i64]) -> rusqlite::Result<Vec<FileRecord>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, path, hash, language, mtime, indexed_at, repo_label FROM files WHERE id IN ({})", placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| Ok(FileRecord {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            hash: row.get::<_, i64>(2)? as u64,
+            language: row.get(3)?,
+            mtime: row.get::<_, i64>(4)?,
+            indexed_at: row.get::<_, i64>(5)?,
+            repo_label: row.get(6)?,
+        }))?;
+        rows.collect()
+    }
+
+    /// Batch-load edges for multiple symbol IDs. Returns all edges where either
+    /// src_id or dst_id is in the given set. Avoids N+1 queries in graph rendering.
+    pub fn get_edges_for_symbols(&self, symbol_ids: &rustc_hash::FxHashSet<i64>) -> rusqlite::Result<Vec<EdgeRecord>> {
+        if symbol_ids.is_empty() { return Ok(Vec::new()); }
+        let ids: Vec<i64> = symbol_ids.iter().copied().collect();
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id IN ({}) OR dst_id IN ({})", placeholders, placeholders);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().chain(ids.iter())), |row| Ok(EdgeRecord {
+            id: row.get(0)?,
+            src_id: row.get(1)?,
+            dst_id: row.get(2)?,
+            edge_kind: row.get(3)?,
+            confidence: row.get(4)?,
+            file_id: row.get(5)?,
+            line: row.get::<_, i64>(6)? as usize,
+        }))?;
+        rows.collect()
     }
 
     /// Get all symbols across all files. Uses chunked loading to bound memory;
@@ -1763,19 +2034,20 @@ impl GraphStore {
     pub fn get_callers(&self, symbol_id: i64, max_depth: usize) -> rusqlite::Result<Vec<(i64, String, f64, i64)>> {
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE callers(depth, caller_id, caller_name, confidence, file_id) AS (
-                SELECT 0, s.id, s.name, c.confidence, c.file_id
-                FROM calls c
-                JOIN symbols s ON s.id = c.resolved_symbol_id
-                WHERE c.resolved_symbol_id = ?1
+                SELECT 0, e.src_id, s.name, e.confidence, e.file_id
+                FROM edges e
+                JOIN symbols s ON s.id = e.src_id
+                WHERE e.dst_id = ?1 AND e.edge_kind = 'CALLS'
                 UNION ALL
-                SELECT callers.depth + 1, s.id, s.name, c.confidence, c.file_id
+                SELECT callers.depth + 1, e.src_id, s.name, e.confidence, e.file_id
                 FROM callers
-                JOIN calls c ON c.resolved_symbol_id = callers.caller_id
-                JOIN symbols s ON s.id = c.resolved_symbol_id
-                WHERE callers.depth < ?2
+                JOIN edges e ON e.dst_id = callers.caller_id
+                JOIN symbols s ON s.id = e.src_id
+                WHERE e.edge_kind = 'CALLS' AND callers.depth < ?2
             )
-            SELECT caller_id, caller_name, confidence, file_id FROM callers WHERE depth > 0
-            ORDER BY depth"
+            SELECT DISTINCT caller_id, caller_name, confidence, file_id FROM callers WHERE depth > 0
+            ORDER BY depth
+            LIMIT 10000"
         )?;
         let rows = stmt.query_map(params![symbol_id, max_depth as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -1787,22 +2059,20 @@ impl GraphStore {
     pub fn get_callees(&self, symbol_id: i64, max_depth: usize) -> rusqlite::Result<Vec<(i64, String, f64, i64)>> {
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE callees(depth, callee_id, callee_name, confidence, file_id) AS (
-                SELECT 0, c.resolved_symbol_id, s.name, c.confidence, c.file_id
-                FROM calls c
-                JOIN symbols s ON s.id = c.resolved_symbol_id
-                WHERE c.file_id IN (SELECT file_id FROM symbols WHERE id = ?1)
-                AND c.resolved_symbol_id IS NOT NULL
+                SELECT 0, e.dst_id, s.name, e.confidence, e.file_id
+                FROM edges e
+                JOIN symbols s ON s.id = e.dst_id
+                WHERE e.src_id = ?1 AND e.edge_kind = 'CALLS'
                 UNION ALL
-                SELECT callees.depth + 1, c.resolved_symbol_id, s.name, c.confidence, c.file_id
+                SELECT callees.depth + 1, e.dst_id, s.name, e.confidence, e.file_id
                 FROM callees
-                JOIN symbols sym ON sym.id = callees.callee_id
-                JOIN calls c ON c.file_id IN (SELECT file_id FROM symbols WHERE id = callees.callee_id)
-                JOIN symbols s ON s.id = c.resolved_symbol_id
-                WHERE callees.depth < ?2
-                AND c.resolved_symbol_id IS NOT NULL
+                JOIN edges e ON e.src_id = callees.callee_id
+                JOIN symbols s ON s.id = e.dst_id
+                WHERE e.edge_kind = 'CALLS' AND callees.depth < ?2
             )
-            SELECT callee_id, callee_name, confidence, file_id FROM callees WHERE depth > 0
-            ORDER BY depth"
+            SELECT DISTINCT callee_id, callee_name, confidence, file_id FROM callees WHERE depth > 0
+            ORDER BY depth
+            LIMIT 10000"
         )?;
         let rows = stmt.query_map(params![symbol_id, max_depth as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -1946,12 +2216,12 @@ impl GraphStore {
         routes: &[(i64, crate::routes::Route)], // (handler_symbol_id, route)
         file_ids_to_replace: &[i64],
     ) -> rusqlite::Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin_tx()?;
         // Clear old routes for the files being re-indexed
         if !file_ids_to_replace.is_empty() {
             let placeholders = file_ids_to_replace.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!("DELETE FROM routes WHERE file_path IN (SELECT path FROM files WHERE id IN ({}))", placeholders);
-            let params: Vec<&(dyn rusqlite::ToSql)> = file_ids_to_replace.iter().map(|id| id as &(dyn rusqlite::ToSql)).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = file_ids_to_replace.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             tx.execute(&sql, params.as_slice())?;
         }
         let mut count = 0;

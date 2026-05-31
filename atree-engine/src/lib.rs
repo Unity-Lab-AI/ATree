@@ -12,6 +12,7 @@ pub mod graph;
 #[cfg(feature = "git")]
 pub mod git_history;
 pub mod store;
+pub use store::validate_cypher_query;
 pub mod community;
 pub mod process;
 pub mod routes;
@@ -582,6 +583,7 @@ fn process_dir(
 /// `ScanResult.truncated = true`.
 pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
     let root = opts.root.canonicalize().unwrap_or_else(|_| opts.root.clone());
+    tracing::info!(root = %root.to_string_lossy(), threads = opts.threads, semantic = opts.semantic, "Starting graph build");
 
     // Validate the root before scanning. A nonexistent or non-directory path
     // would otherwise produce a single-node "scan" with the literal path as a
@@ -928,8 +930,9 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             let store_guard = shared.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref store) = *store_guard {
                 perf_timer!("Abstraction layers");
+                let _tab0 = std::time::Instant::now();
                 if let Err(e) = store.build_abstraction_layers() {
-                    eprintln!("[WARN] Failed to build abstraction layers: {}", e);
+                    tracing::warn!(error = %e, "Failed to build abstraction layers");
                 }
             }
             drop(store_guard);
@@ -945,7 +948,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
                 match crate::git_history::extract_and_persist(&root, store.conn(), &git_config) {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        eprintln!("[git_history] Warning: {}", e);
+                        tracing::warn!(error = %e, "Git history extraction failed");
                         None
                     }
                 }
@@ -977,10 +980,23 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
         let parsed_files = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let scope_resolution_stats = shared.scope_resolution_stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let detected_routes = shared.detected_routes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        // Run WAL checkpoint after large batch writes to prevent unbounded WAL growth.
+        if let Ok(guard) = shared.store.lock() {
+            if let Some(ref store) = *guard {
+                store.maintenance_or_warn();
+            }
+        }
+
         (store_stats, symbol_table, None, scope_resolution_stats, detected_routes, parsed_files)
     } else {
         (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0 }, SymbolTable::new(), None, None, Vec::new(), Vec::new())
     };
+
+    tracing::info!(
+        files = store_stats.files, symbols = store_stats.symbols, edges = store_stats.edges,
+        routes = detected_routes.len(), truncated, "Graph build complete"
+    );
 
     Ok(ScanResult {
         parsed_files,
@@ -1565,11 +1581,11 @@ fn run_incremental_semantic_phases(
         ) {
             Ok(result) => {
                 if let Err(e) = crate::community::store_memberships(store, &result) {
-                    eprintln!("[communities] Warning: failed to store incremental memberships: {}", e);
+                    tracing::warn!(error = %e, "Failed to store community memberships (incremental)");
                 }
             }
             Err(e) => {
-                eprintln!("[communities] Warning: incremental update failed, falling back: {}", e);
+                tracing::warn!(error = %e, "Community incremental update failed, falling back to full recompute");
                 // Fallback to full recompute
                 if let Ok(result) = crate::community::detect_communities(store, &crate::community::CommunityConfig::default()) {
                     let _ = crate::community::store_memberships(store, &result);
@@ -1581,10 +1597,10 @@ fn run_incremental_semantic_phases(
         match crate::community::detect_communities(store, &crate::community::CommunityConfig::default()) {
             Ok(result) => {
                 if let Err(e) = crate::community::store_memberships(store, &result) {
-                    eprintln!("[communities] Warning: failed to store memberships: {}", e);
+                    tracing::warn!(error = %e, "Failed to store community memberships");
                 }
             }
-            Err(e) => eprintln!("[communities] Warning: detection failed: {}", e),
+            Err(e) => tracing::warn!(error = %e, "Community detection failed"),
         }
     }
 
@@ -2855,7 +2871,10 @@ def my_func():
         // Verify scope-resolution extracted reference sites
         if let Some(ref srs) = result.scope_resolution_stats {
             assert!(srs.files_processed > 0, "ScopeResolution: should have processed files");
-            assert!(srs.unresolved_sites > 0, "ScopeResolution: should have found reference sites");
+            // With the type-binding fallback fix, most sites now resolve.
+            // Just verify the pipeline ran (reference_edges_emitted > 0 or unresolved_sites > 0).
+            assert!(srs.reference_edges_emitted > 0 || srs.unresolved_sites > 0,
+                "ScopeResolution: should have processed reference sites");
         }
 
         fs::remove_dir_all(&tmp).ok();
@@ -3624,7 +3643,6 @@ func main() {
         for c in &parsed.calls {
             writeln!(diag, "    {} @ line {} receiver={:?}", c.callee_name, c.line, c.receiver).unwrap();
         }
-        let file_id = 1u64;
         writeln!(diag, "  assignments: {}", parsed.assignments.len()).unwrap();
         for a in &parsed.assignments {
             writeln!(diag, "    {} @ line {} receiver={:?}", a.name, a.line, a.receiver).unwrap();
