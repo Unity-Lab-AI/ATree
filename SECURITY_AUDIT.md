@@ -2,7 +2,7 @@
 
 ## Score: 9.7/10
 ## Tests: 280 passing, 0 failures
-## Status: All CRITICAL + SERIOUS findings resolved. 2 P2 items deferred.
+## Status: All CRITICAL + SERIOUS findings resolved. 1 P2 item deferred.
 
 ---
 
@@ -63,7 +63,7 @@ Web `/api/search` now uses FTS5 index; layout endpoint wired; webhook canonicali
 3. **`unchecked_transaction()`** — 11 call sites; needs `Mutex<Connection>` refactor
 4. ~~**`type_env` output not consumed**~~ — FIXED: type_env enrichment now runs inline in cross_file phase before scope resolution. Enriched bindings (Tier 1 constructor inference, Tier 2 assignment propagation) are merged into ParsedFile.type_bindings with owner_kind="type_env_inferred".
 5. **Query timeout** — Deferred: rusqlite 0.31's progress_handler not externally accessible. soft_heap_limit (512MB) provides OOM guard.
-6. **`unchecked_transaction()`** — 8 call sites use direct conn().unchecked_transaction() with safety comments. Not a bug (no nested transactions), but could be refactored to use begin_tx() wrapper.
+6. ~~**`unchecked_transaction()` maintenance trap**~~ — FIXED: all 8 call sites now use safe begin_transaction() wrapper that returns errors instead of panicking.
 7. ~~**M-03: O(n²) edge lookup in web UI**~~ — FIXED: batched get_edges_for_nodes() replaces per-symbol queries
 5. ~~**Container support**~~ — FIXED: Dockerfile added
 6. **MCP auth/rate limiting** — Out of scope for local stdio MCP
