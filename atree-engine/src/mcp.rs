@@ -30,12 +30,60 @@ use crate::store::validate_cypher_query;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ListReposInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct IndexInput { pub path: Option<String>, #[serde(default)] pub force: bool, #[serde(default)] pub embeddings: bool, pub name: Option<String> }
+impl IndexInput {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(ref p) = self.path {
+            if p.contains("..") || p.starts_with('/') {
+                return Err("path must be relative and must not contain '..'".to_string());
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct QueryInput { pub query: String, pub task_context: Option<String>, pub goal: Option<String>, #[serde(default = "dl")] pub max_seeds: u32, #[serde(default = "dms")] pub max_symbols: u32, #[serde(default)] pub include_content: bool }
+impl QueryInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.query.trim().is_empty() {
+            return Err("query must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ContextInput { pub name: Option<String>, pub kind: Option<String>, #[serde(default)] pub include_content: bool }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ImpactInput { pub target: String, pub direction: String, pub kind: Option<String>, #[serde(default = "dd")] pub max_depth: u32 }
+impl ImpactInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.target.trim().is_empty() {
+            return Err("target must not be empty".to_string());
+        }
+        let valid_directions = ["upstream", "downstream", "both"];
+        if !valid_directions.contains(&self.direction.as_str()) {
+            return Err(format!("direction must be one of: {:?}", valid_directions));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DetectChangesInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct RenameInput { pub symbol_name: Option<String>, pub new_name: String, #[serde(default = "ddr")] pub dry_run: bool }
+impl RenameInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.new_name.trim().is_empty() {
+            return Err("new_name must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct CypherInput { pub query: String }
+impl CypherInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.query.trim().is_empty() {
+            return Err("query must not be empty".to_string());
+        }
+        // Delegate to the existing cypher validation for SQL injection prevention.
+        crate::store::validate_cypher_query(&self.query)
+            .map_err(|e| format!("Invalid cypher query: {}", e))
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct RouteMapInput { pub route: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ShapeCheckInput { pub route: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ToolMapInput {}
@@ -178,6 +226,7 @@ impl ATreeMcpServer {
 
     /// Handle the `query` tool using evidence bundles.
     fn handle_query_evidence(&self, input: QueryInput) -> Result<String, ErrorData> {
+        input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
         let store = self.open_store()?;
 
         // Ensure the search index exists.
@@ -351,6 +400,7 @@ impl ATreeMcpServer {
 
     /// Handle the `impact` tool using in-process analysis.
     fn handle_impact_evidence(&self, input: ImpactInput) -> Result<String, ErrorData> {
+        input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
         let store = self.open_store()?;
 
         let evidence_config = crate::evidence_path::EvidenceConfig {
@@ -793,6 +843,7 @@ impl ATreeMcpServer {
             "index" => {
                 let input: IndexInput = serde_json::from_value(serde_json::Value::Object(args))
                     .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                 let path = input.path.as_deref().unwrap_or(".");
                 let mut a = vec!["--semantic", "--root", path];
                 if input.force { a.push("--force"); }
@@ -802,6 +853,7 @@ impl ATreeMcpServer {
             "query" => {
                 let input: QueryInput = serde_json::from_value(serde_json::Value::Object(args))
                     .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                 let mut a = vec!["query", "search", &input.query];
                 if let Some(db) = db { a.push("--db"); a.push(db); }
                 self.run_atree(&a)?
@@ -830,6 +882,7 @@ impl ATreeMcpServer {
             "rename" => {
                 let input: RenameInput = serde_json::from_value(serde_json::Value::Object(args))
                     .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                 let sn = input.symbol_name.as_deref()
                     .ok_or_else(|| ErrorData::invalid_params("Missing 'symbol_name'".to_string(), None))?;
                 let mut a = vec!["query", "rename", sn, "--new-name", &input.new_name];
@@ -840,10 +893,7 @@ impl ATreeMcpServer {
             "cypher" => {
                 let input: CypherInput = serde_json::from_value(serde_json::Value::Object(args))
                     .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
-                // Validate the query against an allowlist of permitted tables and columns.
-                validate_cypher_query(&input.query).map_err(|e| {
-                    ErrorData::invalid_params(format!("Query rejected: {}", e), None)
-                })?;
+                input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                 let mut a = vec!["query", "cypher", &input.query];
                 if let Some(db) = db { a.push("--db"); a.push(db); }
                 self.run_atree(&a)?
