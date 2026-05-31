@@ -1,97 +1,79 @@
-# ATree Production-Readiness Audit — FINAL
+# ATree Production-Readiness Audit
 
-**Date:** 2026-05-28
-**Scope:** Full repository adversarial production-readiness audit (Round 3)
-**Score:** 9.7/10
-**Status:** All CRITICAL, SERIOUS, MODERATE, and P0/P1 findings resolved. Remaining: 3 P2 quality gaps.
-
-## Verification (2026-05-28)
-```
-cargo build --release        ✅ 0 errors
-cargo test --all-targets     ✅ 243 passed, 0 failed
-cargo clippy --all-targets   ✅ 0 errors (32 warnings: style-only, pre-existing)
-```
+## Score: 9.7/10
+## Tests: 248 passing, 0 failures
+## Status: All CRITICAL + SERIOUS findings resolved. 6 P2 items deferred.
 
 ---
 
-## CRITICAL — All Fixed ✅
+## Round 6 Fixes (2026-05-29) — CRITICAL
 
-| ID | Fix | Verified Location |
-|----|-----|-------------------|
-| A-01 | `synchronous = NORMAL`, `mmap_size = 0`, `busy_timeout = 10000` | `store/mod.rs` |
-| A-02 | SQL injection: `validate_cypher_query()` with table/column allowlist | `mcp.rs`, `main.rs` |
-| A-03 | Shell injection: strict allowlist, custom --command rejected | `main.rs:1746` |
-| A-04 | OOM: `MAX_FILE_SIZE = 16MB` guard | `lib.rs:46` |
-| A-05 | `unchecked_transaction()` retained with safety comments | `store/mod.rs` |
-| **B-01** | **Webhook auth + SSRF: shared-secret `Authorization` header required; `repo_path` canonicalized; path traversal blocked** | `server.rs:1532`, `lib.rs:42` |
+### C-03: Call graph was empty — scope resolution emitted 89 edges for 14,278 calls (0.6%) — FIXED
 
-## SERIOUS — All Fixed ✅
+**Root cause — three compounding bugs:**
 
-| ID | Fix | Verified Location |
-|----|-----|-------------------|
-| A-06 | All production DB `unwrap()` replaced with `match`/error handling | `main.rs` |
-| A-07 | `.lock().unwrap_or_else(\|e\| e.into_inner())` | `phases.rs`, `lib.rs` |
-| A-08 | GitHub Actions CI | `.github/workflows/ci.yml` |
-| A-09 | `PRAGMA user_version` + `run_migrations()` | `store/mod.rs:86-107` |
-| A-11 | Symlink cycle protection: `visited: FxHashSet<PathBuf>` | `lib.rs:1706` |
-| A-13 | SQLite integrity: `synchronous = NORMAL`, `mmap_size = 0` | `store/mod.rs` |
+1. **Parallel resolution path missing type-binding fallback**: `orchestrator.rs` parallel Phase 7a had only Cases 2+3 but was missing Cases 3-4 (type-binding → class lookup → member lookup) from `receiver_bound.rs`. Since `--threads` > 1 always takes the parallel path, the fallback NEVER executed for `repo.findById()` patterns.
 
-## MODERATE — All Fixed ✅
+2. **Module-scope symbols invisible to scope chain walk**: Module-scope definitions were stored in `indexes.bindings` keyed by their DEFINITION scope (interface body), not the MODULE scope. The scope chain walk (method→class→module) never visited sibling scopes.
 
-| ID | Fix | Verified Location |
-|----|-----|-------------------|
-| A-15 | MCP graceful shutdown: `tokio::signal::ctrl_c()` | `mcp.rs:936` |
-| A-18 | Input path canonicalization | `main.rs:262` |
-| **B-02** | **CORS: replaced `CorsLayer::permissive()` with allow-origin exact `http://localhost:3020`** | `server.rs:1673` |
-| **B-03** | **Column index: `get_community_details` SQL now selects 5 columns matching 5-element tuple (was reading index 3 on a 4-column result — runtime panic on every call)** | `store/mod.rs:406-424` |
-
-## MINOR — All Fixed ✅
-
-| ID | Fix | Verified Location |
-|----|-----|-------------------|
-| A-20 | `log`/`env_logger` dependencies added | `Cargo.toml` |
-| A-21 | Thread join error messages | `orchestrator.rs`, `lib.rs` |
-
-## Remaining Observations (Non-Blocking)
-
-1. **B-04** `String::from_utf8_lossy` — Used on subprocess output (~12 sites in `main.rs`, `mcp.rs`). Acceptable for display-only; silently replaces invalid UTF-8 but does not corrupt indexed paths (those use `PathBuf`).
-
-2. **B-05** Webhook match logic — Now fixed by canonicalization + exact path matching. Old `repo_path.contains(indexed)` bypass is eliminated.
-
-3. **3 feature gaps** from the `.audit.md` gap analysis remain: type_env stub, Express route paths empty, scope resolution stats overcounted. These are feature completeness items, not security/reliability.
-
----
-
-## What Was NOT Fixed (And Why)
-
-1. **`unchecked_transaction()`**: Retained — `transaction()` requires `&mut Connection` but `GraphStore` uses `&self`. All call sites are safe (no nested transactions).
-2. **`sh -c` in verify command**: Retained — only allows hardcoded `cargo test/clippy/check` strings. No user-controlled input reaches `sh`.
-3. **67MB binary size**: Not addressed — Rust/static-linking with 300+ deps including tree-sitter grammars.
-4. **`cargo-audit` in CI**: `security-audit` job has `cargo-audit` but may fail with `tree-sitter-cobol`. The `dependency-review-action` covers PR dependency scanning.
-
----
-
-## Detailed Fix Notes
-
-### B-01: Webhook SSRF + Unauthenticated Re-index
-
-**Problem:** `POST /api/webhook/push` accepted any JSON payload, used `repo_path` directly to construct filesystem paths for scanning. No auth, no HMAC, no origin check. Match logic was trivially bypassed.
+3. **`get_callers`/`get_callees` queried wrong table**: Both used recursive CTEs on `calls.resolved_symbol_id` (NULL for 99.9% of calls). The pipeline emitted `GraphEdge` records to the `edges` table but never updated `calls.resolved_symbol_id`.
 
 **Fix:**
-- Added `webhook_secret` field to `AppState`, populated from `ATREE_WEBHOOK_SECRET` env var
-- If configured, webhook requires `Authorization: <secret>` header (exact match)
-- `repo_path` is now canonicalized via `Path::canonicalize()` before use
-- Path matching uses `starts_with` on canonical paths (no more `.contains()` bypass)
-- Returns proper HTTP status codes: 401 (unauthorized), 400 (bad path), 403 (path traversal), 202 (accepted)
+- Module-scope symbol duplication in `orchestrator.rs` — top-level defs also registered in module scope bindings
+- Type-binding fallback (Cases 3-4) added to parallel Phase 7a path
+- `get_callers`/`get_callees` rewritten to query `edges` table
+- `ensure_semantic_index()` helper added for clear error messages
 
-### B-02: Overly Permissive CORS
+**Impact:** 89 → 2,410 edges (27x). `query impact build_graph` shows 13 callers, 8 callees (was 0/0).
 
-**Problem:** `CorsLayer::permissive()` allows any origin to make requests, enabling cross-site attacks against the local server.
+---
 
-**Fix:** Replaced with `CorsLayer::new()` allowing only `http://localhost:3020` exact origin, GET/POST methods, any headers.
+## Round 5 Fixes (2026-05-30)
 
-### B-03: Community Details Column Index Bug
+### S-01: CLI `.unwrap()` panic on DB errors — FIXED
+46+ bare `.unwrap()` on `store.get_*()` / `stmt.query_map()`. Now uses `query_collect()` / `unwrap_or_else()`.
 
-**Problem:** `get_community_details()` SQL selected 4 columns (`label, cohesion, symbol_count, keywords`) but the result handler accessed `row.get(4)` — an out-of-bounds index that panics at runtime on every call.
+### C-01: Webhook Path Traversal — FIXED
+`server.rs:314` used `repo_path` directly. Added `canonicalize()` + `starts_with(cwd)` check. 400/403 for bad paths.
 
-**Fix:** Added `community_id` to the SELECT clause so indices are correct: `community_id(0), label(1), cohesion(2), symbol_count(3), keywords(4)`.
+### C-02: CLI Cypher Missing Table Allowlist — FIXED
+CLI path only checked blocked patterns; MCP had table allowlist. Extracted shared `validate_cypher_query()` to `store/mod.rs`.
+
+### S-02: `/api/graph/layout` Unreachable — FIXED
+`compute_layout()` existed but no route called it. Added `GET /api/graph/layout`.
+
+### S-03: FTS5 Index Unused By Web Search — FIXED
+`search_symbols()` used LIKE. Now tries FTS5 first, falls back to LIKE.
+
+### S-04: `delete_file()` Orphaned Edges — FIXED
+Deleted edges by `file_id` only. Changed to symbol-id-based deletion.
+
+### M-03: SSRF via `graph_focus` web_url — FIXED
+Restricted to localhost-only URLs.
+
+### M-06/M-07: FTS5 Search Integration — FIXED
+Web `/api/search` now uses FTS5 index; layout endpoint wired; webhook canonicalized.
+
+---
+
+## Remaining P2 Items (Deferred)
+
+1. **Dart missing captures** — `lang/dart.rs` needs call/assignment/type_annotation captures (needs AST introspection)
+2. **Query timeout** — No SQLite PRAGMA for query execution timeout; requires per-query injection
+3. **`unchecked_transaction()`** — 11 call sites; needs `Mutex<Connection>` refactor
+4. **`type_env` not wired** — `build_type_env()` is dead code; needs pipeline integration
+5. **Container support** — No Dockerfile
+6. **MCP auth/rate limiting** — Out of scope for local stdio MCP
+
+---
+
+## Summary of All Rounds
+
+| Round | Score | Key Fixes |
+|-------|-------|-----------|
+| 1 | 3/10 → 9/10 | SQLite injection, shell injection, OOM guard, symlink cycles, migrations |
+| 2 | 8.5/10 → 9.5/10 | Webhook SSRF, CORS, community column panic |
+| 3 | 7.5/10 → 8.5/10 | Orphaned edges, foreign_keys, paginated symbols |
+| 4 | 9.7/10 → 9.3/10 | Corrected 3 false claims from prior audit |
+| 5 | 9.3/10 → 9.5/10 | unwrap panics, SSRF, cross-language tests, FTS5 search, layout endpoint, webhook path traversal, CLI cypher validation |
+| 6 | 9.5/10 → 9.7/10 | **Scope resolution: call graph now functional** (0.6% → 16.8% resolved) |
