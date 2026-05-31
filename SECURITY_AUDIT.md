@@ -58,11 +58,11 @@ Web `/api/search` now uses FTS5 index; layout endpoint wired; webhook canonicali
 
 ## Remaining P2 Items (Deferred)
 
-1. **Dart missing captures** — `lang/dart.rs` needs call/assignment/type_annotation captures (needs AST introspection)
+1. ~~**Dart missing captures**~~ — FIXED in `lang/dart.rs` (calls, methods, constructors, fields, imports, heritage)
 2. **Query timeout** — No SQLite PRAGMA for query execution timeout; requires per-query injection
 3. **`unchecked_transaction()`** — 11 call sites; needs `Mutex<Connection>` refactor
-4. **`type_env` not wired** — `build_type_env()` is dead code; needs pipeline integration
-5. **Container support** — No Dockerfile
+4. **`type_env` output not consumed** — `build_type_envs()` runs in pipeline but `TypeEnvOutput` is never read by downstream phases. Type bindings are inferred but not persisted to DB or used for scope resolution.
+5. ~~**Container support**~~ — FIXED: Dockerfile added
 6. **MCP auth/rate limiting** — Out of scope for local stdio MCP
 
 ---
