@@ -6,57 +6,424 @@
     <title>ATree — Code Intelligence Graph</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
-        #canvas { width: 100vw; height: 100vh; display: block; }
-        #info { position: fixed; top: 16px; left: 16px; background: rgba(15, 23, 42, 0.9); border: 1px solid #334155; border-radius: 8px; padding: 16px; font-size: 13px; max-width: 320px; }
-        #info h1 { font-size: 16px; margin-bottom: 8px; color: #6366f1; }
-        #info .stat { color: #94a3b8; margin: 4px 0; }
-        #info .stat span { color: #e2e8f0; font-weight: 600; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; overflow: hidden; }
+        #canvas { width: 100vw; height: 100vh; display: block; cursor: grab; }
+        #canvas:active { cursor: grabbing; }
+
+        /* Top bar */
+        #topbar {
+            position: fixed; top: 0; left: 0; right: 0; height: 48px;
+            background: rgba(15, 23, 42, 0.95); border-bottom: 1px solid #1e293b;
+            display: flex; align-items: center; padding: 0 16px; gap: 12px;
+        }
+        #topbar h1 { font-size: 15px; font-weight: 600; color: #818cf8; }
+        #topbar .sep { width: 1px; height: 20px; background: #334155; }
+        #topbar input {
+            background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+            padding: 6px 10px; border-radius: 6px; font-size: 13px; width: 240px;
+        }
+        #topbar input:focus { outline: none; border-color: #6366f1; }
+        #topbar button {
+            background: #6366f1; color: #fff; border: none; padding: 6px 14px;
+            border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer;
+        }
+        #topbar button:hover { background: #4f46e5; }
+        #topbar button:disabled { background: #334155; cursor: not-allowed; }
+        #topbar .spacer { flex: 1; }
+        #topbar .status { font-size: 12px; color: #64748b; }
+
+        /* Side panel */
+        #sidebar {
+            position: fixed; top: 48px; right: 0; width: 300px; bottom: 0;
+            background: rgba(15, 23, 42, 0.95); border-left: 1px solid #1e293b;
+            overflow-y: auto; padding: 12px; font-size: 13px;
+        }
+        #sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; margin-bottom: 8px; }
+        #sidebar .stat { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #1e293b; }
+        #sidebar .stat .label { color: #94a3b8; }
+        #sidebar .stat .value { color: #e2e8f0; font-weight: 500; }
+        #sidebar .legend-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+        #sidebar .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+        /* Tooltip */
+        #tooltip {
+            position: fixed; background: rgba(15, 23, 42, 0.95); border: 1px solid #334155;
+            border-radius: 6px; padding: 8px 12px; font-size: 12px; pointer-events: none;
+            display: none; max-width: 300px; z-index: 100;
+        }
+        #tooltip .name { font-weight: 600; color: #e2e8f0; }
+        #tooltip .kind { color: #818cf8; font-size: 11px; }
+        .tooltip .file { color: #64748b; font-size: 11px; }
+
+        /* Loading overlay */
+        #loading {
+            position: fixed; top: 48px; left: 0; right: 300px; bottom: 0;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(15, 23, 42, 0.8); z-index: 50;
+        }
+        #loading .spinner {
+            width: 32px; height: 32px; border: 3px solid #334155;
+            border-top-color: #6366f1; border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Error banner */
+        #error-banner {
+            position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+            background: #7f1d1d; color: #fca5a5; padding: 8px 16px; border-radius: 6px;
+            font-size: 13px; display: none; z-index: 100;
+        }
     </style>
 </head>
 <body>
-    <canvas id="canvas"></canvas>
-    <div id="info">
-        <h1>ATree Code Intelligence</h1>
-        <div class="stat">Status: <span id="status">Connecting...</span></div>
-        <div class="stat">Nodes: <span id="nodes">0</span></div>
-        <div class="stat">Edges: <span id="edges">0</span></div>
+    <div id="topbar">
+        <h1>ATree</h1>
+        <div class="sep"></div>
+        <input type="text" id="search" placeholder="Search symbols..." />
+        <button id="search-btn" onclick="searchSymbols()">Search</button>
+        <div class="sep"></div>
+        <button onclick="loadGraph()">Load Graph</button>
+        <div class="sep"></div>
+        <select id="view-select" onchange="onViewChange()">
+            <option value="full">Full</option>
+            <option value="file">File</option>
+            <option value="module">Module</option>
+        </select>
+        <button onclick="loadOverview()">Overview</button>
+        <button onclick="resetView()">Reset</button>
+        <div class="spacer"></div>
+        <span class="status" id="status">Connecting...</span>
     </div>
+
+    <div id="error-banner"></div>
+    <div id="loading"><div class="spinner"></div></div>
+
+    <canvas id="canvas"></canvas>
+
+    <div id="sidebar">
+        <h2>Statistics</h2>
+        <div class="stat"><span class="label">Nodes</span><span class="value" id="stat-nodes">0</span></div>
+        <div class="stat"><span class="label">Edges</span><span class="value" id="stat-edges">0</span></div>
+        <div class="stat"><span class="label">Layout time</span><span class="value" id="stat-time">—</span></div>
+        <div class="stat"><span class="label">Zoom</span><span class="value" id="stat-zoom">100%</span></div>
+        <h2 style="margin-top: 16px;">Node Types</h2>
+        <div id="legend"></div>
+    </div>
+
+    <div id="tooltip">
+        <div class="name"></div>
+        <div class="kind"></div>
+        <div class="file"></div>
+    </div>
+
     <script>
+        // ── State ──
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
-        let scale = 1, offsetX = 0, offsetY = 0, dragging = false, lastX, lastY;
+        let scale = 1, offsetX = 0, offsetY = 0;
+        let nodes = [], edges = [];
+        let hovering = null;
+        let dragging = false, dragStartX, dragStartY;
 
-        function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; draw(); }
-        window.addEventListener('resize', resize); resize();
+        // ── Kind colors ──
+        const KIND_COLORS = {
+            DefinitionClass: '#6366f1', DefinitionInterface: '#8b5cf6',
+            DefinitionFunction: '#22c55e', DefinitionMethod: '#10b981',
+            DefinitionProperty: '#f59e0b', DefinitionStruct: '#3b82f6',
+            DefinitionEnum: '#ec4899', DefinitionTrait: '#14b8a6',
+            DefinitionModule: '#f97316', DefinitionConstructor: '#06b6d4',
+            CallName: '#64748b', default: '#475569',
+        };
 
-        canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
-        canvas.addEventListener('mouseup', () => dragging = false);
-        canvas.addEventListener('mousemove', e => { if (!dragging) return; offsetX += e.clientX - lastX; offsetY += e.clientY - lastY; lastX = e.clientX; lastY = e.clientY; draw(); });
-        canvas.addEventListener('wheel', e => { e.preventDefault(); scale *= e.deltaY > 0 ? 0.9 : 1.1; scale = Math.max(0.1, Math.min(10, scale)); draw(); });
+        function kindColor(kind) { return KIND_COLORS[kind] || KIND_COLORS.default; }
 
-        function draw() {
-            ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.save(); ctx.translate(offsetX, offsetY); ctx.scale(scale, scale);
-            // Draw placeholder
-            ctx.fillStyle = '#6366f1'; ctx.font = '24px sans-serif'; ctx.textAlign = 'center';
-            ctx.fillText('ATree Graph View', canvas.width / 2 / scale - offsetX / scale, canvas.height / 2 / scale - offsetY / scale);
-            ctx.fillStyle = '#94a3b8'; ctx.font = '14px sans-serif';
-            ctx.fillText('Index a repository with: atree --semantic --db .atree/index.sqlite --root .', canvas.width / 2 / scale - offsetX / scale, canvas.height / 2 / scale - offsetY / scale + 30);
-            ctx.restore();
+        // ── Canvas ──
+        function resize() {
+            canvas.width = window.innerWidth - 300;
+            canvas.height = window.innerHeight - 48;
+            draw();
         }
-        draw();
+        window.addEventListener('resize', resize);
+        resize();
 
-        // Health check
+        // ── Pan & zoom ──
+        canvas.addEventListener('mousedown', e => {
+            dragging = true;
+            dragStartX = e.clientX - offsetX;
+            dragStartY = e.clientY - offsetY;
+        });
+        canvas.addEventListener('mouseup', () => { dragging = false; });
+        canvas.addEventListener('mouseleave', () => { dragging = false; hideTooltip(); });
+        canvas.addEventListener('mousemove', e => {
+            if (dragging) {
+                offsetX = e.clientX - dragStartX;
+                offsetY = e.clientY - dragStartY;
+                draw();
+                return;
+            }
+            const rect = canvas.getBoundingClientRect();
+            const mx = (e.clientX - rect.left - offsetX) / scale;
+            const my = (e.clientY - rect.top - offsetY) / scale;
+            let found = null;
+            for (const n of nodes) {
+                const dx = mx - n.x, dy = my - n.y;
+                if (dx*dx + dy*dy < n.size*n.size) { found = n; break; }
+            }
+            if (found !== hovering) {
+                hovering = found;
+                if (found) showTooltip(e.clientX, e.clientY, found);
+                else hideTooltip();
+                draw();
+            } else if (found) {
+                moveTooltip(e.clientX, e.clientY);
+            }
+        });
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const factor = e.deltaY > 0 ? 0.9 : 1.1;
+            const mx = e.clientX - canvas.getBoundingClientRect().left;
+            const my = e.clientY - canvas.getBoundingClientRect().top;
+            offsetX = mx - (mx - offsetX) * factor;
+            offsetY = my - (my - offsetY) * factor;
+            scale = Math.max(0.05, Math.min(20, scale * factor));
+            draw();
+        });
+
+        // ── Tooltip ──
+        const tip = document.getElementById('tooltip');
+        function showTooltip(x, y, n) {
+            tip.querySelector('.name').textContent = n.label;
+            tip.querySelector('.kind').textContent = n.node_type;
+            tip.querySelector('.file').textContent = (n.file_path || '') + (n.line != null ? ':' + n.line : '');
+            tip.style.display = 'block';
+            moveTooltip(x, y);
+        }
+        function moveTooltip(x, y) {
+            tip.style.left = (x + 14) + 'px';
+            tip.style.top = (y + 14) + 'px';
+        }
+        function hideTooltip() { tip.style.display = 'none'; }
+
+        // ── Search ──
+        function searchSymbols() {
+            const q = document.getElementById('search').value.trim();
+            if (!q) return;
+            const url = '/api/search?q=' + encodeURIComponent(q) + '&limit=15';
+            fetch(url).then(r => r.json()).then(d => {
+                if (d.results.length === 0) { showError('No symbols found for "' + q + '"'); return; }
+                loadGraphForNode(d.results[0].id);
+            }).catch(() => showError('Search failed'));
+        }
+        document.getElementById('search').addEventListener('keydown', e => {
+            if (e.key === 'Enter') searchSymbols();
+        });
+
+        // ── View state ──
+        let currentView = 'full';
+        let graphInfo = null;
+
+        function onViewChange() {
+            currentView = document.getElementById('view-select').value;
+            if (graphInfo) renderGraph(graphInfo);
+        }
+
+        // ── Load graph ──
+        function loadGraph() {
+            showLoading(true);
+            const view = document.getElementById('view-select').value;
+            fetch('/api/graph/layout?limit=2000&scope=' + view)
+                .then(r => r.json())
+                .then(d => { graphInfo = d; renderGraph(d); })
+                .catch(() => showError('Failed to load graph'))
+                .finally(() => showLoading(false));
+        }
+
+        function loadOverview() {
+            showLoading(true);
+            fetch('/api/graph/overview')
+                .then(r => r.json())
+                .then(d => {
+                    // Update sidebar with overview info
+                    document.getElementById('stat-nodes').textContent = d.symbols;
+                    document.getElementById('stat-edges').textContent = d.edges;
+                    document.getElementById('stat-time').textContent = d.size_class;
+                    // Show recommendation
+                    if (d.recommendation) {
+                        showError(d.recommendation);
+                    }
+                    // Set view selector to default
+                    if (d.default_view) {
+                        document.getElementById('view-select').value = d.default_view;
+                        currentView = d.default_view;
+                    }
+                    // Auto-load graph with recommended view
+                    if (d.symbols > 0) {
+                        loadGraph();
+                    }
+                })
+                .catch(() => showError('Failed to load overview'))
+                .finally(() => showLoading(false));
+        }
+
+        function loadGraphForNode(nodeId) {
+            showLoading(true);
+            // Load semantic neighborhood around a specific node
+            fetch('/api/search/semantic?q=' + encodeURIComponent(nodeId.replace('sym:', '')) + '&depth=2&limit=200')
+                .then(r => r.json())
+                .then(d => {
+                    if (!d.layout || !d.layout.nodes || d.layout.nodes.length === 0) {
+                        // Fallback: load full graph
+                        return fetch('/api/graph/layout?limit=1000&scope=full')
+                            .then(r => r.json());
+                    }
+                    return d;
+                })
+                .then(renderGraph)
+                .catch(() => showError('Failed to load graph'))
+                .finally(() => showLoading(false));
+        }
+
+        function renderGraph(data) {
+            hideError();
+            const layout = data.layout;
+            if (!layout || !layout.nodes) { showError('No graph data available. Run a semantic index first.'); return; }
+
+            nodes = layout.nodes;
+            edges = (layout.edges || []).map(e => ({
+                source: nodes.find(n => n.id === e.source_id),
+                target: nodes.find(n => n.id === e.target_id),
+                confidence: e.confidence,
+            })).filter(e => e.source && e.target);
+
+            // Fit view to nodes
+            if (nodes.length > 0) {
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                for (const n of nodes) {
+                    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+                    minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+                }
+                const pad = 100;
+                const gw = maxX - minX + pad * 2, gh = maxY - minY + pad * 2;
+                const sx = (canvas.width - pad * 2) / gw, sy = (canvas.height - pad * 2) / gh;
+                scale = Math.min(sx, sy, 2) * 0.9;
+                offsetX = pad - minX * scale + (canvas.width - gw * scale) / 2;
+                offsetY = pad - minY * scale + (canvas.height - gh * scale) / 2;
+            }
+
+            // Update stats
+            document.getElementById('stat-nodes').textContent = nodes.length;
+            document.getElementById('stat-edges').textContent = edges.length;
+            document.getElementById('stat-time').textContent = (layout.stats ? layout.stats.elapsed_ms : 0) + 'ms';
+
+            // Build legend
+            const kinds = {};
+            for (const n of nodes) kinds[n.node_type] = (kinds[n.node_type] || 0) + 1;
+            const legend = document.getElementById('legend');
+            legend.innerHTML = Object.entries(kinds).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, c]) =>
+                '<div class="legend-item"><span class="legend-dot" style="background:' + kindColor(k) + '"></span>' + k + ' (' + c + ')</div>'
+            ).join('');
+
+            draw();
+        }
+
+        // ── Draw ──
+        function draw() {
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            if (nodes.length === 0) {
+                ctx.fillStyle = '#475569';
+                ctx.font = '16px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Load a graph to visualize', canvas.width / 2, canvas.height / 2);
+                ctx.font = '13px sans-serif';
+                ctx.fillText('Use: atree --semantic --db .atree/index.sqlite --root .', canvas.width / 2, canvas.height / 2 + 24);
+                return;
+            }
+
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+            ctx.scale(scale, scale);
+
+            // Draw edges
+            ctx.strokeStyle = '#1e293b';
+            ctx.lineWidth = 0.8;
+            for (const e of edges) {
+                ctx.globalAlpha = 0.3 + (e.confidence || 0.5) * 0.4;
+                ctx.beginPath();
+                ctx.moveTo(e.source.x, e.source.y);
+                ctx.lineTo(e.target.x, e.target.y);
+                ctx.stroke();
+            }
+            ctx.globalAlpha = 1;
+
+            // Draw nodes
+            for (const n of nodes) {
+                const r = n.size || 4;
+                const isHover = hovering === n;
+                ctx.fillStyle = kindColor(n.node_type);
+                if (isHover) {
+                    ctx.shadowColor = ctx.fillStyle;
+                    ctx.shadowBlur = 12;
+                }
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, r + (isHover ? 3 : 0), 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 0;
+
+                // Label on hover
+                if (isHover && scale > 0.3) {
+                    ctx.fillStyle = '#e2e8f0';
+                    ctx.font = '11px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(n.label, n.x, n.y - r - 6);
+                }
+            }
+
+            ctx.restore();
+
+            // Update zoom display
+            document.getElementById('stat-zoom').textContent = Math.round(scale * 100) + '%';
+        }
+
+        // ── UI helpers ──
+        function showLoading(on) { document.getElementById('loading').style.display = on ? 'flex' : 'none'; }
+        function showError(msg) {
+            const b = document.getElementById('error-banner');
+            b.textContent = msg; b.style.display = 'block';
+            setTimeout(() => b.style.display = 'none', 5000);
+        }
+        function hideError() { document.getElementById('error-banner').style.display = 'none'; }
+        function resetView() { scale = 1; offsetX = 0; offsetY = 0; draw(); }
+
+        // ── Health check ──
         fetch('/api/health').then(r => r.json()).then(d => {
-            document.getElementById('status').textContent = d.status === 'ok' ? 'Connected' : 'Error';
-            document.getElementById('status').style.color = d.status === 'ok' ? '#22c55e' : '#ef4444';
-        }).catch(() => { document.getElementById('status').textContent = 'No server'; });
+            const el = document.getElementById('status');
+            if (d.status === 'ok') {
+                el.textContent = 'Connected' + (d.has_index ? ' (indexed)' : ' (no index)');
+                el.style.color = '#22c55e';
+                if (d.has_index) loadOverview();
+            } else {
+                el.textContent = 'Error';
+                el.style.color = '#ef4444';
+            }
+        }).catch(() => {
+            document.getElementById('status').textContent = 'No server';
+            document.getElementById('status').style.color = '#ef4444';
+        });
 
-        // SSE for real-time events
+        // ── SSE for real-time events ──
         if (typeof EventSource !== 'undefined') {
             const es = new EventSource('/api/events');
-            es.onmessage = e => { try { const evt = JSON.parse(e.data); console.log('Graph event:', evt); } catch(_) {} };
+            es.onmessage = e => {
+                try {
+                    const evt = JSON.parse(e.data);
+                    if (evt.event_type === 'focus_node' && evt.node_ids && evt.node_ids.length > 0) {
+                        loadGraphForNode(evt.node_ids[0]);
+                    }
+                } catch(_) {}
+            };
         }
     </script>
 </body>

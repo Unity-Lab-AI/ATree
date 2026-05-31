@@ -9,8 +9,6 @@
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::thread;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -133,6 +131,7 @@ struct SimNode {
     vx: f64,
     vy: f64,
     mass: f64,
+    #[allow(dead_code)]
     community: Option<usize>,
 }
 
@@ -192,6 +191,7 @@ impl FastRng {
         (Self::next(&mut self.s) >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    #[allow(dead_code)]
     fn next_range(&mut self, min: f64, max: f64) -> f64 {
         min + self.next_f64() * (max - min)
     }
@@ -226,7 +226,7 @@ impl QuadTree {
             QuadTree::Empty => {
                 *self = QuadTree::Leaf { x: px, y: py, mass: new_mass, cx: px, cy: py };
             }
-            QuadTree::Leaf { x, y, mass: m, cx, cy } => {
+            QuadTree::Leaf { x: _x, y: _y, mass: m, cx, cy } => {
                 let old_mass = *m;
                 let old_x = *cx;
                 let old_y = *cy;
@@ -235,7 +235,6 @@ impl QuadTree {
                 *cy = (old_y * old_mass + py * new_mass) / *m;
 
                 // Subdivide
-                let half = size / 2.0;
                 let children: [Box<QuadTree>; 4] = [
                     Box::new(QuadTree::Empty),
                     Box::new(QuadTree::Empty),
@@ -503,7 +502,7 @@ fn compute_force_layout(
         config.threads.max(1)
     };
 
-    let (filtered_nodes, filtered_edges, _orig_to_dense) = filter_graph(nodes, edges, config);
+    let (filtered_nodes, _filtered_edges, _orig_to_dense) = filter_graph(nodes, edges, config);
 
     if filtered_nodes.is_empty() {
         return GraphLayout {
