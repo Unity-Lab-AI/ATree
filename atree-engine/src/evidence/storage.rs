@@ -73,7 +73,7 @@ impl<'a> EvidenceStore<'a> {
     /// Insert a batch of evidence in a single transaction.
     /// Skips duplicates (INSERT OR IGNORE).
     pub fn insert_batch(&self, evidence: &[Evidence]) -> rusqlite::Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::store::begin_transaction(&self.conn)?;
         let mut stmt = tx.prepare("
             INSERT OR IGNORE INTO evidence
             (id, kind, file, start_line, start_col, end_line, end_col, language,

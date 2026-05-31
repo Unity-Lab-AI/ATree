@@ -95,6 +95,18 @@ pub struct GraphStore {
     conn: Connection,
 }
 
+/// Begin a transaction on a raw Connection, returning an error instead of
+/// panicking if a transaction is already active. Use this instead of
+/// `conn.unchecked_transaction()` to avoid the maintenance trap of
+/// unchecked panics on nested calls.
+pub fn begin_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.unchecked_transaction()
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to begin transaction (possible nested call)");
+            e
+        })
+}
+
 impl GraphStore {
     /// Open or create a graph store at the given path.
     ///
@@ -134,9 +146,9 @@ impl GraphStore {
     }
 
     /// Begin a transaction, returning an error if one is already active.
-    /// This is a safe wrapper around `unchecked_transaction()` that avoids
-    /// panicking if called within an existing transaction.
-    fn begin_tx(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    /// Safe wrapper around `unchecked_transaction()` — logs and returns an error
+    /// instead of panicking on nested calls. Use this instead of `conn().unchecked_transaction()`.
+    pub fn begin_transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
         self.conn.unchecked_transaction()
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to begin transaction (possible nested call)");
@@ -1085,7 +1097,7 @@ impl GraphStore {
         repo_label: Option<&str>,
     ) -> rusqlite::Result<rustc_hash::FxHashMap<u64, i64>> {
         let _t0 = std::time::Instant::now();
-        let tx = self.begin_tx()?;
+        let tx = self.begin_transaction()?;
         let mut global_symbol_id_map: rustc_hash::FxHashMap<u64, i64> =
             rustc_hash::FxHashMap::default();
 
@@ -1254,7 +1266,7 @@ impl GraphStore {
         edges: &[crate::store::EdgeRecord],
     ) -> rusqlite::Result<usize> {
         let _t0 = std::time::Instant::now();
-        let tx = self.begin_tx()?;
+        let tx = self.begin_transaction()?;
         let mut stmt = tx.prepare(
             "INSERT INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
@@ -1390,7 +1402,7 @@ impl GraphStore {
     /// may reference this file's symbols but carry a different file_id.
     pub fn remove_file_data(&self, path: &str) -> rusqlite::Result<()> {
         if let Some(file) = self.get_file(path)? {
-            let tx = self.begin_tx()?;
+            let tx = self.begin_transaction()?;
             // Delete edges where THIS file's symbols are either source or destination.
             // The per-file file_id filter misses cross-file edges; the symbol-based
             // deletions catch all edges involving this file's symbols.
@@ -1435,7 +1447,7 @@ impl GraphStore {
 
     /// Delete a file and all its associated records.
     pub fn delete_file(&self, file_id: i64) -> rusqlite::Result<()> {
-        let tx = self.begin_tx()?;
+        let tx = self.begin_transaction()?;
         // Delete edges by symbol_id (not file_id) to catch cross-file edges.
         tx.execute("DELETE FROM edges WHERE src_id IN (SELECT id FROM symbols WHERE file_id = ?1) OR dst_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file_id])?;
         tx.execute("DELETE FROM calls WHERE file_id = ?1", [file_id])?;
@@ -2251,7 +2263,7 @@ impl GraphStore {
         routes: &[(i64, crate::routes::Route)], // (handler_symbol_id, route)
         file_ids_to_replace: &[i64],
     ) -> rusqlite::Result<usize> {
-        let tx = self.begin_tx()?;
+        let tx = self.begin_transaction()?;
         // Clear old routes for the files being re-indexed
         if !file_ids_to_replace.is_empty() {
             let placeholders = file_ids_to_replace.iter().map(|_| "?").collect::<Vec<_>>().join(",");
