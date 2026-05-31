@@ -822,47 +822,47 @@ impl SyntaxEngine {
         &self, node: Node, content: &str, node_kind: &str,
         var_name: &mut Option<String>, type_text: &mut Option<String>,
     ) {
+        // Kotlin tree-sitter uses positional children, not named fields.
+        // From AST: class_parameter → [binding_pattern_kind, simple_identifier, ":", user_type]
+        // From AST: parameter → [simple_identifier, ":", user_type]
+        // From AST: function_declaration → [simple_identifier, function_value_parameters, ":", nullable_type|user_type]
+        // From AST: property_declaration → [binding_pattern_kind, simple_identifier, ":", user_type]
+        let children: Vec<Node> = node.children(&mut node.walk()).collect();
         match node_kind {
-            // val x: Type = ...
-            "property_declaration" => {
-                *var_name = node.child_by_field_name("name")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string())
-                    .or_else(|| {
-                        let mut walker = node.walk();
-                        let mut found = None;
-                        let mut cur = walker.node();
-                        // Walk children looking for simple_identifier
-                        if walker.goto_first_child() {
-                            loop {
-                                if cur.kind() == "simple_identifier" {
-                                    found = Some(content[cur.start_byte()..cur.end_byte()].to_string());
-                                    break;
-                                }
-                                if !walker.goto_next_sibling() {
-                                    break;
-                                }
-                                cur = walker.node();
-                            }
+            "class_parameter" | "parameter" | "property_declaration" => {
+                // Name is the first simple_identifier child
+                *var_name = children.iter().find(|c| c.kind() == "simple_identifier")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                // Type is the user_type or nullable_type child
+                *type_text = children.iter().find(|c| c.kind() == "user_type" || c.kind() == "nullable_type")
+                    .map(|n| {
+                        // For nullable_type, extract the inner type_identifier
+                        if n.kind() == "nullable_type" {
+                            n.children(&mut n.walk())
+                                .find(|c| c.kind() == "type_identifier")
+                                .map(|c| content[c.start_byte()..c.end_byte()].to_string())
+                                .unwrap_or_else(|| content[n.start_byte()..n.end_byte()].to_string())
+                        } else {
+                            // user_type → type_identifier
+                            n.children(&mut n.walk())
+                                .find(|c| c.kind() == "type_identifier")
+                                .map(|c| content[c.start_byte()..c.end_byte()].to_string())
+                                .unwrap_or_else(|| content[n.start_byte()..n.end_byte()].to_string())
                         }
-                        found
                     });
-                *type_text = node.child_by_field_name( "type")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
-            }
-            // fun foo(param: Type): ReturnType
-            "parameter" => {
-                *var_name = node.child_by_field_name( "name")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
-                *type_text = node.child_by_field_name( "type")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
             }
             "function_declaration" => {
-                *var_name = node.children(&mut node.walk())
-                    .find(|c| c.kind() == "simple_identifier")
+                // Name is the first simple_identifier child
+                *var_name = children.iter().find(|c| c.kind() == "simple_identifier")
                     .map(|n| content[n.start_byte()..n.end_byte()].to_string());
-                *type_text = node.child_by_field_name( "return_type")
-                    .or_else(|| node.child_by_field_name( "type"))
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                // Return type is the nullable_type or user_type after function_value_parameters
+                *type_text = children.iter().find(|c| c.kind() == "nullable_type" || c.kind() == "user_type")
+                    .map(|n| {
+                        n.children(&mut n.walk())
+                            .find(|c| c.kind() == "type_identifier")
+                            .map(|c| content[c.start_byte()..c.end_byte()].to_string())
+                            .unwrap_or_else(|| content[n.start_byte()..n.end_byte()].to_string())
+                    });
             }
             _ => {}
         }
@@ -926,39 +926,34 @@ impl SyntaxEngine {
         &self, node: Node, content: &str, node_kind: &str,
         var_name: &mut Option<String>, type_text: &mut Option<String>,
     ) {
+        // Dart tree-sitter uses positional children, not named fields.
+        // From AST: class_parameter → [binding_pattern_kind, simple_identifier, ":", user_type]
+        // From AST: parameter → [simple_identifier, ":", user_type]
+        // From AST: initialized_variable_definition → [var, identifier, "=", expression]
+        // From AST: function_signature → [return_type?, simple_identifier, formal_parameter_list]
+        let children: Vec<Node> = node.children(&mut node.walk()).collect();
         match node_kind {
-            // var x: Type = ... or final x: Type
-            "declaration" | "constant_pattern" | "variable_pattern" => {
-                *var_name = node.child_by_field_name("name")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
-                *type_text = node.child_by_field_name("type")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
-            }
-            // function foo(param: Type): ReturnType
+            // Dart formal_parameter: [type, identifier]
             "formal_parameter" => {
                 *var_name = node.child_by_field_name("name")
-                    .map(|n| content[n.start_byte()..n.end_byte()].to_string())
-                    .or_else(|| {
-                        let mut walker = node.walk();
-                        if walker.goto_first_child() {
-                            loop {
-                                let cur = walker.node();
-                                if cur.kind() == "identifier" {
-                                    return Some(content[cur.start_byte()..cur.end_byte()].to_string());
-                                }
-                                if !walker.goto_next_sibling() { break; }
-                            }
-                        }
-                        None
-                    });
+                    .or_else(|| children.iter().find(|c| c.kind() == "identifier").copied())
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
                 *type_text = node.child_by_field_name("type")
                     .map(|n| content[n.start_byte()..n.end_byte()].to_string());
             }
-            // function signature: ReturnType foo(...)
+            // Dart function/method signature: return type is a named field
             "function_signature" | "method_signature" => {
                 *var_name = node.child_by_field_name("name")
                     .map(|n| content[n.start_byte()..n.end_byte()].to_string());
                 *type_text = node.child_by_field_name("return_type")
+                    .or_else(|| node.child_by_field_name("type"))
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+            }
+            // Dart class fields: declaration → initialized_identifier_list → initialized_identifier
+            "initialized_identifier" | "initialized_variable_definition" => {
+                *var_name = node.child_by_field_name("name")
+                    .map(|n| content[n.start_byte()..n.end_byte()].to_string());
+                *type_text = node.child_by_field_name("type")
                     .map(|n| content[n.start_byte()..n.end_byte()].to_string());
             }
             _ => {}

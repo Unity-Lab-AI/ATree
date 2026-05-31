@@ -21,6 +21,16 @@ impl LanguageProvider for KotlinProvider {
 (type_alias (type_identifier) @name) @definition.type
 (import_header (identifier) @import.source) @import
 (call_expression (simple_identifier) @call.name) @call
+
+;; ── Type annotations ──────────────────────────────────────────────────────
+;;   Class parameters:  class User(val id: Int)  →  class_parameter → user_type → type_identifier
+(class_parameter (user_type (type_identifier) @type_annotation)) @type_annotation
+;;   Function parameters:  fun findById(id: Int)  →  parameter → user_type → type_identifier
+(parameter (user_type (type_identifier) @type_annotation)) @type_annotation
+;;   Function return types (nullable):  fun findById(): User?  →  nullable_type → user_type → type_identifier
+(function_declaration (nullable_type (user_type (type_identifier) @type_annotation))) @type_annotation
+;;   Function return types:  fun render(): String  →  user_type → type_identifier
+(function_declaration (user_type (type_identifier) @type_annotation)) @type_annotation
 (call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.name))) @call
 (constructor_invocation (user_type (type_identifier) @call.name)) @call
 (infix_expression (simple_identifier) @call.name) @call
