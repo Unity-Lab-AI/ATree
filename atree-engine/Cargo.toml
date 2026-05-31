@@ -43,6 +43,7 @@ chrono.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+tracing.workspace = true
 
 # MCP server support (optional — only needed for AI agent integration)
 rmcp = { version = "1.7.0", features = ["server"], optional = true }

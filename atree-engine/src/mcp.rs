@@ -21,6 +21,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// Ensure validate_cypher_query is accessible within this module.
+use crate::store::validate_cypher_query;
+
 // =====================================================================
 // Tool Input Types
 // =====================================================================
@@ -423,7 +426,10 @@ impl ATreeMcpServer {
             "anim_duration_ms": input.anim_duration_ms,
         });
 
-        // POST to the web server
+        // Restrict to localhost to prevent SSRF.
+        if !web_url.starts_with("http://127.0.0.1:") && !web_url.starts_with("http://localhost:") && !web_url.starts_with("http://[::1]:") {
+            return Err(ErrorData::invalid_params("web_url must be a localhost address (e.g. http://localhost:3020)".to_string(), None));
+        }
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -583,9 +589,126 @@ impl ServerHandler for ATreeMcpServer {
         Ok(ListToolsResult { tools, next_cursor: None, meta: None })
     }
 
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
+        async move {
+            use rmcp::model::{Annotated, RawResource};
+            let resources = vec![
+                Annotated::new(
+                    RawResource::new(
+                        "atree://repo/processes",
+                        "Processes — all detected execution flows",
+                    ).with_description("List of execution flows (main functions, request handlers, background jobs) with step counts and entry points."),
+                    None,
+                ),
+                Annotated::new(
+                    RawResource::new(
+                        "atree://repo/clusters",
+                        "Clusters — community detection results",
+                    ).with_description("Symbol communities detected via label propagation, with cohesion scores and member counts."),
+                    None,
+                ),
+                Annotated::new(
+                    RawResource::new(
+                        "atree://repo/schema",
+                        "Schema — graph schema and statistics",
+                    ).with_description("Graph schema describing node types, edge types, and index statistics (files, symbols, edges, resolution rates)."),
+                    None,
+                ),
+            ];
+            Ok(rmcp::model::ListResourcesResult { resources, next_cursor: None, meta: None })
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+        async move {
+        let uri = request.uri.as_str();
+        match uri {
+            "atree://repo/processes" => {
+                let store = self.open_store()
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                let config = crate::process::ProcessConfig::default();
+                let result = crate::process::detect_processes(&store, &config)
+                    .map_err(|e| rmcp::ErrorData::internal_error(format!("Failed to detect processes: {}", e), None))?;
+                let content = serde_json::json!({
+                    "processes": result.processes.iter().map(|p| serde_json::json!({
+                        "id": p.id,
+                        "label": p.label,
+                        "type": p.process_type,
+                        "steps": p.step_count,
+                        "entry_point_id": p.entry_point_id,
+                    })).collect::<Vec<_>>(),
+                    "total": result.processes.len(),
+                });
+                Ok(rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
+                    serde_json::to_string_pretty(&content).unwrap_or_default(),
+                    uri.to_string(),
+                )]))
+            }
+            "atree://repo/clusters" => {
+                let store = self.open_store()
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                let mut clusters = Vec::new();
+                if let Ok(mut stmt) = store.conn().prepare(
+                    "SELECT community_id, label, symbol_count, cohesion, modularity FROM communities ORDER BY symbol_count DESC"
+                ) {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok(serde_json::json!({
+                            "id": row.get::<_, String>(0)?,
+                            "label": row.get::<_, String>(1)?,
+                            "symbol_count": row.get::<_, i64>(2)?,
+                            "cohesion": row.get::<_, f64>(3)?,
+                            "modularity": row.get::<_, f64>(4)?,
+                        }))
+                    }) {
+                        for row in rows { if let Ok(r) = row { clusters.push(r); } }
+                    }
+                }
+                let content = serde_json::json!({ "clusters": clusters, "total": clusters.len() });
+                Ok(rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
+                    serde_json::to_string_pretty(&content).unwrap_or_default(),
+                    uri.to_string(),
+                )]))
+            }
+            "atree://repo/schema" => {
+                let store = self.open_store()
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                let stats = store.stats()
+                    .map_err(|e| rmcp::ErrorData::internal_error(format!("Failed to load stats: {}", e), None))?;
+                let content = serde_json::json!({
+                    "files": stats.files,
+                    "symbols": stats.symbols,
+                    "scopes": stats.scopes,
+                    "imports": stats.imports,
+                    "calls": stats.calls,
+                    "edges": stats.edges,
+                    "node_kinds": store.get_symbol_kind_counts().unwrap_or_default(),
+                });
+                Ok(rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
+                    serde_json::to_string_pretty(&content).unwrap_or_default(),
+                    uri.to_string(),
+                )]))
+            }
+            _ => Err(rmcp::ErrorData::invalid_params(
+                format!("Unknown resource: {}", uri),
+                None,
+            )),
+        }}
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
-            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
         )
     }
 }
@@ -1117,72 +1240,4 @@ pub async fn run_mcp_server(
 // =====================================================================
 // SQL validation for cypher tool
 // =====================================================================
-
-/// Allowed tables and their permitted columns for cypher queries.
-const ALLOWED_TABLES: &[(&str, &[&str])] = &[
-    ("files", &["id", "path", "hash", "language", "mtime", "indexed_at", "repo_label"]),
-    ("symbols", &["id", "file_id", "name", "qualified_name", "kind", "line", "col", "is_exported", "scope_id", "owner_symbol_id"]),
-    ("scopes", &["id", "file_id", "parent_id", "owner_symbol_id", "kind", "line_start", "line_end"]),
-    ("imports", &["id", "file_id", "source", "imported_name", "local_name", "resolved_file_id", "confidence"]),
-    ("exports", &["id", "file_id", "exported_name", "symbol_id", "is_default"]),
-    ("heritage", &["id", "file_id", "child_symbol_id", "parent_symbol_id", "parent_name", "heritage_kind", "confidence", "line"]),
-    ("calls", &["id", "file_id", "caller_scope_id", "callee_name", "receiver", "resolved_symbol_id", "confidence", "line", "col"]),
-    ("edges", &["id", "src_id", "dst_id", "edge_kind", "confidence", "file_id", "line"]),
-];
-
-/// Validate a cypher query against the allowlist.
-///
-/// Rejects:
-/// - References to sqlite_master, sqlite_temp_master, pg_catalog, information_schema
-/// - PRAGMA statements
-/// - INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH
-/// - Semicolons (multi-statement injection)
-/// - Comments that could mask injected SQL
-/// - Tables/columns not in the allowlist
-fn validate_cypher_query(query: &str) -> Result<(), String> {
-    let lower = query.to_lowercase();
-
-    // Block dangerous keywords/patterns.
-    let blocked_patterns = [
-        "sqlite_master", "sqlite_temp_master", "pg_catalog", "information_schema",
-        "pragma", ";", "--", "/*", "*/",
-        "insert", "update", "delete", "drop", "alter", "create",
-        "attach", "detach", "replace",
-    ];
-    for pat in &blocked_patterns {
-        if lower.contains(pat) {
-            return Err(format!("Query contains forbidden pattern: '{}'", pat));
-        }
-    }
-
-    // Must start with SELECT or WITH.
-    let trimmed = lower.trim();
-    if !trimmed.starts_with("select") && !trimmed.starts_with("with") {
-        return Err("Only SELECT and WITH queries are allowed".to_string());
-    }
-
-    // Extract and validate all referenced table names.
-    let table_names: std::collections::HashSet<&str> = ALLOWED_TABLES.iter().map(|(t, _)| *t).collect();
-    // Simple word-boundary check: find any word that looks like a table name
-    // not in our allowlist but appears after FROM or JOIN.
-    for table_word in lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if table_word.is_empty() { continue; }
-        // Check if this word is a known SQL keyword we should skip.
-        let sql_keywords = ["select", "from", "where", "join", "left", "right", "inner",
-            "outer", "on", "and", "or", "not", "in", "is", "null", "as", "group",
-            "order", "by", "limit", "offset", "having", "union", "all", "distinct",
-            "case", "when", "then", "else", "end", "exists", "between", "like",
-            "count", "sum", "avg", "min", "max", "asc", "desc", "using",
-            "with", "recursive", "cast", "coalesce"];
-        if sql_keywords.contains(&table_word) { continue; }
-        // If it looks like an identifier (starts with letter), it should be in our allowlist.
-        if table_word.chars().next().map_or(false, |c| c.is_alphabetic())
-            && !table_names.contains(table_word)
-            && table_word.len() > 1
-        {
-            return Err(format!("Query references unknown table: '{}'", table_word));
-        }
-    }
-
-    Ok(())
-}
+// validate_cypher_query is re-exported from the crate root (lib.rs).

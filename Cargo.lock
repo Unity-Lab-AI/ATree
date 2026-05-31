@@ -180,6 +180,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "ureq",
 ]
 
@@ -206,6 +207,7 @@ dependencies = [
  "streaming-iterator",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "tree-sitter 0.26.8",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -244,6 +246,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+ "tracing",
  "uuid",
 ]
 

@@ -55,3 +55,12 @@ chrono = "0.4"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
