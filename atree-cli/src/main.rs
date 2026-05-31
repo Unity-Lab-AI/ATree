@@ -157,7 +157,7 @@ enum QueryCommand {
     /// Run impact analysis on a pattern (all evidence participating in the pattern)
     PatternImpact { pattern_id: String },
     /// Check constraints synthesized from evidence patterns
-    ConstraintCheck { symbol: Option<String> },
+    ConstraintCheck { #[allow(dead_code)] symbol: Option<String> },
     /// List active constraints with confidence scores
     ListConstraints { min_confidence: f64 },
 }
@@ -1054,6 +1054,43 @@ fn resolve_caps(args: &Args) -> (usize, usize, bool) {
 // Main
 // ---------------------------------------------------------------------
 
+/// Execute a prepared statement and collect rows, logging errors instead of panicking.
+fn query_collect<T, F>(stmt: &mut rusqlite::Statement, row_map: F) -> Vec<T>
+where
+    F: FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+{
+    match stmt.query_map([], row_map) {
+        Ok(iter) => iter.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Err(e) => { eprintln!("DB query error: {}", e); vec![] }
+    }
+}
+
+/// Like query_collect but with explicit query parameters.
+fn query_collect_params<T, F, P>(stmt: &mut rusqlite::Statement, params: P, row_map: F) -> Vec<T>
+where
+    F: FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+    P: rusqlite::Params,
+{
+    match stmt.query_map(params, row_map) {
+        Ok(iter) => iter.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        Err(e) => { eprintln!("DB query error: {}", e); vec![] }
+    }
+}
+
+/// Check whether the index has semantic call-graph data. If not, print a hint
+/// and exit. Callers use this before querying callers/callees/heritage.
+fn ensure_semantic_index(store: &atree_engine::store::GraphStore) {
+    let has_calls: bool = store.conn()
+        .query_row("SELECT EXISTS(SELECT 1 FROM calls LIMIT 1)", [], |r| r.get::<_, i64>(0))
+        .map(|n| n != 0)
+        .unwrap_or(false);
+    if !has_calls {
+        eprintln!("No call graph data. Run a semantic index first:");
+        eprintln!("  atree --semantic --db <path> --root <repo>");
+        std::process::exit(1);
+    }
+}
+
 /// Execute a query command against the code index.
 fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::ScanResult>) -> ! {
     use atree_engine::store::GraphStore;
@@ -1176,12 +1213,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 eprintln!("Symbol '{}' not found.", symbol);
                 std::process::exit(1);
             }
+            ensure_semantic_index(&store);
             for sym in &syms {
                 let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
                 let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
                 println!("Impact analysis for {} ({}:{}):", sym.name, fp, sym.line);
                 println!("  Upstream (callers, depth={}):", depth);
-                let callers = store.get_callers(sym.id, *depth).unwrap();
+                let callers = store.get_callers(sym.id, *depth).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 if callers.is_empty() {
                     println!("    (none)");
                 }
@@ -1189,7 +1227,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                     println!("    {}  [{:.2}]", name, conf);
                 }
                 println!("  Downstream (callees, depth={}):", depth);
-                let callees = store.get_callees(sym.id, *depth).unwrap();
+                let callees = store.get_callees(sym.id, *depth).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 if callees.is_empty() {
                     println!("    (none)");
                 }
@@ -1207,16 +1245,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  LEFT JOIN symbols s ON s.id = r.handler_symbol_id
                  ORDER BY r.file_path, r.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows: Vec<_> = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,  // method
-                    row.get::<_, String>(1)?,  // path
-                    row.get::<_, String>(2)?,  // file_path
-                    row.get::<_, i64>(3)?,     // line
-                    row.get::<_, String>(4)?,  // framework
-                    row.get::<_, String>(5)?,  // handler_name
-                ))
-            }).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            let rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            )));
             if rows.is_empty() {
                 println!("  (no routes found — run 'atree --semantic --db <path> --root <repo>' to detect routes)");
             } else {
@@ -1285,7 +1321,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             if repos.is_empty() {
                 println!("(no repos found — scan with --repo-label or use 'atree group scan')");
             } else {
-                let repo_stats = store.get_repo_stats().unwrap();
+                let repo_stats = store.get_repo_stats().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 println!("Repos in index:");
                 for (repo, files, symbols) in &repo_stats {
                     // Count public symbols per repo
@@ -1318,14 +1354,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 println!("File: {}:{}", fp, sym.line);
                 println!("Qualified: {}", sym.qualified_name);
                 println!();
-                let callers = store.get_callers(sym.id, 1).unwrap();
+                let callers = store.get_callers(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 println!("Callers:");
                 if callers.is_empty() { println!("  (none)"); }
                 for (_id, name, conf, _) in &callers {
                     println!("  {}  [{:.2}]", name, conf);
                 }
                 println!();
-                let callees = store.get_callees(sym.id, 1).unwrap();
+                let callees = store.get_callees(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 println!("Callees:");
                 if callees.is_empty() { println!("  (none)"); }
                 for (_id, name, conf, _) in &callees {
@@ -1354,14 +1390,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                             for f in &c {
                                 println!("  - {}", f);
                                 // Find indexed file record and its symbols
-                                if let Some(ff) = files.iter().find(|ff| ff.path == *f) {
-                                    let mut stmt = match conn.prepare("SELECT name, kind, line FROM symbols WHERE file_id = ?1") {
+                                if files.iter().any(|fr| fr.path == *f) {
+                                    let mut stmt = match conn.prepare("SELECT name, kind, line FROM symbols s JOIN files f ON f.id = s.file_id WHERE f.path = ?1") {
                                         Ok(s) => s,
                                         Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); }
                                     };
-                                    let rows: Vec<_> = stmt.query_map([ff.id], |row| Ok((
+                                    let rows: Vec<_> = query_collect_params(&mut stmt, [f.as_str()], |row| Ok((
                                         row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                                    ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+                                    )));
                                     for row in &rows {
                                         let (n, k, l) = row;
                                         println!("      {} {}:{}", k, n, l);
@@ -1392,7 +1428,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             let sym = &syms[0];
             let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
             let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
-            let _callers = store.get_callers(sym.id, 5).unwrap();
+            let _callers = store.get_callers(sym.id, 5).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Collect all file positions that need to be renamed
             // (file_id, line, column, old_name) tuples
@@ -1409,9 +1445,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  WHERE c.callee_name = ?1 OR c.resolved_symbol_id = ?2
                  ORDER BY f.path, c.line, c.col"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let call_sites: Vec<_> = stmt.query_map([symbol_name, &sym.id.to_string()], |row| Ok((
+            let call_sites: Vec<_> = query_collect_params(&mut stmt, [symbol_name, &sym.id.to_string()], |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             for (call_file, call_line, call_col) in &call_sites {
                 edits.push((call_file.clone(), *call_line as usize, *call_col as usize, symbol_name.clone()));
@@ -1529,23 +1565,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
         }
         QueryCommand::Cypher { query } => {
             let conn = store.conn();
-            // Validate against allowlist to prevent SQL injection.
-            let trimmed = query.trim().to_lowercase();
-            if !trimmed.starts_with("select") && !trimmed.starts_with("with") {
-                log::error!("Error: Only SELECT queries are allowed");
+            if let Err(e) = atree_engine::validate_cypher_query(&query) {
+                log::error!("Error: {}", e);
                 std::process::exit(1);
             }
-            // Block dangerous patterns.
-            let blocked = ["sqlite_master", "sqlite_temp_master", "pg_catalog", "information_schema",
-                "pragma", ";", "--", "/*", "*/", "insert", "update", "delete", "drop", "alter",
-                "create", "attach", "detach", "replace"];
-            for pat in &blocked {
-                if trimmed.contains(pat) {
-                    log::error!("Error: Query contains forbidden pattern: '{}'", pat);
-                    std::process::exit(1);
-                }
-            }
-            let mut stmt = match conn.prepare(query) {
+            let mut stmt = match conn.prepare(&query) {
                 Ok(s) => s,
                 Err(e) => { eprintln!("Query error: {}", e); std::process::exit(1); }
             };
@@ -1553,14 +1577,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             let col_names: Vec<String> = (0..col_count).map(|i| stmt.column_name(i).unwrap_or("?").to_string()).collect();
             println!("| {} |", col_names.join(" | "));
             println!("|{}|", col_names.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
-            let rows: Vec<Vec<String>> = match stmt.query_map([], |row| {
+            let rows: Vec<Vec<String>> = query_collect(&mut stmt, |row| {
                 let mut vals = Vec::new();
                 for i in 0..col_count { vals.push(format!("{:?}", row.get::<_, rusqlite::types::Value>(i)?)); }
                 Ok(vals)
-            }) {
-                Ok(r) => r.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
-                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
-            };
+            });
             let mut count = 0;
             for row in &rows { println!("| {} |", row.join(" | ")); count += 1; }
             println!("\n{} row(s)", count);
@@ -1587,10 +1608,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      ORDER BY caller_count DESC, callee_count DESC
                      LIMIT 50"
                 ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-                let rows: Vec<_> = stmt.query_map([], |row| Ok((
+                let rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                     row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
-                ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+                )));
                 if rows.is_empty() {
                     println!("  No route handlers found.");
                 } else {
@@ -1612,11 +1633,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  WHERE e.edge_kind IN ('HANDLES_ROUTE', 'ROUTE', 'HANDLES_TOOL', 'HANDLES_ENDPOINT')
                  ORDER BY s.file_path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let edge_rows: Vec<_> = stmt.query_map([], |row| Ok((
+            let edge_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             // Also find symbols that are tools/handlers/endpoints by their role in the call graph:
             // symbols that are called by route handlers or that call into I/O layers
             let mut stmt2 = match conn.prepare(
@@ -1636,11 +1657,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  )
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let io_rows: Vec<_> = stmt2.query_map([], |row| Ok((
+            let io_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             if edge_rows.is_empty() && io_rows.is_empty() {
                 println!("  No tool/handler/endpoint symbols found.");
@@ -1681,13 +1702,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             let fp = file_rec.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
 
             // Full upstream (callers at multiple depths)
-            let direct_callers = store.get_callers(sym.id, 1).unwrap();
-            let depth2_callers = store.get_callers(sym.id, 2).unwrap();
-            let depth3_callers = store.get_callers(sym.id, 3).unwrap();
+            let direct_callers = store.get_callers(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let depth2_callers = store.get_callers(sym.id, 2).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let depth3_callers = store.get_callers(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Downstream: what this API calls internally
-            let direct_callees = store.get_callees(sym.id, 1).unwrap();
-            let depth2_callees = store.get_callees(sym.id, 2).unwrap();
+            let direct_callees = store.get_callees(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let depth2_callees = store.get_callees(sym.id, 2).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Detect if this is a known route handler
             let conn = store.conn();
@@ -1789,7 +1810,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // find matching imports in other repos within the group.
             println!("Group sync for '{}' — rebuilding cross-repo contract links...", name);
             let conn = store.conn();
-            let repos = store.get_repos().unwrap();
+            let repos = store.get_repos().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if repos.is_empty() {
                 println!("  No repos found. Run 'atree group scan --repos name:path ...' first.");
                 std::process::exit(0);
@@ -1807,9 +1828,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  JOIN files f ON f.id = s.file_id
                  ORDER BY f.repo_label, e.exported_name"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let exports: Vec<(String, String, String, String, String)> = stmt.query_map([], |row| Ok((
+            let exports: Vec<(String, String, String, String, String)> = query_collect(&mut stmt, |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Get all imports across all repos
             let mut stmt2 = match conn.prepare(
@@ -1818,9 +1839,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  JOIN files f ON f.id = i.file_id
                  ORDER BY f.repo_label, i.imported_name"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let imports: Vec<(String, String, String, Option<i64>, String)> = stmt2.query_map([], |row| Ok((
+            let imports: Vec<(String, String, String, Option<i64>, String)> = query_collect(&mut stmt2, |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Match imports to exports across repos
             let mut cross_links = 0;
@@ -1867,12 +1888,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 eprintln!("Error: {}", e); std::process::exit(1);
             });
             if syms.is_empty() { eprintln!("Symbol '{}' not found.", symbol); std::process::exit(1); }
+            ensure_semantic_index(&store);
             let sym = &syms[0];
             let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
             let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
-            let callers = store.get_callers(sym.id, 3).unwrap();
-            let callees = store.get_callees(sym.id, 3).unwrap();
-            let heritage = store.get_heritage_by_child(sym.id).unwrap();
+            let callers = store.get_callers(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let callees = store.get_callees(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let heritage = store.get_heritage_by_child(sym.id).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             println!("═══ {} ═══", sym.name);
             println!("Kind: {}  |  File: {}:{}  |  Qualified: {}", sym.kind, fp, sym.line, sym.qualified_name);
             if sym.is_exported { println!("Visibility: exported"); }
@@ -1903,20 +1925,21 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.kind IN ('Function', 'Method', 'Class')
                  ORDER BY s.file_path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             println!("Entry points (exported symbols):");
             let mut count = 0;
             for row in &rows { let (n, k, f, l) = row; println!("  {}  {}  {}:{}", n, k, f, l); count += 1; }
             println!("  {} entry point(s)", count);
         }
         QueryCommand::TraceCallPath { from, to } => {
-            let from_syms = store.get_symbols_by_name(from).unwrap();
-            let to_syms = store.get_symbols_by_name(to).unwrap();
+            let from_syms = store.get_symbols_by_name(from).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let to_syms = store.get_symbols_by_name(to).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if from_syms.is_empty() { eprintln!("'{}' not found.", from); std::process::exit(1); }
             if to_syms.is_empty() { eprintln!("'{}' not found.", to); std::process::exit(1); }
+            ensure_semantic_index(&store);
             let to_id = to_syms[0].id;
             let to_name = &to_syms[0].name;
 
@@ -1933,7 +1956,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             while let Some((cur_id, path)) = queue.pop() {
                 if path.len() > max_depth { continue; }
-                let callees = store.get_callees(cur_id, 1).unwrap();
+                let callees = store.get_callees(cur_id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 for (callee_id, callee_name, conf, _) in &callees {
                     let mut new_path = path.clone();
                     new_path.push((callee_name.clone(), *conf));
@@ -1983,23 +2006,24 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                          WHERE s.is_exported = 1 ORDER BY s.file_path, s.line LIMIT 200".to_string(),
             };
             let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             let mut count = 0;
             for row in &rows { let (n, k, f, l) = row; println!("  {}  {}  {}:{}", n, k, f, l); count += 1; }
             println!("  {} public symbol(s)", count);
         }
         QueryCommand::AffectedTests { symbol } => {
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
+            ensure_semantic_index(&store);
             let sym = &syms[0];
             let conn = store.conn();
 
             // Strategy 1: Walk the call graph and find symbols that are tests by name
-            let _direct_callers = store.get_callers(sym.id, 1).unwrap();
-            let deep_callers = store.get_callers(sym.id, 5).unwrap();
+            let _direct_callers = store.get_callers(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let deep_callers = store.get_callers(sym.id, 5).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Strategy 2: SQL query — find all test-like symbols that transitively call this symbol
             // via the calls table, regardless of file path
@@ -2017,10 +2041,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  )
                  ORDER BY s.file_path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let sql_tests: Vec<_> = stmt.query_map([sym.id], |row| Ok((
+            let sql_tests: Vec<_> = query_collect_params(&mut stmt, [sym.id], |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Strategy 3: Find test files (path-based) that contain callers
             let mut test_by_path: Vec<(String, String, f64, String)> = Vec::new();
@@ -2055,7 +2079,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Strategy 4: Find test runner invocations — symbols that call test frameworks
             let mut test_runners: Vec<String> = Vec::new();
             for (caller_id, caller_name, _, _) in &deep_callers {
-                let callees = store.get_callees(*caller_id, 1).unwrap();
+                let callees = store.get_callees(*caller_id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 for (_, callee_name, _, _) in &callees {
                     if callee_name.contains("test") || callee_name.contains("expect") || callee_name.contains("assert")
                         || callee_name.contains("describe") || callee_name.contains("it(") || callee_name.contains("jest")
@@ -2120,14 +2144,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::ValidationPlan { symbol } => {
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
             let sym = &syms[0];
             let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
             let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
-            let callers = store.get_callers(sym.id, 3).unwrap();
-            let callees = store.get_callees(sym.id, 3).unwrap();
-            let heritage = store.get_heritage_by_child(sym.id).unwrap();
+            let callers = store.get_callers(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let callees = store.get_callees(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let heritage = store.get_heritage_by_child(sym.id).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Risk assessment
             let total_risk_score = callers.len() * 3 + callees.len() + heritage.len() * 2;
@@ -2213,7 +2237,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
         }
         QueryCommand::ContractChangeDetector { base_ref } => {
             let conn = store.conn();
-            let files = store.get_all_files().unwrap();
+            let files = store.get_all_files().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if files.is_empty() {
                 println!("No indexed files. Run 'atree --semantic --db <path> --root <repo>' first.");
                 std::process::exit(0);
@@ -2225,9 +2249,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  FROM symbols s WHERE s.is_exported = 1
                  ORDER BY s.qualified_name"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let current_public: Vec<(String, String, String, String, i64)> = stmt.query_map([], |row| Ok((
+            let current_public: Vec<(String, String, String, String, i64)> = query_collect(&mut stmt, |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             if let Some(base) = base_ref {
                 // Compare current public API against git base ref
@@ -2357,11 +2381,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY f1.repo_label, f2.repo_label
                  LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let cross_repo: Vec<_> = stmt.query_map([], |row| Ok((
+            let cross_repo: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Strategy 2: Cross-module boundary violations within a repo
             // Detect calls between different top-level directories (module boundaries)
@@ -2381,10 +2405,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY s1.file_path, s2.file_path
                  LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let cross_module: Vec<_> = stmt2.query_map([], |row| Ok((
+            let cross_module: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
 
 
@@ -2403,10 +2427,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY f1.file_path
                  LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let cross_import: Vec<_> = stmt3.query_map([], |row| Ok((
+            let cross_import: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             let total = cross_repo.len() + cross_module.len() + cross_import.len();
 
@@ -2459,17 +2483,17 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.kind IN ('Function', 'Method', 'Class')
                  ORDER BY s.file_path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows: Vec<_> = stmt.query_map([], |row| Ok((
+            let rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             let mut violations: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
             // (name, file, line, kind, caller_name, caller_file, violation_type)
 
             for (name, file, line, kind) in &rows {
-                let syms = store.get_symbols_by_name(name).unwrap();
+                let syms = store.get_symbols_by_name(name).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 for sym in &syms {
-                    let callers = store.get_callers(sym.id, 1).unwrap();
+                    let callers = store.get_callers(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                     for (_id, caller_name, _, caller_file_id) in &callers {
                         let caller_file = store.get_file_by_id(*caller_file_id).unwrap_or(None);
                         if let Some(ref cf) = caller_file {
@@ -2506,10 +2530,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.kind IN ('Function', 'Method', 'Class')
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let naming_violations: Vec<_> = stmt2.query_map([], |row| Ok((
+            let naming_violations: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
 
 
@@ -2534,10 +2558,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.is_exported = 1
                  ORDER BY s.file_path, s.line LIMIT 25"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let private_imports: Vec<_> = stmt3.query_map([], |row| Ok((
+            let private_imports: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
 
 
@@ -2607,11 +2631,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.kind IN ('Const', 'Variable', 'Static', 'Function', 'Struct', 'Class')
                  ORDER BY s.file_path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let keyword_rows: Vec<_> = stmt.query_map([], |row| Ok((
+            let keyword_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             // Strategy 2: Detect environment variable access patterns via calls table
             let mut stmt2 = match conn.prepare(
                 "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'env_access' as detection_method
@@ -2627,11 +2651,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  )
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let env_rows: Vec<_> = stmt2.query_map([], |row| Ok((
+            let env_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Strategy 3: Detect config file readers
             let mut stmt3 = match conn.prepare(
@@ -2648,11 +2672,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.name NOT LIKE '%test%' AND s.name NOT LIKE '%Test%'
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let reader_rows: Vec<_> = stmt3.query_map([], |row| Ok((
+            let reader_rows: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Deduplicate
             let mut seen = std::collections::HashSet::new();
@@ -2675,15 +2699,16 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::ImpactBySymbolKind { target, kind, direction } => {
-            let syms = store.get_symbols_by_name(&target).unwrap();
+            let syms = store.get_symbols_by_name(&target).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", target); std::process::exit(1); }
+            ensure_semantic_index(&store);
             let sym = &syms[0];
             println!("Impact for '{}' (kind filter: {}, direction: {})", target, kind, direction);
             if direction == "upstream" || direction == "both" {
-                let callers = store.get_callers(sym.id, 3).unwrap();
+                let callers = store.get_callers(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 println!("  Upstream (callers):");
                 for (_id, n, conf, _) in &callers {
-                    let caller_syms = store.get_symbols_by_name(n).unwrap();
+                    let caller_syms = store.get_symbols_by_name(n).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                     let matches = caller_syms.iter().any(|s| s.kind.to_lowercase().contains(&kind.to_lowercase()));
                     if matches || kind == "*" {
                         println!("    {} [{:.2}]", n, conf);
@@ -2691,10 +2716,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 }
             }
             if direction == "downstream" || direction == "both" {
-                let callees = store.get_callees(sym.id, 3).unwrap();
+                let callees = store.get_callees(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 println!("  Downstream (callees):");
                 for (_id, n, conf, _) in &callees {
-                    let callee_syms = store.get_symbols_by_name(n).unwrap();
+                    let callee_syms = store.get_symbols_by_name(n).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                     let matches = callee_syms.iter().any(|s| s.kind.to_lowercase().contains(&kind.to_lowercase()));
                     if matches || kind == "*" {
                         println!("    {} [{:.2}]", n, conf);
@@ -2708,7 +2733,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // symbol, what callers are affected (blast radius).
             println!("Semantic diff summary{}:",
                 base_ref.as_ref().map(|b| format!(" (vs {})", b)).unwrap_or_default());
-            let files = store.get_all_files().unwrap();
+            let files = store.get_all_files().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if files.is_empty() { println!("  No indexed files."); std::process::exit(0); }
             let repo_path = std::path::Path::new(&files[0].path).parent().map(|p| p.to_path_buf());
             if let Some(path) = repo_path {
@@ -2741,13 +2766,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                             let file_records: Vec<_> = files.iter().filter(|ff| ff.path == *f).collect();
                             for fs in &file_records {
                                 let mut stmt = match conn.prepare("SELECT id, name, kind, line FROM symbols WHERE file_id = ?1") { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-                                let syms: Vec<_> = stmt.query_map([fs.id], |row| Ok((
+                                let syms: Vec<_> = query_collect_params(&mut stmt, [fs.id], |row| Ok((
                                     row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
                                     row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
-                                ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+                                )));
 
                                 for (sym_id, name, kind, line) in &syms {
-                                    let callers = store.get_callers(*sym_id, 3).unwrap();
+                                    let callers = store.get_callers(*sym_id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                                     let caller_names: Vec<String> = callers.iter().map(|(_, n, _, _)| n.clone()).collect();
                                     let impact = callers.len();
                                     total_affected_callers += impact;
@@ -2790,11 +2815,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::SideEffectScanner { symbol } => {
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
             let sym = &syms[0];
-            let direct_callees = store.get_callees(sym.id, 1).unwrap();
-            let deep_callees = store.get_callees(sym.id, 3).unwrap();
+            let direct_callees = store.get_callees(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let deep_callees = store.get_callees(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Comprehensive I/O side effect categories
             let io_effects = [
@@ -2846,7 +2871,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                         // Find which direct callee leads to this
                         let via = direct_callees.iter()
                             .filter(|(dcid, _, _, _)| {
-                                let dc_callees = store.get_callees(*dcid, 1).unwrap();
+                                let dc_callees = store.get_callees(*dcid, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                                 dc_callees.iter().any(|(ccid, _, _, _)| ccid == id)
                             })
                             .map(|(_, dcname, _, _)| dcname.clone())
@@ -2893,19 +2918,20 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
         }
         QueryCommand::ChangeCoupling { symbol } => {
             println!("Change coupling for '{}':", symbol);
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
             let sym = &syms[0];
-            let files = store.get_all_files().unwrap();
+            ensure_semantic_index(&store);
+            let files = store.get_all_files().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if files.is_empty() { println!("  No indexed files."); std::process::exit(0); }
 
             // Strategy 1: Static coupling — symbols that share callers (existing logic, expanded)
-            let callers = store.get_callers(sym.id, 3).unwrap();
+            let callers = store.get_callers(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             let mut static_coupled = std::collections::HashSet::new();
             for (_id, caller_name, _, _caller_file_id) in &callers {
-                let caller_syms = store.get_symbols_by_name(caller_name).unwrap();
+                let caller_syms = store.get_symbols_by_name(caller_name).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 for cs in &caller_syms {
-                    let cs_callees = store.get_callees(cs.id, 2).unwrap();
+                    let cs_callees = store.get_callees(cs.id, 2).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                     for (_id2, callee_name, _, _) in &cs_callees {
                         if callee_name != symbol { static_coupled.insert(callee_name.clone()); }
                     }
@@ -2966,8 +2992,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                         for cfr in &coupled_file_records {
                             let conn = store.conn();
                             let mut stmt = match conn.prepare("SELECT name FROM symbols WHERE file_id = ?1 LIMIT 10") { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-                            let rows: Vec<_> = stmt.query_map([cfr.id], |row| Ok(row.get::<_, String>(0)?))
-                                .unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+                            let rows: Vec<_> = query_collect_params(&mut stmt, [cfr.id], |row| Ok(row.get::<_, String>(0)?));
                             for row in &rows {
                                 if row != symbol { git_symbol_coupled.insert(row.clone()); }
                             }
@@ -3034,11 +3059,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                         OR s.name LIKE '%worker%' OR s.name LIKE '%pool%' OR s.name LIKE '%queue%')
                  ORDER BY s.file_path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let keyword_rows: Vec<_> = stmt.query_map([], |row| Ok((
+            let keyword_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Strategy 2: Detect async functions
             let mut stmt2 = match conn.prepare(
@@ -3051,11 +3076,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                     OR c.callee_name IN ('block_on', 'spawn_blocking', 'yield_now', 'sleep', 'timeout')
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let async_rows: Vec<_> = stmt2.query_map([], |row| Ok((
+            let async_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Strategy 3: Detect shared-state patterns
             let mut stmt3 = match conn.prepare(
@@ -3066,11 +3091,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      'lock', 'read', 'write', 'try_lock', 'get_mut')
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let shared_rows: Vec<_> = stmt3.query_map([], |row| Ok((
+            let shared_rows: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // Deduplicate
             let mut seen = std::collections::HashSet::new();
@@ -3095,11 +3120,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::MinimalEditScope { symbol } => {
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
             let sym = &syms[0];
-            let callers = store.get_callers(sym.id, 1).unwrap();
-            let callees = store.get_callees(sym.id, 1).unwrap();
+            let callers = store.get_callers(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let callees = store.get_callees(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             println!("Minimal edit scope for '{}':", symbol);
             println!("  Definition: {}:{}", sym.file_id, sym.line);
             println!("  Direct callers ({}):", callers.len());
@@ -3113,7 +3138,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             println!("Locating code related to: {}", issue);
             // Search for symbols matching keywords from the issue
             let config = atree_engine::search::SearchConfig { limit: 20, ..Default::default() };
-            let results = atree_engine::search::search(&store, &issue, &config).unwrap();
+            let results = atree_engine::search::search(&store, &issue, &config).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if results.is_empty() {
                 println!("  No matching symbols found. Try different keywords.");
             } else {
@@ -3126,7 +3151,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
         QueryCommand::DocsDriftDetector => {
             println!("Documentation drift detection:");
             let conn = store.conn();
-            let files = store.get_all_files().unwrap();
+            let files = store.get_all_files().unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if files.is_empty() {
                 println!("  No indexed files.");
                 std::process::exit(0);
@@ -3138,9 +3163,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  FROM symbols s WHERE s.is_exported = 1
                  ORDER BY s.file_path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let exported: Vec<(String, String, String, String, i64, i64)> = stmt.query_map([], |row| Ok((
+            let exported: Vec<(String, String, String, String, i64, i64)> = query_collect(&mut stmt, |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // For each exported symbol, check if its file has uncommitted changes
             // and whether the symbol's signature has changed (heuristic: check if
@@ -3212,11 +3237,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             println!("  {} symbols appear up-to-date", up_to_date.len() - undocumented_candidates.len());
         }
         QueryCommand::RenameSafetyCheck { symbol_name, new_name } => {
-            let syms = store.get_symbols_by_name(&symbol_name).unwrap();
+            let syms = store.get_symbols_by_name(&symbol_name).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol_name); std::process::exit(1); }
             let sym = &syms[0];
-            let callers = store.get_callers(sym.id, 5).unwrap();
-            let callees = store.get_callees(sym.id, 5).unwrap();
+            let callers = store.get_callers(sym.id, 5).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let callees = store.get_callees(sym.id, 5).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             let total_refs = callers.len() + callees.len();
             let risk = match total_refs {
                 0 => "SAFE (no references)",
@@ -3233,7 +3258,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 for (_id, n, _, _) in &callees { println!("    callee: {}", n); }
             }
             // Check for name collisions
-            let existing = store.get_symbols_by_name(new_name).unwrap();
+            let existing = store.get_symbols_by_name(new_name).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if !existing.is_empty() {
                 println!("  ⚠ WARNING: '{}' already exists!", new_name);
                 for e in &existing { println!("    {}  {}:{}", e.kind, e.file_id, e.line); }
@@ -3250,10 +3275,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  AND s.id NOT IN (SELECT DISTINCT resolved_symbol_id FROM calls WHERE resolved_symbol_id IS NOT NULL)
                  ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             let mut count = 0;
             for row in &rows { let (n, k, f, l) = row; println!("  {}  {}  {}:{}", n, k, f, l); count += 1; }
             if count == 0 { println!("  No dead code candidates found."); }
@@ -3271,17 +3296,17 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY ref_count DESC
                  LIMIT 20"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             for row in &rows {
                 let (n, k, f, l, c) = row; println!("  {:<30} {:<12} {:<8} {}:{}", n, k, c, f, l);
             }
         }
         QueryCommand::ErrorPathTrace { symbol } => {
             println!("Error path trace for '{}':", symbol);
-            let syms = store.get_symbols_by_name(symbol).unwrap();
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", symbol); std::process::exit(1); }
             let sym = &syms[0];
 
@@ -3301,7 +3326,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             while let Some((cur_id, _cur_name, depth, path)) = queue.pop() {
                 if depth > max_depth || !visited.insert(cur_id) { continue; }
-                let callees = store.get_callees(cur_id, 1).unwrap();
+                let callees = store.get_callees(cur_id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
                 for (callee_id, callee_name, _conf, _) in &callees {
                     let lower = callee_name.to_lowercase();
 
@@ -3404,14 +3429,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             }
         }
         QueryCommand::ResourceLifecycleMap { resource } => {
-            let syms = store.get_symbols_by_name(&resource).unwrap();
+            let syms = store.get_symbols_by_name(&resource).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
             if syms.is_empty() { eprintln!("'{}' not found.", resource); std::process::exit(1); }
             let sym = &syms[0];
             let file = store.get_file_by_id(sym.file_id).unwrap_or(None);
             let fp = file.as_ref().map(|f| f.path.as_str()).unwrap_or("?");
 
-            let direct_callees = store.get_callees(sym.id, 1).unwrap();
-            let deep_callees = store.get_callees(sym.id, 3).unwrap();
+            let direct_callees = store.get_callees(sym.id, 1).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
+            let deep_callees = store.get_callees(sym.id, 3).unwrap_or_else(|e| { eprintln!("DB error: {}", e); std::process::exit(1); });
 
             // Lifecycle phase categories
             let creation = ["new", "init", "create", "open", "acquire", "connect", "build", "start", "setup", "begin", "alloc", "allocate"];
@@ -3534,8 +3559,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  JOIN symbols s2 ON s2.id = c1.resolved_symbol_id
                  LIMIT 20"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows: Vec<_> = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap_or_else(|e| { log::error!("Query failed: {}", e); std::process::exit(1); }).collect();            let mut found = false;
-            for row in rows { let (a, b) = match row { Ok(r) => r, Err(e) => { log::warn!("Row parse error: {}", e); continue; } }; println!("  {} ↔ {} (cycle)", a, b); found = true; }
+            let rows: Vec<_> = query_collect(&mut stmt, |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)));
+            let mut found = false;
+            for row in rows { let (a, b) = row; println!("  {} ↔ {} (cycle)", a, b); found = true; }
             if !found { println!("  No 2-hop cycles detected."); }
         }
         QueryCommand::ResolutionStats => {
@@ -3575,9 +3601,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  GROUP BY f.language
                  ORDER BY total DESC"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let call_by_lang: Vec<(String, i64, i64)> = stmt.query_map([], |row| Ok((
+            let call_by_lang: Vec<(String, i64, i64)> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             // ── Import resolution per language ──
             let mut stmt2 = match conn.prepare(
                 "SELECT f.language,
@@ -3588,9 +3614,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  GROUP BY f.language
                  ORDER BY total DESC"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let import_by_lang: Vec<(String, i64, i64)> = stmt2.query_map([], |row| Ok((
+            let import_by_lang: Vec<(String, i64, i64)> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // ── Top unresolved call patterns (callee_name) ──
             let mut stmt3 = match conn.prepare(
@@ -3601,9 +3627,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY count DESC
                  LIMIT 20"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let unresolved_call_patterns: Vec<(String, i64)> = stmt3.query_map([], |row| Ok((
+            let unresolved_call_patterns: Vec<(String, i64)> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // ── Top unresolved import patterns (source) ──
             let mut stmt4 = match conn.prepare(
@@ -3614,9 +3640,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY count DESC
                  LIMIT 20"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let unresolved_import_patterns: Vec<(String, i64)> = stmt4.query_map([], |row| Ok((
+            let unresolved_import_patterns: Vec<(String, i64)> = query_collect(&mut stmt4, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // ── Confidence distribution for resolved calls ──
             let mut stmt5 = match conn.prepare(
@@ -3648,10 +3674,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  ORDER BY unresolved_out DESC
                  LIMIT 15"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let worst_symbols: Vec<(String, String, String, i64, i64)> = stmt6.query_map([], |row| Ok((
+            let worst_symbols: Vec<(String, String, String, i64, i64)> = query_collect(&mut stmt6, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
 
             // ═══════════════════════════════════════════════════════════════
             // Output
@@ -3768,10 +3794,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                  )
                  ORDER BY s.file_path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
-            let rows = stmt.query_map([], |row| Ok((
+            let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
-            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap_or_default();
+            )));
             let mut count = 0;
             for row in &rows { let (n, k, f, l) = row; println!("  {}  {}  {}:{}", n, k, f, l); count += 1; }
             if count == 0 { println!("  All non-exported symbols have callers."); }
@@ -4219,6 +4245,8 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 }
 
 fn main() {
+    env_logger::init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "atree CLI starting");
     let args = parse_args();
 
     // Handle MCP server mode — start the MCP server instead of scanning/querying.
