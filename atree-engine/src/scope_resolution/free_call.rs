@@ -71,6 +71,11 @@ pub fn emit_free_call_fallback(
 
         let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
 
+        // Skip if already resolved by a higher-priority phase (ref_resolver or receiver_bound).
+        if resolved_sites.contains(&site_key) {
+            continue;
+        }
+
         // Constructor form: new X(...)
         let target_def = if site.is_constructor {
             find_class_binding_in_scope(indexes, site.in_scope, &site.name)

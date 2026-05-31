@@ -174,7 +174,10 @@ pub fn find_evidence_paths(
     };
     let seeds = match hybrid_search(store, query, &search_config) {
         Ok(hits) => hits,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(query = %query, error = %e, "Evidence seed search failed");
+            return Vec::new();
+        }
     };
 
     if seeds.is_empty() {

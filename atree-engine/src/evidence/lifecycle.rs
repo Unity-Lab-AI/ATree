@@ -184,7 +184,7 @@ impl EvidenceLifecycle {
     pub fn enrich(
         &mut self,
         symbol_id_map: &rustc_hash::FxHashMap<u64, i64>,
-        file_id_map: &rustc_hash::FxHashMap<u64, i64>,
+        _file_id_map: &rustc_hash::FxHashMap<u64, i64>,
     ) -> usize {
         let mut count = 0;
         let ids: Vec<EvidenceId> = self.evidence.keys().cloned().collect();

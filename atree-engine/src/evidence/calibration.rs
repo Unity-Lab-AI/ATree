@@ -11,7 +11,7 @@
 //! - Unresolved symbols: decay by 0.3–0.5
 //! - Downstream confidence ≤ upstream confidence (I3)
 
-use crate::evidence::{Evidence, EvidenceKind, EvidenceMetadata};
+use crate::evidence::Evidence;
 
 /// Configuration for confidence calibration.
 #[derive(Debug, Clone)]

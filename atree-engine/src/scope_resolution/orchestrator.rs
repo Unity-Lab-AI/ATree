@@ -296,6 +296,38 @@ fn build_indexes_single(parsed_files: &[ParsedFile]) -> ScopeResolutionIndexes {
                     .or_default()
                     .push(binding);
             }
+            // ALSO add module-scope symbols to the module scope's bindings so they're
+            // findable via scope chain walk (they may be scoped to a nested definition
+            // scope like an interface body, which is not on the method→class→module chain).
+            if matches!(sym.kind,
+                crate::lang::CaptureTag::DefinitionClass |
+                crate::lang::CaptureTag::DefinitionInterface |
+                crate::lang::CaptureTag::DefinitionStruct |
+                crate::lang::CaptureTag::DefinitionEnum |
+                crate::lang::CaptureTag::DefinitionTrait |
+                crate::lang::CaptureTag::DefinitionFunction |
+                crate::lang::CaptureTag::DefinitionModule |
+                crate::lang::CaptureTag::DefinitionMacro |
+                crate::lang::CaptureTag::DefinitionType |
+                crate::lang::CaptureTag::DefinitionImpl) {
+                if let Some(module_scope) = parsed.scopes.iter().find(|s| s.kind == ScopeKind::Module) {
+                    if sym.scope_id != Some(module_scope.id) {
+                        let binding = BindingRef {
+                            def_node_id: sym.id,
+                            name: sym.name.clone(),
+                            origin: BindingOrigin::Local,
+                            def_file_path: parsed.path.clone(),
+                            confidence: 1.0,
+                        };
+                        indexes.bindings
+                            .entry(module_scope.id)
+                            .or_default()
+                            .entry(sym.name.clone())
+                            .or_default()
+                            .push(binding);
+                    }
+                }
+            }
         }
 
         for assign in &parsed.assignments {
@@ -463,12 +495,49 @@ fn parallel_receiver_bound_calls(
                             if found { continue; }
                         }
 
-                        // ── Case 3: variable receiver
+                        // ── Case 3: type-binding fallback ───────────────
+                        // When receiver is a typed field (not class-like), look up its type
+                        // and resolve through the type's class binding.
+                        if let Some(type_ref) = crate::scope_resolution::walkers::find_receiver_type_binding(indexes, site.in_scope, receiver_name) {
+                            if type_ref.raw_name.contains('.') {
+                                let parts: Vec<&str> = type_ref.raw_name.splitn(2, '.').collect();
+                                if parts.len() == 2 {
+                                    if let Some(class_def) = crate::scope_resolution::walkers::find_class_binding_in_scope(indexes, site.in_scope, parts[1]) {
+                                        if let Some(member) = indexes.find_owned_member(class_def.id, &site.name) {
+                                            let ok = graph_bridge::try_emit_edge(
+                                                &mut local_edges, indexes, node_lookup, site, member,
+                                                "global", &mut local_seen, 0.85, provider.collapse_member_calls, None,
+                                            );
+                                            if ok { emitted += 1; local_resolved.insert(site_key.clone()); }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            if !type_ref.raw_name.contains('.') {
+                                if let Some(owner_def) = crate::scope_resolution::walkers::find_class_binding_in_scope(indexes, site.in_scope, &type_ref.raw_name) {
+                                    let mut chain = vec![owner_def.id];
+                                    if let Some(mro) = indexes.method_dispatch.get(&owner_def.id) { chain.extend(mro); }
+                                    for owner_id in &chain {
+                                        if let Some(member) = indexes.find_owned_member(*owner_id, &site.name) {
+                                            let ok = graph_bridge::try_emit_edge(
+                                                &mut local_edges, indexes, node_lookup, site, member,
+                                                "global", &mut local_seen, 0.85, provider.collapse_member_calls, None,
+                                            );
+                                            if ok { emitted += 1; local_resolved.insert(site_key.clone()); }
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // ── Case 4: callable receiver (variable holding a function)
                         if let Some(var_sym) = crate::scope_resolution::walkers::find_callable_binding_in_scope(indexes, site.in_scope, receiver_name) {
                             let ok = graph_bridge::try_emit_edge(
                                 &mut local_edges, indexes, node_lookup, site, var_sym,
-                                "global", &mut local_seen, 0.7, provider.collapse_member_calls,
-                                None,
+                                "global", &mut local_seen, 0.7, provider.collapse_member_calls, None,
                             );
                             if ok { emitted += 1; local_resolved.insert(site_key); }
                         }
@@ -511,10 +580,13 @@ fn parallel_free_call_fallback(
     }
 
     let chunk_size = reference_sites.len().div_ceil(n_threads).max(1);
+    // Snapshot the resolved set so threads can check it without contention.
+    let all_resolved_snapshot = std::sync::Arc::new(all_resolved.clone());
     let results: Vec<(Vec<GraphEdge>, FxHashSet<String>, usize)> = std::thread::scope(|scope| {
         let handles: Vec<_> = reference_sites
             .chunks(chunk_size)
             .map(|chunk| {
+                let thread_snapshot = all_resolved_snapshot.clone();
                 scope.spawn(move || {
                     let mut local_edges = Vec::new();
                     let mut seen = FxHashSet::default();
@@ -530,6 +602,11 @@ fn parallel_free_call_fallback(
                         }
 
                         let site_key = format!("{}:{}:{}", site.in_scope, site.line, site.col);
+
+                        // Skip if already resolved by a higher-priority phase.
+                        if thread_snapshot.contains(&site_key) {
+                            continue;
+                        }
 
                         let target_def = if site.is_constructor {
                             crate::scope_resolution::walkers::find_class_binding_in_scope(indexes, site.in_scope, &site.name)

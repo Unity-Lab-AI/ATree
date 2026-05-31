@@ -3,26 +3,25 @@
 //! Enable with `--features perf`. When the feature is off, all macros expand
 //! to nothing — zero instructions in the binary.
 
-use std::time::Instant;
-
 /// RAII timer. Only exists when `perf` feature is enabled.
 #[cfg(feature = "perf")]
 pub struct PerfTimer {
     label: &'static str,
-    start: Instant,
+    start: std::time::Instant,
 }
 
 #[cfg(feature = "perf")]
 impl PerfTimer {
     pub fn start(label: &'static str) -> Self {
-        Self { label, start: Instant::now() }
+        Self { label, start: std::time::Instant::now() }
     }
 }
 
 #[cfg(feature = "perf")]
 impl Drop for PerfTimer {
     fn drop(&mut self) {
-        eprintln!("[PERF] {}: {}ms", self.label, self.start.elapsed().as_millis());
+        let ms = self.start.elapsed().as_millis();
+        tracing::info!(phase = %self.label, elapsed_ms = ms as u64, "perf");
     }
 }
 

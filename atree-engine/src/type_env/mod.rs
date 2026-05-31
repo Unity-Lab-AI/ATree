@@ -24,9 +24,9 @@ use rustc_hash::FxHashMap;
 #[derive(Debug, Default, Clone)]
 pub struct TypeEnvironment {
     /// scope_key → var_name → resolved type name
-    bindings: FxHashMap<String, FxHashMap<String, String>>,
+    pub bindings: FxHashMap<String, FxHashMap<String, String>>,
     /// Variable names that were assigned via constructor calls (Tier 1)
-    constructor_types: FxHashMap<String, String>,
+    pub constructor_types: FxHashMap<String, String>,
 }
 
 impl TypeEnvironment {

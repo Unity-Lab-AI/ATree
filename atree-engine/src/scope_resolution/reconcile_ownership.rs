@@ -19,9 +19,10 @@ pub fn reconcile_ownership(parsed_files: &mut [ParsedFile]) {
             // Methods: function scope whose parent is a Class scope
             if let Some(parent_id) = scope.parent_id {
                 if let Some(parent_scope) = scopes_by_id.get(&parent_id) {
-                    if parent_scope.kind == ScopeKind::Class {
+                    if matches!(parent_scope.kind,
+                        ScopeKind::Class | ScopeKind::Struct | ScopeKind::Trait |
+                        ScopeKind::Impl | ScopeKind::Interface | ScopeKind::Enum) {
                         if let Some(class_def_id) = parent_scope.owner_symbol_id {
-                            // Mark all symbols in this scope as owned by the class
                             for sym in &mut parsed.symbols {
                                 if sym.scope_id == Some(scope.id) {
                                     sym.owner_id = Some(class_def_id);
@@ -32,8 +33,10 @@ pub fn reconcile_ownership(parsed_files: &mut [ParsedFile]) {
                 }
             }
 
-            // Class-body fields: defs directly in a Class scope
-            if scope.kind == ScopeKind::Class {
+            // Class-body fields: defs directly in a Class/Struct/Impl scope
+            if matches!(scope.kind,
+                ScopeKind::Class | ScopeKind::Struct | ScopeKind::Trait |
+                ScopeKind::Impl | ScopeKind::Interface | ScopeKind::Enum) {
                 if let Some(class_def_id) = scope.owner_symbol_id {
                     for sym in &mut parsed.symbols {
                         if sym.scope_id == Some(scope.id) && sym.id != class_def_id {

@@ -1312,7 +1312,7 @@ mod tests {
         assert!(!truncated);
 
         // Tiny budget — should keep only the first (highest confidence) path.
-        let (result, truncated, _) = truncate_to_budget(paths.clone(), 200, false);
+        let (result, _truncated, _) = truncate_to_budget(paths.clone(), 200, false);
         assert!(result.len() <= 2);
         // The first path should always be kept.
         assert_eq!(result[0].confidence, 0.9);

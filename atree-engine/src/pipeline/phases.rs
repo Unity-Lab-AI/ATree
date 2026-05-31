@@ -18,7 +18,6 @@
 //! struct for dependency tracking.
 
 use super::*;
-use crate::perf_print;
 use crate::perf_timer;
 use rusqlite::params;
 use rustc_hash::FxHashMap;
@@ -81,7 +80,6 @@ impl PipelinePhase for CrossFilePhase {
                 FxHashMap::default()
             }
         };
-
         let resolved_imports: usize = parsed_files_guard.iter().map(|f| f.imports.len()).sum();
         let all_file_paths: Vec<String> = parsed_files_guard.iter().map(|f| f.path.clone()).collect();
 
@@ -105,24 +103,27 @@ impl PipelinePhase for CrossFilePhase {
             let mut evidence_lifecycle = crate::evidence::lifecycle::EvidenceLifecycle::new();
 
             // Collect all evidence candidates from all parsed files.
+            let _t0 = std::time::Instant::now();
             let all_candidates: Vec<crate::evidence::EvidenceCandidate> = parsed_files_guard
                 .iter()
                 .flat_map(|pf| pf.evidence.clone())
                 .collect();
+            let _total_candidates = all_candidates.len();
 
-            let total_candidates = all_candidates.len();
-
-            // Stage 1: Normalize (canonicalize, attach scope chain).
+            // Stage 1: Normalize.
+            let _t1 = std::time::Instant::now();
             let evidence: Vec<crate::evidence::Evidence> = all_candidates
                 .into_iter()
                 .map(|c| c.into_evidence())
                 .collect();
             evidence_lifecycle.normalize(evidence);
 
-            // Stage 2: Deduplicate (content-addressed identity).
-            let (total, merged) = evidence_lifecycle.dedupe();
+            // Stage 2: Deduplicate.
+            let _t2 = std::time::Instant::now();
+            let (_total, _merged) = evidence_lifecycle.dedupe();
 
-            // Stage 3: Enrich (graph binding via symbol_id_map + file_id_map).
+            // Stage 3: Enrich.
+            let _t3 = std::time::Instant::now();
             let file_id_map: rustc_hash::FxHashMap<u64, i64> = parsed_files_guard
                 .iter()
                 .filter_map(|pf| {
@@ -132,27 +133,23 @@ impl PipelinePhase for CrossFilePhase {
                 .collect();
             evidence_lifecycle.enrich(&global_symbol_id_map, &file_id_map);
 
-            // Stage 4: Calibrate confidence.
+            // Stage 4: Calibrate.
+            let _t4 = std::time::Instant::now();
             evidence_lifecycle.calibrate_all();
 
-            // Stage 5: Commit to SQLite.
-            let committed_count = evidence_lifecycle.commit_all();
-
-            // Persist committed evidence to the store.
+            // Stage 5: Commit + persist.
+            let t5 = std::time::Instant::now();
+            let _committed_count = evidence_lifecycle.commit_all();
             let committed_evidence: Vec<&crate::evidence::Evidence> = evidence_lifecycle
                 .by_state(crate::evidence::lifecycle::EvidenceState::Committed);
-
             if !committed_evidence.is_empty() {
                 let ev_store = crate::evidence::storage::EvidenceStore::new(store.conn());
                 let owned: Vec<crate::evidence::Evidence> = committed_evidence.iter().map(|ev| (*ev).clone()).collect();
                 match ev_store.insert_batch(&owned) {
-                    Ok(n) => log::info!("[evidence] Committed {} evidence units ({} candidates, {} merged, {} records)",
-                        committed_count, total_candidates, merged, n),
-                    Err(e) => eprintln!("[evidence] Warning: evidence batch insert failed: {}", e),
+                    Ok(n) => eprintln!("[PERF] Evidence persist: {:.2}s ({} records)", t5.elapsed().as_secs_f64(), n),
+                    Err(e) => eprintln!("[PERF] Evidence persist failed: {}", e),
                 }
             } else {
-                log::info!("[evidence] No committed evidence to persist ({} candidates, {} merged)",
-                    total_candidates, merged);
             }
         }
 
@@ -1334,6 +1331,45 @@ pub struct ScopeResolutionOutput {
 
 pub struct ScopeResolutionPhase;
 
+pub struct TypeEnvPhase;
+
+impl PipelinePhase for TypeEnvPhase {
+    fn name(&self) -> &str { "type_env" }
+    fn deps(&self) -> &[&str] { &["cross_file"] }
+
+    fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
+        let cross = get_phase_output::<CrossFileOutput>(deps, "cross_file");
+
+        (ctx.on_progress)(PipelineProgress {
+            phase: "type_env".to_string(),
+            percent: 55,
+            message: "Building type environments...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        // Build type environments for all parsed files.
+        // This enriches symbols with inferred types (constructor inference,
+        // assignment chain propagation) before downstream phases consume them.
+        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let type_envs = crate::type_env::build_type_envs(&parsed_files_guard);
+        let type_bindings_count: usize = type_envs.values().map(|e| e.bindings.len()).sum();
+        drop(parsed_files_guard);
+
+        tracing::info!(files = cross.total_files, type_bindings = type_bindings_count, "Type environment built");
+
+        Box::new(TypeEnvOutput {
+            total_files: cross.total_files,
+            type_bindings_count,
+        })
+    }
+}
+
+pub struct TypeEnvOutput {
+    pub total_files: usize,
+    pub type_bindings_count: usize,
+}
+
 impl PipelinePhase for ScopeResolutionPhase {
     fn name(&self) -> &str { "scope_resolution" }
     fn deps(&self) -> &[&str] { &["cross_file"] }
@@ -1370,7 +1406,7 @@ impl PipelinePhase for ScopeResolutionPhase {
 ///
 /// DAG:
 /// ```text
-///   cross_file → [routes, tools, orm, markdown, cobol, scope_resolution, mro]
+///   cross_file → [routes, tools, orm, markdown, cobol, type_env, scope_resolution, mro]
 ///     → [communities, processes]
 /// ```
 ///
@@ -1384,6 +1420,7 @@ pub fn all_phases() -> Vec<Box<dyn PipelinePhase>> {
         Box::new(OrmPhase),
         Box::new(MarkdownPhase),
         Box::new(CobolPhase),
+        Box::new(TypeEnvPhase),           // type inference, depends on cross_file
         Box::new(ScopeResolutionPhase),  // no-op, depends on cross_file
         Box::new(MroPhase),              // no-op count, depends on cross_file
         // Wave 3 — parallel graph analytics:

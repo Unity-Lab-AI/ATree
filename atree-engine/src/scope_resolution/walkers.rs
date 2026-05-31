@@ -235,7 +235,7 @@ pub fn find_exported_def<'a>(
 // Helper functions
 // =====================================================================
 
-fn is_class_like(indexes: &ScopeResolutionIndexes, node_id: u64) -> bool {
+pub fn is_class_like(indexes: &ScopeResolutionIndexes, node_id: u64) -> bool {
     indexes.symbols_by_id.get(&node_id).is_some_and(|sym| {
         matches!(sym.kind,
             crate::lang::CaptureTag::DefinitionClass |

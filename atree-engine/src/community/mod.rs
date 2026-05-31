@@ -523,9 +523,6 @@ pub fn update_communities_incremental(
             return detect_communities(store, config); // fallback to full recompute
         }
 
-        // Step 1: Load current community assignments
-        let existing_memberships = store.get_communities()?;
-
         // Build a map of symbol_id → community_id from the existing memberships table
         let mut symbol_to_community: FxHashMap<i64, String> = FxHashMap::default();
         let mut community_symbols: FxHashMap<String, Vec<i64>> = FxHashMap::default();
@@ -654,7 +651,6 @@ pub fn update_communities_incremental(
             return Ok(CommunityDetectionResult::default());
         }
 
-        let subgraph_set: FxHashSet<i64> = subgraph_symbol_ids.iter().copied().collect();
         let id_to_idx: FxHashMap<i64, usize> = subgraph_symbol_ids
             .iter()
             .enumerate()

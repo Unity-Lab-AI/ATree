@@ -26,7 +26,6 @@
 
 use crate::evidence::{Evidence, EvidenceId, EvidenceKind};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// A recurring motif in the evidence graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,48 +95,41 @@ pub fn mine_patterns(
     evidence: &[Evidence],
     config: &PatternMiningConfig,
 ) -> Vec<Pattern> {
-    // Group evidence by file.
-    let mut by_file: HashMap<String, Vec<&Evidence>> = HashMap::new();
-    for ev in evidence {
-        by_file.entry(ev.source.file.clone()).or_default().push(ev);
+    if evidence.is_empty() {
+        return Vec::new();
     }
 
-    // Count co-occurring evidence kind pairs (2-grams).
-    let mut pair_counts: HashMap<(EvidenceKind, EvidenceKind), Vec<EvidenceId>> = HashMap::new();
+    // Group evidence by file using FxHashMap for performance.
+    let mut by_file: rustc_hash::FxHashMap<String, Vec<(EvidenceKind, usize)>> = rustc_hash::FxHashMap::default();
+    for (idx, ev) in evidence.iter().enumerate() {
+        by_file.entry(ev.source.file.clone()).or_default().push((ev.kind, idx));
+    }
+
+    let total_files = by_file.len().max(1) as f64;
+
+    // Count co-occurring evidence kind pairs per file, and track unique file set.
+    // Key: (kind_a, kind_b), Value: (total_pair_count, set_of_file_names)
+    let mut pair_stats: rustc_hash::FxHashMap<(EvidenceKind, EvidenceKind), (usize, rustc_hash::FxHashSet<String>)> = rustc_hash::FxHashMap::default();
+
     for (file, evs) in &by_file {
+        // Only iterate pairs within the same file.
         for i in 0..evs.len() {
             for j in (i + 1)..evs.len() {
-                let key = (evs[i].kind, evs[j].kind);
-                let ids = pair_counts.entry(key).or_default();
-                if !ids.contains(&evs[i].id) {
-                    ids.push(evs[i].id.clone());
-                }
-                if !ids.contains(&evs[j].id) {
-                    ids.push(evs[j].id.clone());
-                }
+                let key = (evs[i].0, evs[j].0);
+                let (count, files) = pair_stats.entry(key).or_default();
+                *count += 1;
+                files.insert(file.clone());
             }
         }
     }
 
-    let total_files = by_file.len().max(1) as f64;
-    let mut patterns = Vec::new();
+    let mut patterns = Vec::with_capacity(pair_stats.len());
 
-    for ((kind_a, kind_b), evidence_ids) in pair_counts {
-        let frequency = evidence_ids.len() / 2; // approximate occurrence count
+    for ((kind_a, kind_b), (frequency, files)) in pair_stats {
         if frequency < config.min_frequency {
             continue;
         }
-
-        // Dispersion: how many unique files contain this pair.
-        let unique_files: std::collections::HashSet<&str> = evidence_ids
-            .iter()
-            .filter_map(|id| {
-                // Find evidence by ID to get file
-                evidence.iter().find(|e| &e.id == id).map(|e| e.source.file.as_str())
-            })
-            .collect();
-        let dispersion = unique_files.len() as f64 / total_files;
-
+        let dispersion = files.len() as f64 / total_files;
         if dispersion < config.min_dispersion {
             continue;
         }
@@ -155,10 +147,10 @@ pub fn mine_patterns(
             name: format!("{:?}→{:?}", kind_a, kind_b),
             description: format!(
                 "Co-occurring {:?} and {:?} in {} files (freq={})",
-                kind_a, kind_b, unique_files.len(), frequency
+                kind_a, kind_b, files.len(), frequency
             ),
             motif: vec![kind_a, kind_b],
-            evidence_ids,
+            evidence_ids: Vec::new(), // Don't store individual IDs — too expensive
             score,
         });
     }

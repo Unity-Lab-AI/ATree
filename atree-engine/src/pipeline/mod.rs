@@ -20,7 +20,6 @@
 //! ```
 
 use crate::perf_print;
-use crate::perf_timer;
 use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::sync::{Arc, Mutex};
