@@ -2,7 +2,7 @@
 
 ## Score: 9.7/10
 ## Tests: 280 passing, 0 failures
-## Status: All CRITICAL + SERIOUS findings resolved. 1 P2 item deferred.
+## Status: All CRITICAL + SERIOUS findings resolved. 1 P2 item deferred (query timeout).
 
 ---
 
@@ -58,15 +58,15 @@ Web `/api/search` now uses FTS5 index; layout endpoint wired; webhook canonicali
 
 ## Remaining P2 Items (Deferred)
 
-1. ~~**Dart missing captures**~~ — FIXED in `lang/dart.rs` (calls, methods, constructors, fields, imports, heritage)
-2. **Query timeout** — No SQLite PRAGMA for query execution timeout; requires per-query injection
-3. **`unchecked_transaction()`** — 11 call sites; needs `Mutex<Connection>` refactor
-4. ~~**`type_env` output not consumed**~~ — FIXED: type_env enrichment now runs inline in cross_file phase before scope resolution. Enriched bindings (Tier 1 constructor inference, Tier 2 assignment propagation) are merged into ParsedFile.type_bindings with owner_kind="type_env_inferred".
-5. **Query timeout** — Deferred: rusqlite 0.31's progress_handler not externally accessible. soft_heap_limit (512MB) provides OOM guard.
-6. ~~**`unchecked_transaction()` maintenance trap**~~ — FIXED: all 8 call sites now use safe begin_transaction() wrapper that returns errors instead of panicking.
-7. ~~**M-03: O(n²) edge lookup in web UI**~~ — FIXED: batched get_edges_for_nodes() replaces per-symbol queries
-5. ~~**Container support**~~ — FIXED: Dockerfile added
-6. **MCP auth/rate limiting** — Out of scope for local stdio MCP
+1. ~~**Dart missing captures**~~ — FIXED: added calls, methods, constructors, fields, imports, heritage
+2. ~~**Query timeout**~~ — DEFERRED: rusqlite 0.31 progress_handler not externally accessible. soft_heap_limit (512MB) provides OOM guard.
+3. ~~**`unchecked_transaction()` maintenance trap**~~ — FIXED: all 8 call sites use safe begin_transaction() wrapper
+4. ~~**`type_env` output not consumed**~~ — FIXED: enrichment runs inline in cross_file before scope resolution
+5. ~~**M-03: O(n²) edge lookup**~~ — FIXED: batched get_edges_for_nodes() replaces per-symbol queries
+6. ~~**M-05: MCP input validation**~~ — FIXED: validate() methods on 5 input structs, called at handler entry
+7. ~~**Container support**~~ — FIXED: Dockerfile added
+8. ~~**M-04: Cross-language tests**~~ — FIXED: all 15 languages have golden test coverage
+9. **MCP auth/rate limiting** — Out of scope for local stdio MCP
 
 ---
 
