@@ -311,12 +311,17 @@ async fn semantic_search(State(state): State<Arc<AppState>>, Query(query): Query
     let depth = query.depth.min(5);
     let mut all_symbol_ids: rustc_hash::FxHashSet<i64> = matched_symbols.iter().map(|s| s.id).collect();
     let mut frontier: Vec<i64> = matched_symbols.iter().map(|s| s.id).collect();
+    // Batch edge lookup: O(1) queries per BFS level instead of O(n).
     for _ in 0..depth {
         if frontier.len() > 1000 { break; } // Prevent frontier explosion
         let mut next = Vec::new();
-        for sid in &frontier {
-            if let Ok(edges) = store.get_edges_for_node(*sid) { for e in &edges { if !all_symbol_ids.contains(&e.dst_id) { all_symbol_ids.insert(e.dst_id); next.push(e.dst_id); } if !all_symbol_ids.contains(&e.src_id) { all_symbol_ids.insert(e.src_id); next.push(e.src_id); } } }
-        } if next.is_empty() { break; } frontier = next;
+        if let Ok(edges) = store.get_edges_for_nodes(&frontier) {
+            for e in &edges {
+                if !all_symbol_ids.contains(&e.dst_id) { all_symbol_ids.insert(e.dst_id); next.push(e.dst_id); }
+                if !all_symbol_ids.contains(&e.src_id) { all_symbol_ids.insert(e.src_id); next.push(e.src_id); }
+            }
+        }
+        if next.is_empty() { break; } frontier = next;
         if all_symbol_ids.len() > 500 { break; }
     }
     let mut nodes = Vec::new();
@@ -332,9 +337,23 @@ async fn semantic_search(State(state): State<Arc<AppState>>, Query(query): Query
             loaded.insert(*sid);
         }
     }
+    // Batch edge lookup for the final loaded set: single query instead of O(n).
     let mut edges = Vec::new();
-    for sid in &loaded {
-        if let Ok(es) = store.get_edges_for_node(*sid) { for e in &es { if loaded.contains(&e.dst_id) && e.src_id != e.dst_id { edges.push(atree_engine::graph::GraphEdge { id: format!("e{}", e.id), source_id: format!("sym:{}", e.src_id), target_id: format!("sym:{}", e.dst_id), rel_type: atree_engine::graph::RelationshipType::Uses, confidence: e.confidence, reason: String::new(), step: None }); } } }
+    let loaded_vec: Vec<i64> = loaded.iter().copied().collect();
+    if let Ok(es) = store.get_edges_for_nodes(&loaded_vec) {
+        for e in &es {
+            if loaded.contains(&e.dst_id) && e.src_id != e.dst_id {
+                edges.push(atree_engine::graph::GraphEdge {
+                    id: format!("e{}", e.id),
+                    source_id: format!("sym:{}", e.src_id),
+                    target_id: format!("sym:{}", e.dst_id),
+                    rel_type: atree_engine::graph::RelationshipType::Uses,
+                    confidence: e.confidence,
+                    reason: String::new(),
+                    step: None,
+                });
+            }
+        }
     }
     let matched_ids: Vec<String> = matched_symbols.iter().map(|s| format!("sym:{}", s.id)).collect();
     Json(serde_json::json!({ "layout": layout::compute_layout(&nodes, &edges, &LayoutConfig::default()), "scope": "semantic", "query": q, "matched_symbols": matched_ids, "nodes_returned": nodes.len(), "edges_returned": edges.len(), "neighborhood_depth": depth })).into_response()

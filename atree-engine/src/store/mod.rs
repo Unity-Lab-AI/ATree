@@ -2010,6 +2010,34 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// Get edges for multiple nodes in a single query. O(1) queries instead of O(n).
+    pub fn get_edges_for_nodes(&self, node_ids: &[i64]) -> rusqlite::Result<Vec<EdgeRecord>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build a parameterized IN clause: "IN (?, ?, ?, ...)"
+        let placeholders: Vec<String> = node_ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
+             FROM edges WHERE src_id IN ({}) OR dst_id IN ({})",
+            placeholders.join(","),
+            placeholders.join(","),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(node_ids.iter().copied().chain(node_ids.iter().copied())), |row| {
+            Ok(EdgeRecord {
+                id: row.get(0)?,
+                src_id: row.get(1)?,
+                dst_id: row.get(2)?,
+                edge_kind: row.get(3)?,
+                confidence: row.get(4)?,
+                file_id: row.get(5)?,
+                line: row.get::<_, i64>(6)? as usize,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Get all edges in the graph.
     pub fn get_all_edges(&self) -> rusqlite::Result<Vec<EdgeRecord>> {
         let mut stmt = self.conn.prepare(
