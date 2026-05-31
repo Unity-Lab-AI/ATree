@@ -188,6 +188,13 @@ impl GraphStore {
         // soft_heap_limit: abort queries that would use more than 512MB of heap.
         // This prevents accidental OOM from large JOINs or unbounded queries.
         self.conn.execute_batch("PRAGMA soft_heap_limit = 536870912;")?;
+
+        // NOTE: per-query timeout via progress_handler is deferred.
+        // rusqlite 0.31's progress_handler method on Connection is defined in
+        // the hooks module but not accessible as an inherent method from
+        // external crates. The soft_heap_limit PRAGMA (512MB) provides OOM
+        // protection as an alternative safety net.
+
         Ok(())
     }
 

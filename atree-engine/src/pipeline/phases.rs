@@ -37,7 +37,7 @@ impl PipelinePhase for CrossFilePhase {
     fn deps(&self) -> &[&str] { &[] }
 
     fn execute(&self, ctx: &PipelineContext, shared: &PipelineSharedState, _deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
-        let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
+        let mut parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
         let total_files = parsed_files_guard.len();
         if parsed_files_guard.is_empty() {
             return Box::new(CrossFileOutput { total_files: 0, resolved_calls: 0, resolved_imports: 0 });
@@ -150,6 +150,53 @@ impl PipelinePhase for CrossFilePhase {
                     Err(e) => eprintln!("[PERF] Evidence persist failed: {}", e),
                 }
             } else {
+            }
+        }
+
+        // ── Type Environment Enrichment (Tier 1 + Tier 2) ──────────────────
+        // Before scope resolution, enrich ParsedFile.type_bindings with
+        // inferred types from constructor calls (Tier 1) and assignment
+        // chain propagation (Tier 2). This gives scope resolution richer
+        // type information for call resolution.
+        (ctx.on_progress)(PipelineProgress {
+            phase: "cross_file".to_string(),
+            percent: 54,
+            message: "Enriching type environments...".to_string(),
+            detail: None,
+            stats: None,
+        });
+
+        let type_envs = crate::type_env::build_type_envs(&parsed_files_guard);
+        let type_bindings_added: usize = type_envs.values()
+            .map(|e| e.bindings.values().map(|m| m.len()).sum::<usize>())
+            .sum();
+        if type_bindings_added > 0 {
+            tracing::info!(type_bindings_added, "Type environment enrichment");
+            // Merge enriched type bindings into parsed files so scope resolution
+            // can use them during call resolution.
+            for parsed in parsed_files_guard.iter_mut() {
+                if let Some(env) = type_envs.get(&parsed.id) {
+                    for (scope_key, name_map) in &env.bindings {
+                        for (var_name, type_text) in name_map {
+                            // Only add if not already present (Tier 0 takes precedence).
+                            let already_has = parsed.type_bindings.iter()
+                                .any(|tb| tb.var_name == *var_name && tb.line > 0);
+                            if !already_has {
+                                // Extract line from scope_key (format: "file_id:line_start")
+                                let line = scope_key.split(':')
+                                    .nth(1)
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                parsed.type_bindings.push(crate::syntax::TypeBinding {
+                                    var_name: var_name.clone(),
+                                    type_text: type_text.clone(),
+                                    line,
+                                    owner_kind: "type_env_inferred".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1342,21 +1389,23 @@ impl PipelinePhase for TypeEnvPhase {
 
         (ctx.on_progress)(PipelineProgress {
             phase: "type_env".to_string(),
-            percent: 55,
-            message: "Building type environments...".to_string(),
+            percent: 56,
+            message: "Type environment (enriched inline in cross_file)...".to_string(),
             detail: None,
             stats: None,
         });
 
-        // Build type environments for all parsed files.
-        // This enriches symbols with inferred types (constructor inference,
-        // assignment chain propagation) before downstream phases consume them.
+        // Type environment enrichment now runs inline in the cross_file phase
+        // (between evidence lifecycle and scope resolution) so that enriched
+        // type bindings are available during scope resolution. This phase is
+        // kept for DAG compatibility but is a no-op.
         let parsed_files_guard = shared.parsed_files.lock().unwrap_or_else(|e| e.into_inner());
-        let type_envs = crate::type_env::build_type_envs(&parsed_files_guard);
-        let type_bindings_count: usize = type_envs.values().map(|e| e.bindings.len()).sum();
+        let type_bindings_count: usize = parsed_files_guard.iter()
+            .map(|pf| pf.type_bindings.len())
+            .sum();
         drop(parsed_files_guard);
 
-        tracing::info!(files = cross.total_files, type_bindings = type_bindings_count, "Type environment built");
+        tracing::info!(files = cross.total_files, type_bindings = type_bindings_count, "Type environment (already enriched in cross_file)");
 
         Box::new(TypeEnvOutput {
             total_files: cross.total_files,
@@ -1373,8 +1422,9 @@ pub struct TypeEnvOutput {
 impl PipelinePhase for ScopeResolutionPhase {
     fn name(&self) -> &str { "scope_resolution" }
     fn deps(&self) -> &[&str] { &["cross_file"] }
-    // No-op: scope resolution already ran inside cross_file phase.
-    // This phase exists only for DAG compatibility with GitNexusRelay.
+    // No-op: scope resolution already ran inside cross_file phase (after type_env
+    // enrichment was applied to parsed_files). This phase exists only for DAG
+    // compatibility with GitNexusRelay.
 
     fn execute(&self, ctx: &PipelineContext, _shared: &PipelineSharedState, deps: &FxHashMap<PhaseName, &PhaseResult>) -> Box<dyn Any + Send + Sync> {
         let cross = get_phase_output::<CrossFileOutput>(deps, "cross_file");
@@ -1406,7 +1456,8 @@ impl PipelinePhase for ScopeResolutionPhase {
 ///
 /// DAG:
 /// ```text
-///   cross_file → [routes, tools, orm, markdown, cobol, type_env, scope_resolution, mro]
+///   cross_file → [routes, tools, orm, markdown, cobol, type_env (no-op), scope_resolution (no-op), mro]
+///   Note: type_env enrichment runs inline in cross_file before scope resolution.
 ///     → [communities, processes]
 /// ```
 ///
