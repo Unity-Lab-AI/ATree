@@ -50,8 +50,28 @@ Incremental scanning is ~127x faster than cold scan on a real-world repo.
 3. **Non-streaming `get_all_symbols`/`get_all_files`**: Full table scans used during indexing pipeline phase (acceptable for current use case, not used during MCP serving)
 4. **String clones in pipeline**: ~19 `clone()` calls in hot path for path/route/symbol data sharing across threads
 
+### Memory Analysis
+
+| Component | Per-record | 10K file estimate |
+|-----------|------------|-------------------|
+| `Evidence` record | ~500 bytes | ~500MB (1M evidence records) |
+| `ParsedFile.symbols` | ~200 bytes/symbol | ~200MB (100 symbols/file avg) |
+| `ParsedFile.scopes` | ~100 bytes/scope | ~50MB (50 scopes/file avg) |
+| SQLite cache | — | 20MB (PRAGMA cache_size) |
+| SQLite heap limit | — | 512MB (soft_heap_limit) |
+| **Total estimate** | — | **~1-2GB for 10K files** |
+
 ### Recommendations for Large Repos (>10K files)
-- Use `cargo-limited` wrapper (provided) to cap memory at 8GB and CPU at 6 cores
-- Set `jobs = 4` in `~/.cargo/config.toml` (already done)
-- Consider `PRAGMA mmap_size = 268435456` (256MB) for large SQLite databases on systems with sufficient RAM
+- Use `cargo-limited` wrapper to cap memory at 8GB and CPU at 6 cores
+- Set `jobs = 4` in `~/.cargo/config.toml`
 - The `--incremental` flag should always be used for repeated scans
+- Index databases for 10K+ file repos can reach 500MB-2GB; monitor with `atree query db-stats`
+- Evidence lifecycle holds all evidence in memory during processing; this is the single largest consumer
+- SQLite `soft_heap_limit = 512MB` prevents query-level OOM
+
+### Performance Optimizations Applied
+- Batched BFS edge lookups: O(depth) queries vs O(nodes) — critical for large call graphs
+- Pre-allocated evidence Vec with estimated capacity
+- Batched `get_edges_for_nodes()` for semantic search neighborhood queries
+- WAL mode + busy_timeout = 10s for concurrent access
+- Incremental scanning: 127x speedup on warm re-scan
