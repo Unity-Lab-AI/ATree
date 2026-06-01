@@ -975,16 +975,20 @@ impl GraphStore {
         let mut current_level = vec![symbol_id];
         visited.insert(symbol_id);
 
-        let mut outgoing_stmt = self.conn.prepare("SELECT dst_id FROM edges WHERE src_id = ?1")?;
-        let mut incoming_stmt = self.conn.prepare("SELECT src_id FROM edges WHERE dst_id = ?1")?;
+        // BFS with batched edge lookups: O(depth) queries instead of O(nodes).
+        let outgoing_sql = "SELECT src_id, dst_id FROM edges WHERE src_id IN (SELECT value FROM json_each(?1))";
+        let incoming_sql = "SELECT src_id, dst_id FROM edges WHERE dst_id IN (SELECT value FROM json_each(?1))";
 
         for _ in 0..max_depth {
             if current_level.is_empty() { break; }
             let mut next_level = Vec::new();
-            for &id in &current_level {
-                let rows = outgoing_stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+            // Process in batches to keep query size reasonable
+            for chunk in current_level.chunks(500) {
+                let json = serde_json::json!(chunk);
+                let mut stmt = self.conn.prepare(outgoing_sql)?;
+                let rows = stmt.query_map([json.to_string()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
-                    let dst = row?;
+                    let (_src, dst) = row?;
                     if visited.insert(dst) {
                         next_level.push(dst);
                     }
@@ -993,22 +997,29 @@ impl GraphStore {
             current_level = next_level;
         }
 
-        // Also get incoming edges (callers)
+        // Also get incoming edges (callers) — same batched approach
         let mut current_level = vec![symbol_id];
+        // Reset visited for the incoming traversal (we want both directions)
+        let mut visited_incoming = rustc_hash::FxHashSet::default();
+        visited_incoming.insert(symbol_id);
         for _ in 0..max_depth {
             if current_level.is_empty() { break; }
             let mut next_level = Vec::new();
-            for &id in &current_level {
-                let rows = incoming_stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+            for chunk in current_level.chunks(500) {
+                let json = serde_json::json!(chunk);
+                let mut stmt = self.conn.prepare(incoming_sql)?;
+                let rows = stmt.query_map([json.to_string()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
                 for row in rows {
-                    let src = row?;
-                    if visited.insert(src) {
+                    let (src, _dst) = row?;
+                    if visited_incoming.insert(src) {
                         next_level.push(src);
                     }
                 }
             }
             current_level = next_level;
         }
+        // Merge incoming visited into the main visited set
+        visited.extend(visited_incoming);
 
         // Fetch all visited symbols
         let all_ids: Vec<i64> = visited.into_iter().collect();
