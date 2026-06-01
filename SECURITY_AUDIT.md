@@ -1,8 +1,8 @@
 # ATree Production-Readiness Audit
 
-## Score: 9.7/10
+## Score: 9.8/10
 ## Tests: 280 passing, 0 failures
-## Status: All CRITICAL + SERIOUS findings resolved. 1 P2 item deferred (query timeout).
+## Status: All CRITICAL + SERIOUS + P2 findings resolved. 1 P2 item deferred (query timeout — rusqlite API limitation).
 
 ---
 
