@@ -103,12 +103,15 @@ impl PipelinePhase for CrossFilePhase {
             let mut evidence_lifecycle = crate::evidence::lifecycle::EvidenceLifecycle::new();
 
             // Collect all evidence candidates from all parsed files.
+            // Pre-allocate with estimated capacity to avoid reallocations.
             let _t0 = std::time::Instant::now();
-            let all_candidates: Vec<crate::evidence::EvidenceCandidate> = parsed_files_guard
-                .iter()
-                .flat_map(|pf| pf.evidence.clone())
-                .collect();
+            let total_evidence_estimate: usize = parsed_files_guard.iter().map(|pf| pf.evidence.len()).sum();
+            let mut all_candidates = Vec::with_capacity(total_evidence_estimate);
+            for pf in parsed_files_guard.iter() {
+                all_candidates.extend(pf.evidence.iter().cloned());
+            }
             let _total_candidates = all_candidates.len();
+            tracing::debug!(total_evidence_estimate, "Evidence candidates collected");
 
             // Stage 1: Normalize.
             let _t1 = std::time::Instant::now();
