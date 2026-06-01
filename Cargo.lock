@@ -212,7 +212,6 @@ dependencies = [
  "tree-sitter-bash",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
- "tree-sitter-cobol",
  "tree-sitter-cpp",
  "tree-sitter-dart",
  "tree-sitter-go",
@@ -3334,12 +3333,6 @@ dependencies = [
  "cc",
  "tree-sitter-language",
 ]
-
-[[package]]
-name = "tree-sitter-cobol"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d930266d07e57a091887a0ba4a4646134c60a84f73a3bb7e73363f26519771"
 
 [[package]]
 name = "tree-sitter-cpp"
