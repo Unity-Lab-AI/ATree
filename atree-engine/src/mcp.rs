@@ -21,8 +21,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// Ensure validate_cypher_query is accessible within this module.
-use crate::store::validate_cypher_query;
+// validate_cypher_query is used by CypherInput::validate() below via crate::store::
 
 // =====================================================================
 // Tool Input Types
