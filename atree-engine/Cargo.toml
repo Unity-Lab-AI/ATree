@@ -35,7 +35,7 @@ tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-dart.workspace = true
 tree-sitter-vue.workspace = true
-tree-sitter-cobol.workspace = true
+# tree-sitter-cobol.workspace = true  # disabled: broken lib target
 regex.workspace = true
 git2 = { workspace = true, optional = true }
 thiserror.workspace = true
