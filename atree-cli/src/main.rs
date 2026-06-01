@@ -160,6 +160,8 @@ enum QueryCommand {
     ConstraintCheck { #[allow(dead_code)] symbol: Option<String> },
     /// List active constraints with confidence scores
     ListConstraints { min_confidence: f64 },
+    /// Show database size and row counts
+    DbStats,
 }
 
 #[derive(Debug)]
@@ -909,6 +911,9 @@ fn parse_args() -> Args {
                         let min_confidence = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(0.5);
                         if min_confidence != 0.5 { i += 1; }
                         args.query = Some(QueryCommand::ListConstraints { min_confidence });
+                    }
+                    "db-stats" => {
+                        args.query = Some(QueryCommand::DbStats);
                     }
                     other => {
                         eprintln!("Error: unknown query subcommand '{}'. Run 'atree query --help' for full list.", other);
@@ -4239,6 +4244,29 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                     println!("  {:<40} {:<25} {:.2}", name, kind, conf);
                 }
             }
+        }
+        QueryCommand::DbStats => {
+            let db_path = match &args.db_path {
+                Some(p) => p.clone(),
+                None => { eprintln!("Error: --db <PATH> is required"); std::process::exit(1); }
+            };
+            let store = match atree_engine::store::GraphStore::open(&db_path) {
+                Ok(s) => s, Err(e) => { eprintln!("Error opening store: {}", e); std::process::exit(1); }
+            };
+            let stats = store.stats().unwrap_or_else(|e| {
+                eprintln!("Error reading stats: {}", e);
+                std::process::exit(1);
+            });
+            let size_mb = stats.db_size_bytes as f64 / (1024.0 * 1024.0);
+            println!("Index Database Stats:");
+            println!("  Files:          {}", stats.files);
+            println!("  Symbols:        {}", stats.symbols);
+            println!("  Scopes:         {}", stats.scopes);
+            println!("  Imports:        {}", stats.imports);
+            println!("  Calls:          {} ({} resolved)", stats.calls, stats.resolved_calls);
+            println!("  Edges:          {}", stats.edges);
+            println!("  Evidence:       {}", stats.evidence);
+            println!("  DB size:        {:.1} MB", size_mb);
         }
     }
     std::process::exit(0);

@@ -171,6 +171,38 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Get the current database file size in bytes.
+    pub fn db_size_bytes(&self) -> u64 {
+        self.conn
+            .query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as u64
+    }
+
+    /// Get a summary of the index size and row counts.
+    pub fn stats(&self) -> rusqlite::Result<StoreStats> {
+        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
+        let symbols: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let scopes: i64 = self.conn.query_row("SELECT COUNT(*) FROM scopes", [], |r| r.get(0)).unwrap_or(0);
+        let imports: i64 = self.conn.query_row("SELECT COUNT(*) FROM imports", [], |r| r.get(0)).unwrap_or(0);
+        let calls: i64 = self.conn.query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0)).unwrap_or(0);
+        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+        let resolved_calls: i64 = self.conn.query_row("SELECT COUNT(*) FROM calls WHERE resolved_symbol_id IS NOT NULL", [], |r| r.get(0)).unwrap_or(0);
+        let evidence: i64 = self.conn.query_row("SELECT COUNT(*) FROM evidence", [], |r| r.get(0)).unwrap_or(0);
+        Ok(StoreStats {
+            files,
+            symbols,
+            scopes,
+            imports,
+            calls,
+            edges,
+            resolved_calls,
+            files_inserted: 0,
+            files_reused: 0,
+            evidence,
+            db_size_bytes: self.db_size_bytes(),
+        })
+    }
+
     /// Try running maintenance, logging errors instead of failing.
     pub fn maintenance_or_warn(&self) {
         if let Err(e) = self.maintenance() {
@@ -2138,23 +2170,6 @@ impl GraphStore {
         rows.collect()
     }
 
-    // =================================================================
-    // Stats
-    // =================================================================
-
-    pub fn stats(&self) -> rusqlite::Result<StoreStats> {
-        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
-        let symbols: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
-        let scopes: i64 = self.conn.query_row("SELECT COUNT(*) FROM scopes", [], |row| row.get(0))?;
-        let imports: i64 = self.conn.query_row("SELECT COUNT(*) FROM imports", [], |row| row.get(0))?;
-        let calls: i64 = self.conn.query_row("SELECT COUNT(*) FROM calls", [], |row| row.get(0))?;
-        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
-        let resolved_calls: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'CALLS'", [], |row| row.get(0)
-        )?;
-        Ok(StoreStats { files, symbols, scopes, imports, calls, edges, resolved_calls, files_inserted: 0, files_reused: 0 })
-    }
-
     /// Set incremental indexing stats.
     pub fn set_incremental_stats(&self, _inserted: i64, _reused: i64) {
         // Store in a separate metadata table or just track in memory
@@ -2260,6 +2275,8 @@ pub struct StoreStats {
     pub resolved_calls: i64,
     pub files_inserted: i64,
     pub files_reused: i64,
+    pub evidence: i64,
+    pub db_size_bytes: u64,
 }
 
 // =================================================================
