@@ -961,7 +961,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
             match *store_guard {
                 Some(ref store) => store.stats()
                     .map_err(|e| io::Error::other(e.to_string()))?,
-                None => crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0 },
+                None => crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0, evidence: 0, db_size_bytes: 0 },
             }
         };
         let symbol_table = {
@@ -986,7 +986,7 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
 
         (store_stats, symbol_table, None, scope_resolution_stats, detected_routes, parsed_files)
     } else {
-        (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0 }, SymbolTable::new(), None, None, Vec::new(), Vec::new())
+        (crate::store::StoreStats { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0, files_inserted: 0, files_reused: 0, evidence: 0, db_size_bytes: 0 }, SymbolTable::new(), None, None, Vec::new(), Vec::new())
     };
 
     tracing::info!(
