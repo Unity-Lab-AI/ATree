@@ -184,11 +184,7 @@ pub fn build_graph_group(config: &GroupConfig) -> io::Result<Vec<ScanResult>> {
             graph_phases: config.graph_phases,
             ..Default::default()
         };
-        let result = if config.semantic {
-            build_graph(&opts)?
-        } else {
-            build_graph(&opts)?
-        };
+        let result = build_graph(&opts)?;
         results.push(result);
     }
     Ok(results)
