@@ -2,7 +2,8 @@
 
 ## Score: 9.8/10
 ## Tests: 280 passing, 0 failures
-## Status: All CRITICAL + SERIOUS + P2 findings resolved. 1 P2 item deferred (query timeout — rusqlite API limitation).
+## Status: All CRITICAL + SERIOUS + P2 findings resolved. 1 P2 item deferred (query timeout).
+Round 7 complete — all actionable audit findings addressed.
 
 ---
 
