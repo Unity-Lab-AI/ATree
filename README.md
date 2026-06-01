@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Version** | `0.7.0-alpha` |
-| **Status** | Alpha — A\* filesystem tool and semantic engine v2 with scope resolution, type-aware extraction, MCP server, and 55+ query subcommands. |
+| **Status** | Alpha — A\* filesystem tool and semantic engine with scope resolution, type-aware extraction, MCP server, and 35+ query subcommands. |
 | **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red, B-A-M-N |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
@@ -13,7 +13,7 @@
 ATree is two products sharing one CLI binary:
 
 - **ATree** — parallel filesystem scanner with A\* pathfinding. Walks directory trees, renders Unicode/ASCII trees, finds optimal paths, emits JSON/Graphviz.
-- **ATree Semantic Engine** — multi-language code intelligence. Parses source with tree-sitter, resolves symbols across files, analyzes git history, exposes everything through 55+ CLI queries, a Rust library, and an MCP server for AI agents.
+- **ATree Semantic Engine** — multi-language code intelligence. Parses source with tree-sitter, resolves symbols across files, analyzes git history, exposes everything through CLI queries, a Rust library, and an MCP server for AI agents.
 
 Pass `--semantic` to activate the code intelligence layer.
 
@@ -249,8 +249,8 @@ The engine is activated with the `--semantic` flag. It stores its index in a per
 - **Git history** — commit log walk, per-file change tracking, author aggregation, co-change coupling
 - **Graph analytics** — community detection (label propagation), process tracing (BFS call chains)
 - **Search** — BM25 FTS5 full-text search + optional semantic vector embeddings (ONNX)
-- **Incremental indexing** — only re-indexes changed files (~99x speedup on warm re-index)
-- **MCP server** — 43 tools exposed via Model Context Protocol for AI agent integration
+- **Incremental indexing** — only re-indexes changed files (significant speedup on warm re-index)
+- **MCP server** — 46 tools exposed via Model Context Protocol for AI agent integration
 - **Evidence engine** — A* + beam search over the layered code graph, token-bounded, confidence-ranked results
 
 ## Quick start
@@ -261,7 +261,7 @@ The engine is activated with the `--semantic` flag. It stores its index in a per
 # Full semantic index (persistent SQLite DB)
 atree --semantic --db .atree/index.sqlite --root . --include-files
 
-# Incremental re-index (only changed files, ~99x faster)
+# Incremental re-index (only changed files, much faster)
 atree --semantic --db .atree/index.sqlite --root . --incremental
 
 # With embeddings for semantic vector search
@@ -572,7 +572,7 @@ atree mcp-server --db .atree/index.sqlite
 ATree is a Cargo workspace with two packages:
 
 - **`atree-engine`** — the semantic code intelligence library. Tree-sitter extraction, scope resolution, git history analysis, A* evidence paths, SQLite persistence. Feature-flagged modules for embeddings and MCP.
-- **`atree-cli`** — the CLI binary. Filesystem scanning, 55+ query subcommands, JSON output, A* filesystem pathfinding. Thin wrapper over the engine.
+- **`atree-cli`** — the CLI binary. Filesystem scanning, 35+ query subcommands, JSON output, A* filesystem pathfinding. Thin wrapper over the engine.
 
 ## Parallel scanner
 
