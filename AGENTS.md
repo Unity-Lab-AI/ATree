@@ -34,14 +34,44 @@ This project is indexed by ATree's own semantic engine (3,248 symbols, 11,662 ed
 | `shape_check` | API route response shape validation. |
 | `pattern_mine` | Recurring evidence motifs ranked by frequency × dispersion. |
 | `constraint_check` | Architectural constraints synthesized from evidence. |
+| `architecture_boundary_check` | User-declared layer boundary violations (config-driven). |
+
+## Architecture Boundary Enforcement
+
+ATree supports user-declared architecture boundaries via `.atree/boundaries.json`:
+
+```json
+{
+  "layers": [
+    {"name": "presentation", "paths": ["src/ui/", "src/pages/"]},
+    {"name": "domain", "paths": ["src/services/", "src/models/"]},
+    {"name": "data", "paths": ["src/repositories/", "src/db/"]}
+  ],
+  "rules": [
+    {"name": "pres-to-domain", "from": "presentation", "to": "domain", "allowed": true},
+    {"name": "domain-to-data", "from": "domain", "to": "data", "allowed": true},
+    {"name": "pres-no-data", "from": "presentation", "to": "data", "allowed": false}
+  ]
+}
+```
+
+Violations are detected during indexing and exposed via:
+- `atree query boundary-check` — CLI
+- `mcp_atree_architecture_boundary_check` — MCP tool
+- Stored in `boundary_violations` table for CI/CD integration
 
 ## Performance Characteristics
 
 - **Scalability**: Handles 25K+ file repos (tested with Conflux: 125K calls, 81.8% resolution, 0 missed)
 - **Incremental scanning**: 0.25s for 2,692-file repo (930x faster than cold scan)
-- **Call resolution**: 100% of resolvable calls resolved (unresolved are external/builtin names)
+- **Call resolution**: 100% of resolvable calls resolved via lexical scope-chain walk (O(1) per step)
+- **Data flow analysis**: Tracks assignments, parameter passing, property access, returns
+- **Cycle detection**: Recursive CTE + SCC detection for call graph cycles
 - **Heritage/MRO**: Tracks inheritance with parent resolution (81% for projects with internal trait hierarchies)
-- **Process detection**: Identifies execution flows via STEP_IN_PROCESS edges
+- **Process detection**: Entry points from API routes + exports + event handlers + callees
+- **Type resolution**: Cross-file type inference via import graph + type environments
+- **Architecture boundaries**: User-declared layer rules with violation tracking
+- **FTS5 evidence search**: Auto-indexed on commit, cleaned up on incremental re-index
 - **Community detection**: Leiden algorithm for functional area clustering
 
 ## Comparison with GitNexus
@@ -64,4 +94,5 @@ ATree and GitNexus are both configured as MCP servers. Key differences:
 
 **ATree is strictly superior in all dimensions.** GitNexus cannot compete on
 scalability (crashes >1K files), data flow analysis, cycle detection, dead code
-detection, lexical scope resolution, or FTS5 evidence search.
+detection, lexical scope resolution, FTS5 evidence search, architecture boundary
+enforcement, or cross-file type resolution.
