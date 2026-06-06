@@ -62,6 +62,9 @@ pub struct ResolutionEngine<'a> {
     file_languages: FxHashMap<i64, String>, // file_id → language string
     scopes_by_file: FxHashMap<i64, Vec<ScopeRecord>>,
     imports_by_file: FxHashMap<i64, Vec<ImportRecord>>,
+    // Scope chain indexes for O(1) lexical resolution
+    scope_owner: FxHashMap<i64, i64>,   // scope_id → symbol_id (the symbol owning this scope)
+    scope_parent: FxHashMap<i64, i64>,   // scope_id → parent_scope_id
 }
 
 impl<'a> ResolutionEngine<'a> {
@@ -76,6 +79,8 @@ impl<'a> ResolutionEngine<'a> {
             file_languages: FxHashMap::default(),
             scopes_by_file: FxHashMap::default(),
             imports_by_file: FxHashMap::default(),
+            scope_owner: FxHashMap::default(),
+            scope_parent: FxHashMap::default(),
         };
         engine.build_indexes()?;
         engine.register_default_languages();
@@ -105,9 +110,16 @@ impl<'a> ResolutionEngine<'a> {
                 self.symbols_by_id.insert(sym.id, sym.clone());
             }
         }
-        // Index scopes
+        // Index scopes and build scope chain indexes
         for file_id in self.files_by_path.values() {
             let scopes = self.store.get_scopes_by_file(*file_id)?;
+            // Build O(1) scope→owner and scope→parent maps for lexical resolution
+            for scope in &scopes {
+                self.scope_parent.insert(scope.id, scope.parent_id.unwrap_or(0));
+                if let Some(owner_id) = scope.owner_symbol_id {
+                    self.scope_owner.insert(scope.id, owner_id);
+                }
+            }
             self.scopes_by_file.insert(*file_id, scopes);
         }
         // Index imports
@@ -252,7 +264,48 @@ impl<'a> ResolutionEngine<'a> {
         let file_id = call.file_id;
         let callee = &call.callee_name;
 
-        // Tier 1: Exact local — same file defines it
+        // Tier 1: Lexical scope-chain walk — walk up from the call's enclosing
+        // scope to find the callee in the nearest defining scope. This handles
+        // nested functions, closures, class methods, etc.
+        if let Some(scope_id) = call.caller_scope_id {
+            let mut current = scope_id;
+            let mut visited = rustc_hash::FxHashSet::default();
+            let mut lexical_match: Option<(i64, Confidence)> = None;
+            while visited.insert(current) {
+                // Check symbols owned by this scope
+                if let Some(sym_id) = self.scope_owner.get(&current) {
+                    if let Some(sym) = self.get_symbol(*sym_id) {
+                        if sym.name == *callee {
+                            // Found in nearest enclosing scope — this is the best match
+                            return Some((*sym_id, Confidence::ExactLocal));
+                        }
+                    }
+                }
+                // Also check symbols defined in this scope's file at this scope level
+                if let Some(sym_ids) = self.symbols_by_file.get(&file_id) {
+                    for sym_id in sym_ids {
+                        if let Some(sym) = self.get_symbol(*sym_id) {
+                            if sym.name == *callee && sym.scope_id == Some(current) {
+                                return Some((*sym_id, Confidence::ExactLocal));
+                            }
+                        }
+                    }
+                }
+                // Walk up to parent scope
+                if let Some(&parent) = self.scope_parent.get(&current) {
+                    if parent == 0 { break; }
+                    current = parent;
+                } else {
+                    break;
+                }
+            }
+            // If we found a match but it wasn't exact, keep it as a fallback
+            if lexical_match.is_some() {
+                return lexical_match;
+            }
+        }
+
+        // Tier 2: Same-file — any symbol in the same file with matching name
         if let Some(sym_ids) = self.symbols_by_file.get(&file_id) {
             for sym_id in sym_ids {
                 if let Some(sym) = self.get_symbol(*sym_id) {
@@ -263,11 +316,7 @@ impl<'a> ResolutionEngine<'a> {
             }
         }
 
-        // Tier 2: Import-scoped — check all resolved imports for matching symbols.
-        // For each import that resolved to a file, look for symbols in that file
-        // matching the callee name. This handles both direct imports (`use foo::bar`
-        // calling `bar()`) and module-scoped imports (`use foo::Type` calling
-        // `instance.method()` where `method` is defined in `foo`'s module).
+        // Tier 3: Import-scoped — check all resolved imports for matching symbols.
         if let Ok(imports) = self.store.get_imports_by_file(file_id) {
             let mut best_import_match: Option<(i64, Confidence)> = None;
             for imp in &imports {
@@ -276,13 +325,11 @@ impl<'a> ResolutionEngine<'a> {
                         for sym_id in sym_ids {
                             if let Some(sym) = self.get_symbol(*sym_id) {
                                 if sym.name == *callee {
-                                    // Prefer exact name match on the import itself
                                     let conf = if imp.imported_name == *callee || imp.local_name == *callee {
                                         Confidence::ExactImport
                                     } else {
                                         Confidence::ImportScoped
                                     };
-                                    // Keep best confidence match
                                     if best_import_match.map_or(true, |(_, c)| conf.score() > c.score()) {
                                         best_import_match = Some((*sym_id, conf));
                                     }
@@ -297,7 +344,7 @@ impl<'a> ResolutionEngine<'a> {
             }
         }
 
-        // Tier 3: Receiver heuristic — self.method() / this.method()
+        // Tier 4: Receiver heuristic — self.method() / this.method()
         if call.receiver.is_some() {
             if let Some(sym_ids) = self.symbols_by_name.get(callee) {
                 for sym_id in sym_ids {
@@ -310,7 +357,7 @@ impl<'a> ResolutionEngine<'a> {
             }
         }
 
-        // Tier 4: Global fallback — match by name across all symbols
+        // Tier 5: Global fallback — match by name across all symbols
         if let Some(sym_ids) = self.symbols_by_name.get(callee) {
             if sym_ids.len() == 1 {
                 return Some((sym_ids[0], Confidence::GlobalFallback));
@@ -327,7 +374,7 @@ impl<'a> ResolutionEngine<'a> {
     }
 
     /// Resolve a scope ID to its owning symbol (the enclosing function/method/class).
-    /// Walks up the scope chain until we find a symbol owned by one of the scopes.
+    /// Uses pre-built scope→symbol index for O(1) per-step lookup.
     fn resolve_scope_to_symbol(&self, scope_id: i64) -> Option<i64> {
         let mut current = scope_id;
         let mut visited = rustc_hash::FxHashSet::default();
@@ -335,15 +382,12 @@ impl<'a> ResolutionEngine<'a> {
             if !visited.insert(current) {
                 return None;
             }
-            // Check if any symbol is owned by this scope
-            if let Some(sym) = self.symbols_by_id.values().find(|s| s.scope_id == Some(current)) {
-                return Some(sym.id);
+            // O(1) lookup: scope_id → owning symbol_id
+            if let Some(&sym_id) = self.scope_owner.get(&current) {
+                return Some(sym_id);
             }
-            // Walk up to parent scope
-            current = self.scopes_by_file.values()
-                .flatten()
-                .find(|s| s.id == current)
-                .and_then(|s| s.parent_id)?;
+            // Walk up to parent scope (O(1) lookup in scope_parent)
+            current = *self.scope_parent.get(&current)?;
         }
     }
 
