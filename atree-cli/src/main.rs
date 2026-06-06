@@ -85,7 +85,7 @@ enum QueryCommand {
     /// Detect contract changes (breaking changes to public API)
     ContractChangeDetector { base_ref: Option<String> },
     /// Check architecture boundary violations
-    ArchitectureBoundaryCheck,
+    ArchitectureBoundaryCheck { rule: Option<String>, file: Option<String> },
     /// Detect scope violations (private symbol used externally)
     ScopeViolationDetector,
     /// Map configuration surface (env vars, config files, feature flags)
@@ -672,7 +672,11 @@ fn parse_args() -> Args {
                         args.query = Some(QueryCommand::ContractChangeDetector { base_ref });
                     }
                     "boundary-check" => {
-                        args.query = Some(QueryCommand::ArchitectureBoundaryCheck);
+                        let rule = cli_args.get(i+1).filter(|s| !s.starts_with("--")).map(|s| s.to_string());
+                        if rule.is_some() { i += 1; }
+                        let file = cli_args.get(i+1).filter(|s| !s.starts_with("--")).map(|s| s.to_string());
+                        if file.is_some() { i += 1; }
+                        args.query = Some(QueryCommand::ArchitectureBoundaryCheck { rule, file });
                     }
                     "scope-violations" => {
                         args.query = Some(QueryCommand::ScopeViolationDetector);
@@ -2397,8 +2401,20 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 println!("  Use --base <ref> to compare against a git ref (e.g., --base main).");
             }
         }
-        QueryCommand::ArchitectureBoundaryCheck => {
+        QueryCommand::ArchitectureBoundaryCheck { rule, file } => {
             println!("Architecture boundary check:");
+
+            // First, check stored boundary violations (from user-declared rules)
+            let stored = store.get_boundary_violations(rule.as_deref(), file.as_deref()).unwrap_or_default();
+            if !stored.is_empty() {
+                println!("── Declared Boundary Violations ({}) ──", stored.len());
+                for (rule_name, from_file, to_file, from_layer, to_layer, kind, line, symbol) in &stored {
+                    println!("  [{}] {} → {}  ({} → {})  {}:{}  {}",
+                        rule_name, from_file, to_file, from_layer, to_layer, kind, line, symbol);
+                }
+                println!();
+            }
+
             let conn = store.conn();
 
             // Strategy 1: Cross-repo boundary violations (using repo_label)
