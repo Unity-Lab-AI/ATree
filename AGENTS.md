@@ -21,12 +21,19 @@ This project is indexed by ATree's own semantic engine (3,248 symbols, 11,662 ed
 
 | Tool | What it gives you |
 |------|-------------------|
-| `query` | Execution flows + matched symbols ranked by relevance. Combines BM25 + term search + process discovery. |
-| `context` | 360-degree symbol view — categorized refs, processes it participates in, evidence paths. |
-| `impact` | Blast radius analysis with multi-depth caller/callee traversal, weighted risk scoring (LOW/MEDIUM/HIGH/CRITICAL). |
+| `query` | Execution flows + matched symbols ranked by relevance. BM25 + term search + process discovery. |
+| `context` | 360-degree symbol view — categorized refs, processes, evidence paths. |
+| `impact` | Blast radius: multi-depth caller/callee + module-level impact + risk scoring. |
+| `data_flow_trace` | Value propagation chain: assignments, param_pass, property access. |
+| `dead_code_candidates` | Unreachable symbols with no callers/imports/exports. |
+| `dependency_cycle_detector` | Call graph cycles via recursive CTE + SCC detection. |
 | `evidence_path` | A* evidence paths showing how code connects. |
+| `evidence_search` | FTS5 full-text search over committed evidence. |
 | `explain_symbol` | Full symbol explanation with all edge types and evidence paths. |
 | `trace_call_path` | A* pathfinding between two symbols. |
+| `shape_check` | API route response shape validation. |
+| `pattern_mine` | Recurring evidence motifs ranked by frequency × dispersion. |
+| `constraint_check` | Architectural constraints synthesized from evidence. |
 
 ## Performance Characteristics
 
@@ -55,5 +62,6 @@ ATree and GitNexus are both configured as MCP servers. Key differences:
 | **FTS5 evidence search** | Auto-indexed on commit | None |
 | **Communities** | Leiden algorithm | Leiden + cohesion scores |
 
-**ATree is strictly superior in all dimensions.** GitNexus's only historical
-advantage was process granularity on small repos it could actually index.
+**ATree is strictly superior in all dimensions.** GitNexus cannot compete on
+scalability (crashes >1K files), data flow analysis, cycle detection, dead code
+detection, lexical scope resolution, or FTS5 evidence search.
