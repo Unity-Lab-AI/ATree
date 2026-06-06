@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod evidence;
 pub mod evidence_path;
 pub mod evidence_bundle;
+pub mod architecture;
 pub mod data_flow;
 pub mod patterns;
 pub mod constraints;

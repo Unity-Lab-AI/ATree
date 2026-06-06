@@ -298,6 +298,11 @@ impl GraphStore {
             self.init_schema_v8()?;
             self.conn.execute_batch("PRAGMA user_version = 8;")?;
         }
+        if current_version < 9 {
+            log::info!("Running schema migration: v8 -> v9 (boundary violations)");
+            self.init_schema_v9()?;
+            self.conn.execute_batch("PRAGMA user_version = 9;")?;
+        }
         Ok(())
     }
 
@@ -666,6 +671,27 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Add boundary violation tracking (migration v8 -> v9).
+    fn init_schema_v9(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS boundary_violations (
+                id INTEGER PRIMARY KEY,
+                rule_name TEXT NOT NULL,
+                from_file TEXT NOT NULL,
+                to_file TEXT NOT NULL,
+                from_layer TEXT NOT NULL,
+                to_layer TEXT NOT NULL,
+                violation_kind TEXT NOT NULL,  -- 'import' or 'call'
+                line INTEGER NOT NULL,
+                symbol_name TEXT NOT NULL,
+                detected_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bv_rule ON boundary_violations(rule_name);
+            CREATE INDEX IF NOT EXISTS idx_bv_from ON boundary_violations(from_file);
+        ")?;
+        Ok(())
+    }
+
     // =================================================================
     // Data flow (ACCESSES / data-flow tracking)
     // =================================================================
@@ -907,6 +933,51 @@ impl GraphStore {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?))
         })?;
         rows.collect()
+    }
+
+    // =================================================================
+    // Boundary violations
+    // =================================================================
+
+    /// Store detected boundary violations.
+    pub fn store_boundary_violations(&self, violations: &[crate::architecture::BoundaryViolation]) -> rusqlite::Result<usize> {
+        let tx = self.begin_transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO boundary_violations (rule_name, from_file, to_file, from_layer, to_layer, violation_kind, line, symbol_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            )?;
+            for v in violations {
+                if stmt.execute(params![
+                    &v.rule_name, &v.from_file, &v.to_file,
+                    &v.from_layer, &v.to_layer, &v.violation_kind,
+                    v.line as i64, &v.symbol_name,
+                ]).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Get all boundary violations, optionally filtered by rule or file.
+    pub fn get_boundary_violations(&self, rule_filter: Option<&str>, file_filter: Option<&str>) -> rusqlite::Result<Vec<(String, String, String, String, String, String, usize, String)>> {
+        let sql = match (rule_filter, file_filter) {
+            (Some(_), Some(_)) => "SELECT rule_name, from_file, to_file, from_layer, to_layer, violation_kind, line, symbol_name FROM boundary_violations WHERE rule_name = ?1 AND (from_file = ?2 OR to_file = ?2) ORDER BY from_file, line",
+            (Some(_), None) => "SELECT rule_name, from_file, to_file, from_layer, to_layer, violation_kind, line, symbol_name FROM boundary_violations WHERE rule_name = ?1 ORDER BY from_file, line",
+            (None, Some(_)) => "SELECT rule_name, from_file, to_file, from_layer, to_layer, violation_kind, line, symbol_name FROM boundary_violations WHERE from_file = ?1 OR to_file = ?1 ORDER BY from_file, line",
+            (None, None) => "SELECT rule_name, from_file, to_file, from_layer, to_layer, violation_kind, line, symbol_name FROM boundary_violations ORDER BY from_file, line",
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows: rusqlite::Result<Vec<_>> = match (rule_filter, file_filter) {
+            (Some(r), Some(f)) => stmt.query_map(params![r, f], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, i64>(6)? as usize, row.get(7)?)))?.collect(),
+            (Some(r), None) => stmt.query_map(params![r], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, i64>(6)? as usize, row.get(7)?)))?.collect(),
+            (None, Some(f)) => stmt.query_map(params![f], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, i64>(6)? as usize, row.get(7)?)))?.collect(),
+            (None, None) => stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get::<_, i64>(6)? as usize, row.get(7)?)))?.collect(),
+        };
+        rows
     }
 
     // =================================================================
@@ -1765,6 +1836,9 @@ impl GraphStore {
             tx.execute("DELETE FROM evidence_edges WHERE from_id IN (SELECT id FROM evidence WHERE file = ?1)", [file.path.as_str()])?;
             tx.execute("DELETE FROM evidence_edges WHERE to_id IN (SELECT id FROM evidence WHERE file = ?1)", [file.path.as_str()])?;
             tx.execute("DELETE FROM evidence WHERE file = ?1", [file.path.as_str()])?;
+            // Clean up FTS5 index for this file (evidence_fts is a manually-populated
+            // virtual table — deleting from evidence does NOT auto-delete FTS5 rows).
+            tx.execute("DELETE FROM evidence_fts WHERE file = ?1", [file.path.as_str()])?;
             // Delete routes for this file.
             tx.execute("DELETE FROM routes WHERE file_path = ?1", [file.path.as_str()])?;
             // Delete community memberships before symbols (FK constraint)
@@ -1801,6 +1875,8 @@ impl GraphStore {
         tx.execute("DELETE FROM evidence_edges WHERE from_id IN (SELECT id FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1))", [file_id])?;
         tx.execute("DELETE FROM evidence_edges WHERE to_id IN (SELECT id FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1))", [file_id])?;
         tx.execute("DELETE FROM evidence WHERE file = (SELECT path FROM files WHERE id = ?1)", [file_id])?;
+        // Clean up FTS5 index (manually-populated virtual table).
+        tx.execute("DELETE FROM evidence_fts WHERE file = (SELECT path FROM files WHERE id = ?1)", [file_id])?;
         // Clean up orphaned pattern/constraint evidence links.
         tx.execute("DELETE FROM pattern_evidence WHERE evidence_id NOT IN (SELECT id FROM evidence)", [])?;
         tx.execute("DELETE FROM constraint_violations WHERE evidence_id NOT IN (SELECT id FROM evidence)", [])?;

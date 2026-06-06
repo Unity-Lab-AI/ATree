@@ -237,6 +237,184 @@ pub fn build_type_envs(parsed_files: &[ParsedFile]) -> FxHashMap<u64, TypeEnviro
     envs
 }
 
+/// Cross-file type resolution context.
+/// Links type environments across files using import graphs.
+pub struct CrossFileTypeResolver {
+    /// file_id → type environment
+    envs: FxHashMap<u64, TypeEnvironment>,
+    /// file_id → Vec<(local_name, imported_type_name, source_file_id)>
+    /// Built from imports: `import { Foo } from './bar'` → local_name="Foo", type_name="Foo", source=bar
+    import_links: FxHashMap<u64, Vec<(String, String, u64)>>,
+    /// type_name → Vec<(file_id, symbol_id)> — reverse index for type→definition lookup
+    type_definitions: FxHashMap<String, Vec<(u64, u64)>>,
+}
+
+impl CrossFileTypeResolver {
+    pub fn new(envs: FxHashMap<u64, TypeEnvironment>) -> Self {
+        Self {
+            envs,
+            import_links: FxHashMap::default(),
+            type_definitions: FxHashMap::default(),
+        }
+    }
+
+    /// Register an import link: file `from_file` imports `type_name` as `local_name` from `to_file`.
+    pub fn add_import(&mut self, from_file: u64, local_name: &str, type_name: &str, to_file: u64) {
+        self.import_links
+            .entry(from_file)
+            .or_default()
+            .push((local_name.to_string(), type_name.to_string(), to_file));
+    }
+
+    /// Register a type definition: `type_name` is defined in `file_id` by `symbol_id`.
+    pub fn add_type_definition(&mut self, type_name: &str, file_id: u64, symbol_id: u64) {
+        self.type_definitions
+            .entry(type_name.to_string())
+            .or_default()
+            .push((file_id, symbol_id));
+    }
+
+    /// Resolve a method call on a receiver to a specific symbol.
+    /// Given: receiver type = `type_name`, method = `method_name`, calling from `from_file`.
+    /// Returns: Some((file_id, symbol_id)) of the resolved method, or None.
+    pub fn resolve_method(&self, type_name: &str, method_name: &str, from_file: u64) -> Option<(u64, u64)> {
+        // Strategy 1: Direct type definition lookup — find the class/struct with this name,
+        // then look for a method with the matching name in that file.
+        if let Some(defs) = self.type_definitions.get(type_name) {
+            for (file_id, _sym_id) in defs {
+                if let Some(env) = self.envs.get(file_id) {
+                    // Check if this file's symbols include the method
+                    for scope_map in env.bindings.values() {
+                        if scope_map.contains_key(method_name) {
+                            // Found the method in the type's file — return the type's file
+                            // The actual symbol ID would need a second lookup, but for now
+                            // return the file so the caller can search for the method symbol
+                            return Some((*file_id, 0));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Follow import links from the calling file.
+        // If the calling file imported this type, look in the source file.
+        if let Some(imports) = self.import_links.get(&from_file) {
+            for (local, imported_type, source_file) in imports {
+                if local == type_name || imported_type == type_name {
+                    if let Some(env) = self.envs.get(source_file) {
+                        for scope_map in env.bindings.values() {
+                            if scope_map.contains_key(method_name) {
+                                return Some((*source_file, 0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve a variable's type, following import chains across files.
+    pub fn resolve_type(&self, var_name: &str, from_file: u64, scope_id: Option<u64>) -> Option<String> {
+        // First, check the local file's type environment
+        if let Some(env) = self.envs.get(&from_file) {
+            if let Some(t) = env.lookup(var_name, scope_id, &[], &[]) {
+                return Some(t);
+            }
+        }
+
+        // If not found locally, check if the variable's type was imported from another file
+        if let Some(imports) = self.import_links.get(&from_file) {
+            for (local, imported_type, _source_file) in imports {
+                if local == var_name {
+                    return Some(imported_type.clone());
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Build a CrossFileTypeResolver from parsed files and their imports.
+/// This is the main entry point for cross-file type resolution.
+pub fn build_cross_file_resolver(
+    parsed_files: &[ParsedFile],
+    file_id_to_path: &FxHashMap<u64, String>,
+    path_to_file_id: &FxHashMap<String, u64>,
+) -> CrossFileTypeResolver {
+    let envs = build_type_envs(parsed_files);
+    let mut resolver = CrossFileTypeResolver::new(envs);
+
+    // Build type definitions index: class/struct/enum/trait names → (file_id, symbol_id)
+    for parsed in parsed_files {
+        for sym in &parsed.symbols {
+            use crate::lang::CaptureTag;
+            match sym.kind {
+                CaptureTag::DefinitionClass | CaptureTag::DefinitionStruct |
+                CaptureTag::DefinitionInterface | CaptureTag::DefinitionEnum |
+                CaptureTag::DefinitionTrait | CaptureTag::DefinitionType => {
+                    resolver.add_type_definition(&sym.name, parsed.id, sym.id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Build import links from parsed imports
+    for parsed in parsed_files {
+        for imp in &parsed.imports {
+            // Resolve the import source to a file ID
+            if let Some(source_file_id) = resolve_import_to_file_id(
+                &imp.source, &parsed.path, file_id_to_path, path_to_file_id
+            ) {
+                resolver.add_import(
+                    parsed.id,
+                    &imp.local_name,
+                    &imp.imported_name,
+                    source_file_id,
+                );
+            }
+        }
+    }
+
+    resolver
+}
+
+/// Resolve an import source path to a file ID using path mappings.
+fn resolve_import_to_file_id(
+    source: &str,
+    from_path: &str,
+    _file_id_to_path: &FxHashMap<u64, String>,
+    path_to_file_id: &FxHashMap<String, u64>,
+) -> Option<u64> {
+    // Try direct path match
+    if let Some(id) = path_to_file_id.get(source) {
+        return Some(*id);
+    }
+
+    // Try resolving relative to the importing file's directory
+    if source.starts_with('.') {
+        let from_dir = std::path::Path::new(from_path).parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let resolved = format!("{}/{}", from_dir, source);
+        if let Some(id) = path_to_file_id.get(&resolved) {
+            return Some(*id);
+        }
+        // Try with common extensions
+        for ext in &[".ts", ".js", ".tsx", ".jsx", ".py", ".rs", ".go", ".java"] {
+            let with_ext = format!("{}{}", resolved, ext);
+            if let Some(id) = path_to_file_id.get(&with_ext) {
+                return Some(*id);
+            }
+        }
+    }
+
+    None
+}
+
 /// Type-aware call resolution — resolve a call's receiver to its type,
 /// then use that type to find the correct target symbol.
 pub fn resolve_call_with_type_env(
