@@ -862,6 +862,41 @@ impl GraphStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Get the module-level impact: which files are affected if this symbol changes.
+    /// Returns (source_file, target_file, edge_kind, weight) tuples.
+    pub fn get_module_impact(&self, symbol_id: i64, max_depth: i64) -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE impact(fid, depth) AS (
+                 SELECT DISTINCT s2.file_id, 1
+                 FROM edges e
+                 JOIN symbols s2 ON s2.id = e.src_id OR s2.id = e.dst_id
+                 WHERE (e.src_id = ?1 OR e.dst_id = ?1)
+                 AND s2.file_id != (SELECT file_id FROM symbols WHERE id = ?1)
+                 UNION ALL
+                 SELECT DISTINCT s3.file_id, i.depth + 1
+                 FROM edges e2
+                 JOIN symbols s3 ON s3.id = e2.src_id OR s3.id = e2.dst_id
+                 JOIN impact i ON s3.file_id = i.fid
+                 WHERE i.depth < ?2
+             )
+             SELECT f1.path, f2.path, e.edge_kind, COUNT(*) as weight
+             FROM edges e
+             JOIN symbols s_src ON s_src.id = e.src_id
+             JOIN symbols s_dst ON s_dst.id = e.dst_id
+             JOIN files f1 ON f1.id = s_src.file_id
+             JOIN files f2 ON f2.id = s_dst.file_id
+             WHERE s_src.file_id != s_dst.file_id
+             AND (s_src.file_id IN (SELECT fid FROM impact) OR s_src.file_id = ?3)
+             GROUP BY f1.path, f2.path, e.edge_kind
+             ORDER BY weight DESC
+             LIMIT 50"
+        )?;
+        let rows = stmt.query_map(params![symbol_id, max_depth, symbol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
     /// Get all ACCESSES edges for a symbol (both reads and writes).
     pub fn get_accesses(&self, symbol_id: i64) -> rusqlite::Result<Vec<(i64, String, f64)>> {
         let mut stmt = self.conn.prepare(
