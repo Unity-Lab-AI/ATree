@@ -2,8 +2,14 @@
   "mcp": {
     "atree": {
       "type": "stdio",
-      "command": "atree",
-      "args": ["mcp-server"],
+      "command": "/home/bamn/ATree/target/release/atree",
+      "args": ["mcp-server", "--db", "/home/bamn/ATree/.atree/index.sqlite"],
+      "env": {}
+    },
+    "gitnexus": {
+      "type": "stdio",
+      "command": "gitnexus",
+      "args": ["mcp"],
       "env": {}
     }
   }

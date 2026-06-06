@@ -224,16 +224,23 @@ impl<'a> ResolutionEngine<'a> {
                 let result = self.resolve_call(call);
                 if let Some((sym_id, confidence)) = result {
                     self.store.update_call_resolution(call.id, Some(sym_id), confidence.score())?;
-                    // Emit CALLS edge
-                    self.store.insert_edge(&EdgeRecord {
-                        id: 0,
-                        src_id: call.caller_scope_id.unwrap_or(0),
-                        dst_id: sym_id,
-                        edge_kind: "CALLS".to_string(),
-                        confidence: confidence.score(),
-                        file_id: Some(*file_id),
-                        line: call.line,
-                    })?;
+                    // Resolve the caller scope to an enclosing symbol (function/method).
+                    // caller_scope_id references the scopes table; we need the symbol
+                    // that owns this scope (the enclosing function/method).
+                    let caller_symbol_id = call.caller_scope_id
+                        .and_then(|sid| self.resolve_scope_to_symbol(sid))
+                        .unwrap_or(0);
+                    if caller_symbol_id > 0 {
+                        self.store.insert_edge(&EdgeRecord {
+                            id: 0,
+                            src_id: caller_symbol_id,
+                            dst_id: sym_id,
+                            edge_kind: "CALLS".to_string(),
+                            confidence: confidence.score(),
+                            file_id: Some(*file_id),
+                            line: call.line,
+                        })?;
+                    }
                     resolved += 1;
                 }
             }
@@ -256,22 +263,37 @@ impl<'a> ResolutionEngine<'a> {
             }
         }
 
-        // Tier 2: Import-scoped — check imports
-        if let Some(imports) = self.imports_by_file.get(&file_id) {
-            for imp in imports {
-                if imp.imported_name == *callee || imp.local_name == *callee {
-                    if let Some(target_file) = imp.resolved_file_id {
-                        if let Some(sym_ids) = self.symbols_by_file.get(&target_file) {
-                            for sym_id in sym_ids {
-                                if let Some(sym) = self.get_symbol(*sym_id) {
-                                    if sym.name == *callee {
-                                        return Some((*sym_id, Confidence::ExactImport));
+        // Tier 2: Import-scoped — check all resolved imports for matching symbols.
+        // For each import that resolved to a file, look for symbols in that file
+        // matching the callee name. This handles both direct imports (`use foo::bar`
+        // calling `bar()`) and module-scoped imports (`use foo::Type` calling
+        // `instance.method()` where `method` is defined in `foo`'s module).
+        if let Ok(imports) = self.store.get_imports_by_file(file_id) {
+            let mut best_import_match: Option<(i64, Confidence)> = None;
+            for imp in &imports {
+                if let Some(target_file) = imp.resolved_file_id {
+                    if let Some(sym_ids) = self.symbols_by_file.get(&target_file) {
+                        for sym_id in sym_ids {
+                            if let Some(sym) = self.get_symbol(*sym_id) {
+                                if sym.name == *callee {
+                                    // Prefer exact name match on the import itself
+                                    let conf = if imp.imported_name == *callee || imp.local_name == *callee {
+                                        Confidence::ExactImport
+                                    } else {
+                                        Confidence::ImportScoped
+                                    };
+                                    // Keep best confidence match
+                                    if best_import_match.map_or(true, |(_, c)| conf.score() > c.score()) {
+                                        best_import_match = Some((*sym_id, conf));
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+            if let Some((sym_id, conf)) = best_import_match {
+                return Some((sym_id, conf));
             }
         }
 
@@ -304,6 +326,27 @@ impl<'a> ResolutionEngine<'a> {
         self.symbols_by_id.get(&id).cloned()
     }
 
+    /// Resolve a scope ID to its owning symbol (the enclosing function/method/class).
+    /// Walks up the scope chain until we find a symbol owned by one of the scopes.
+    fn resolve_scope_to_symbol(&self, scope_id: i64) -> Option<i64> {
+        let mut current = scope_id;
+        let mut visited = rustc_hash::FxHashSet::default();
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+            // Check if any symbol is owned by this scope
+            if let Some(sym) = self.symbols_by_id.values().find(|s| s.scope_id == Some(current)) {
+                return Some(sym.id);
+            }
+            // Walk up to parent scope
+            current = self.scopes_by_file.values()
+                .flatten()
+                .find(|s| s.id == current)
+                .and_then(|s| s.parent_id)?;
+        }
+    }
+
     // =================================================================
     // Phase 3: MRO (Method Resolution Order)
     // =================================================================
@@ -315,39 +358,36 @@ impl<'a> ResolutionEngine<'a> {
         let mut edges = 0;
         let all_heritage = self.store.get_all_heritage()?;
 
-        // Build a map: child_symbol_id → Vec<(parent_name, heritage_kind, line)>
-        let mut heritage_by_child: FxHashMap<i64, Vec<(String, String, usize)>> = FxHashMap::default();
-        for h in &all_heritage {
-            heritage_by_child
-                .entry(h.child_symbol_id)
-                .or_default()
-                .push((h.parent_name.clone(), h.heritage_kind.clone(), h.line));
-        }
+        // Track emitted (child, parent) pairs to avoid duplicates
+        let mut emitted: rustc_hash::FxHashSet<(i64, i64)> = rustc_hash::FxHashSet::default();
 
-        // For each class with heritage, resolve parent names to symbol IDs
-        for (child_id, parents) in &heritage_by_child {
-            for (parent_name, heritage_kind, line) in parents {
-                // Resolve parent symbol by name across all indexed symbols
-                if let Some(parent_ids) = self.symbols_by_name.get(parent_name) {
-                    // Pick the best match: prefer same-file, then first match
-                    let parent_id = self.resolve_best_parent(*child_id, parent_ids);
-                    if let Some(pid) = parent_id {
-                        // Emit EXTENDS or IMPLEMENTS edge
-                        let edge_kind = match heritage_kind.as_str() {
-                            "Implements" | "implements" => "IMPLEMENTS",
-                            _ => "EXTENDS",
-                        };
-                        self.store.insert_edge(&EdgeRecord {
-                            id: 0,
-                            src_id: *child_id,
-                            dst_id: pid,
-                            edge_kind: edge_kind.to_string(),
-                            confidence: 1.0,
-                            file_id: None,
-                            line: *line,
-                        })?;
-                        edges += 1;
-                    }
+        for h in &all_heritage {
+            // Determine parent symbol ID: use already-resolved value or look up by name
+            let parent_id: Option<i64> = if let Some(pid) = h.parent_symbol_id {
+                if pid > 0 { Some(pid) } else { None }
+            } else if let Some(parent_ids) = self.symbols_by_name.get(&h.parent_name) {
+                self.resolve_best_parent(h.child_symbol_id, parent_ids)
+            } else {
+                None
+            };
+
+            if let Some(pid) = parent_id {
+                // Skip if we already emitted this edge
+                if emitted.insert((h.child_symbol_id, pid)) {
+                    let edge_kind = match h.heritage_kind.as_str() {
+                        "Implements" | "implements" => "IMPLEMENTS",
+                        _ => "EXTENDS",
+                    };
+                    self.store.insert_edge(&EdgeRecord {
+                        id: 0,
+                        src_id: h.child_symbol_id,
+                        dst_id: pid,
+                        edge_kind: edge_kind.to_string(),
+                        confidence: 1.0,
+                        file_id: None,
+                        line: h.line,
+                    })?;
+                    edges += 1;
                 }
             }
         }

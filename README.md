@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Version** | `0.7.0-alpha` |
-| **Status** | Alpha — A\* filesystem tool and semantic engine with scope resolution, type-aware extraction, MCP server, and 35+ query subcommands. |
+| **Status** | Alpha — A\* filesystem tool and semantic engine with scope resolution, MCP server, and 40+ CLI/MCP query commands. |
 | **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red, B-A-M-N |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
@@ -243,9 +243,9 @@ The engine is activated with the `--semantic` flag. It stores its index in a per
 
 ## Key features
 
-- **16+ languages** — TypeScript, JavaScript, Python, Rust (Tier 1); Go, Java, C#, PHP (Tier 2); C, C++, Ruby, Kotlin, Swift, Bash, JSON, YAML (Tier 3)
-- **Scope resolution** — C3 MRO, receiver-bound calls (7-case dispatcher), free-call fallback, overload narrowing by arity + argument types
-- **Type-aware extraction** — AST type binding, type environment with scoped resolution
+- **17 languages** — TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, PHP, Ruby, Kotlin, Swift, Dart, Bash, JSON, YAML
+- **Scope resolution** — C3 MRO, receiver-bound calls (7-case dispatcher), free-call fallback, import resolution (3-tier)
+- **Type extraction** — AST type bindings extracted and stored; type environment (Tier 0 annotations) populated during indexing. Tier 1 (constructor inference) and Tier 2 (assignment propagation) are not yet wired into scope resolution.
 - **Git history** — commit log walk, per-file change tracking, author aggregation, co-change coupling
 - **Graph analytics** — community detection (label propagation), process tracing (BFS call chains)
 - **Search** — BM25 FTS5 full-text search + optional semantic vector embeddings (ONNX)
@@ -499,11 +499,11 @@ The scope-resolution pipeline (ported from GitNexus RFC #909 Ring 3) resolves sy
 - **Ownership reconciliation** — populates class-owned members after resolution
 - **Namespace target collection** — gathers all possible targets for a reference site
 
-All 55 existing tests pass, including stress tests for deep inheritance chains, mixed-language projects, and incremental scan correctness.
+All 286 tests pass, including stress tests for deep inheritance chains, mixed-language projects, and incremental scan correctness.
 
 ## MCP server
 
-ATree exposes 43 MCP (Model Context Protocol) tools for AI agent integration via stdio transport.
+ATree exposes 46 MCP (Model Context Protocol) tools for AI agent integration via stdio transport.
 
 ### Configuration
 

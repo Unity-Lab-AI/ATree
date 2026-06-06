@@ -146,14 +146,11 @@ impl GraphStore {
     }
 
     /// Begin a transaction, returning an error if one is already active.
-    /// Safe wrapper around `unchecked_transaction()` — logs and returns an error
-    /// instead of panicking on nested calls. Use this instead of `conn().unchecked_transaction()`.
+    /// Begin a transaction, returning an error if one is already active.
+    /// Safe wrapper — logs and returns an error instead of panicking on nested calls.
+    /// Use this instead of `conn().unchecked_transaction()` directly.
     pub fn begin_transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        self.conn.unchecked_transaction()
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to begin transaction (possible nested call)");
-                e
-            })
+        begin_transaction(&self.conn)
     }
 
     /// Run WAL checkpoint and ANALYZE to keep the database performant.
@@ -1182,6 +1179,7 @@ impl GraphStore {
             .as_secs() as i64;
 
         for file in parsed_files {
+
             // Insert file record.
             if let Err(e) = file_stmt.execute(params![
                 file.path, file.hash as i64,
@@ -1247,17 +1245,42 @@ impl GraphStore {
 
             // Insert heritage.
             for her in &file.heritage {
-                let child_id = file.symbols.iter()
-                    .position(|s| s.name == her.class_name || her.class_name.is_empty())
+                let child_idx = if !her.class_name.is_empty() {
+                    file.symbols.iter().position(|s| s.name == her.class_name)
+                } else {
+                    file.symbols.iter()
+                        .enumerate()
+                        .filter(|(_, s)| {
+                            matches!(s.kind,
+                                crate::lang::CaptureTag::DefinitionClass |
+                                crate::lang::CaptureTag::DefinitionStruct |
+                                crate::lang::CaptureTag::DefinitionInterface |
+                                crate::lang::CaptureTag::DefinitionEnum |
+                                crate::lang::CaptureTag::DefinitionTrait)
+                        })
+                        .filter(|(_, s)| s.line <= her.line)
+                        .max_by_key(|(_, s)| s.line)
+                        .map(|(idx, _)| idx)
+                };
+                let child_id = child_idx
                     .and_then(|idx| file.symbols.get(idx).and_then(|s| global_symbol_id_map.get(&s.id).copied()))
                     .unwrap_or(0);
-                let _ = heritage_stmt.execute(params![
-                    file_id, child_id, 0i64,
+                let parent_id: Option<i64> = if child_id > 0 {
+                    let same_file = file.symbols.iter()
+                        .find(|s| s.name == her.target_name && s.id as i64 != child_id)
+                        .and_then(|s| global_symbol_id_map.get(&s.id).copied());
+                    if same_file.is_some() { same_file } else {
+                        self.get_symbols_by_name(&her.target_name).ok()
+                            .and_then(|syms| syms.first().map(|s| s.id))
+                    }
+                } else { None };
+                heritage_stmt.execute(params![
+                    file_id, child_id, parent_id,
                     her.target_name,
                     format!("{:?}", her.heritage_kind),
                     her.confidence.score(),
                     her.line as i64,
-                ]);
+                ])?;
             }
 
             // Insert imports.
@@ -1476,15 +1499,7 @@ impl GraphStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, hash, language, mtime, indexed_at, repo_label FROM files"
         )?;
-        let rows = stmt.query_map([], |row| Ok(FileRecord {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            hash: row.get::<_, i64>(2)? as u64,
-            language: row.get(3)?,
-            mtime: row.get(4)?,
-            indexed_at: row.get(5)?,
-            repo_label: row.get(6)?,
-        }))?;
+        let rows = stmt.query_map([], Self::map_file_row)?;
         rows.collect()
     }
 
@@ -1531,6 +1546,21 @@ impl GraphStore {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a symbol with an explicit ID (for process/community nodes).
+    pub fn insert_symbol_with_id(&self, rec: &SymbolRecord) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO symbols (id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                rec.id, rec.file_id, rec.name, rec.qualified_name, rec.kind,
+                rec.line as i64, rec.col as i64,
+                if rec.is_exported { 1 } else { 0 },
+                rec.scope_id, rec.owner_symbol_id,
+            ],
+        )?;
+        Ok(rec.id)
     }
 
     /// Get symbols by name (across all files).
@@ -1714,14 +1744,79 @@ impl GraphStore {
         rows.collect()
     }
 
-    /// Get all symbols across all files. Uses chunked loading to bound memory;
-    /// for very large indexes, prefer paginated queries via `get_symbols_paginated`.
+    /// Get all symbols across all files.
+    ///
+    /// **Memory warning:** For large indexes (>100K symbols), prefer
+    /// `get_all_symbols_chunked` or `get_symbols_paginated` to bound memory.
     pub fn get_all_symbols(&self) -> rusqlite::Result<Vec<SymbolRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
              FROM symbols"
         )?;
-        let rows = stmt.query_map([], |row| Ok(SymbolRecord {
+        let rows = stmt.query_map([], Self::map_symbol_row)?;
+        rows.collect()
+    }
+
+    /// Stream all symbols in chunks to bound memory usage.
+    ///
+    /// Calls `chunk_fn` with each chunk of up to `chunk_size` symbols.
+    /// Returns the total symbol count. If `chunk_fn` returns `Err`, streaming stops.
+    ///
+    /// Use this instead of `get_all_symbols` for large indexes where loading
+    /// all symbols into a single `Vec` would exhaust memory.
+    pub fn get_all_symbols_chunked<F>(&self, chunk_size: usize, mut chunk_fn: F) -> rusqlite::Result<usize>
+    where
+        F: FnMut(&[SymbolRecord]) -> rusqlite::Result<()>,
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+             FROM symbols"
+        )?;
+        let mut rows = stmt.query_map([], Self::map_symbol_row)?;
+        let mut chunk = Vec::with_capacity(chunk_size);
+        let mut total = 0;
+        while let Some(row) = rows.next() {
+            chunk.push(row?);
+            total += 1;
+            if chunk.len() >= chunk_size {
+                chunk_fn(&chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            chunk_fn(&chunk)?;
+        }
+        Ok(total)
+    }
+
+    /// Get all files in chunks to bound memory usage.
+    pub fn get_all_files_chunked<F>(&self, chunk_size: usize, mut chunk_fn: F) -> rusqlite::Result<usize>
+    where
+        F: FnMut(&[FileRecord]) -> rusqlite::Result<()>,
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, hash, language, mtime, indexed_at, repo_label FROM files"
+        )?;
+        let mut rows = stmt.query_map([], Self::map_file_row)?;
+        let mut chunk = Vec::with_capacity(chunk_size);
+        let mut total = 0;
+        while let Some(row) = rows.next() {
+            chunk.push(row?);
+            total += 1;
+            if chunk.len() >= chunk_size {
+                chunk_fn(&chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            chunk_fn(&chunk)?;
+        }
+        Ok(total)
+    }
+
+    #[inline]
+    fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRecord> {
+        Ok(SymbolRecord {
             id: row.get(0)?,
             file_id: row.get(1)?,
             name: row.get(2)?,
@@ -1732,8 +1827,20 @@ impl GraphStore {
             is_exported: row.get::<_, i64>(7)? != 0,
             scope_id: row.get(8)?,
             owner_symbol_id: row.get(9)?,
-        }))?;
-        rows.collect()
+        })
+    }
+
+    #[inline]
+    fn map_file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+        Ok(FileRecord {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            hash: row.get::<_, i64>(2)? as u64,
+            language: row.get(3)?,
+            mtime: row.get(4)?,
+            indexed_at: row.get(5)?,
+            repo_label: row.get(6)?,
+        })
     }
 
     /// Get symbols with pagination (for large indexes). Returns (symbols, has_more).
@@ -1785,6 +1892,11 @@ impl GraphStore {
     /// Count total symbols.
     pub fn count_symbols(&self) -> rusqlite::Result<i64> {
         self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+    }
+
+    /// Count indexed files.
+    pub fn count_files(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM files WHERE path != '__process_placeholder__'", [], |row| row.get(0))
     }
 
     // =================================================================
@@ -2094,11 +2206,45 @@ impl GraphStore {
     }
 
     /// Get all edges in the graph.
+    ///
+    /// **Memory warning:** For large indexes (>1M edges), prefer
+    /// `get_all_edges_chunked` to bound memory.
     pub fn get_all_edges(&self) -> rusqlite::Result<Vec<EdgeRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges"
         )?;
-        let rows = stmt.query_map([], |row| Ok(EdgeRecord {
+        let rows = stmt.query_map([], Self::map_edge_row)?;
+        rows.collect()
+    }
+
+    /// Stream all edges in chunks to bound memory usage.
+    pub fn get_all_edges_chunked<F>(&self, chunk_size: usize, mut chunk_fn: F) -> rusqlite::Result<usize>
+    where
+        F: FnMut(&[EdgeRecord]) -> rusqlite::Result<()>,
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges"
+        )?;
+        let mut rows = stmt.query_map([], Self::map_edge_row)?;
+        let mut chunk = Vec::with_capacity(chunk_size);
+        let mut total = 0;
+        while let Some(row) = rows.next() {
+            chunk.push(row?);
+            total += 1;
+            if chunk.len() >= chunk_size {
+                chunk_fn(&chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            chunk_fn(&chunk)?;
+        }
+        Ok(total)
+    }
+
+    #[inline]
+    fn map_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeRecord> {
+        Ok(EdgeRecord {
             id: row.get(0)?,
             src_id: row.get(1)?,
             dst_id: row.get(2)?,
@@ -2106,8 +2252,7 @@ impl GraphStore {
             confidence: row.get(4)?,
             file_id: row.get(5)?,
             line: row.get::<_, i64>(6)? as usize,
-        }))?;
-        rows.collect()
+        })
     }
 
     /// Count total edges.
@@ -2121,50 +2266,54 @@ impl GraphStore {
 
     /// Find all callers of a symbol (upstream impact).
     /// Uses recursive CTE to walk the call graph backwards.
+    /// `max_depth` is hard-capped at 10 to prevent pathological queries.
     pub fn get_callers(&self, symbol_id: i64, max_depth: usize) -> rusqlite::Result<Vec<(i64, String, f64, i64)>> {
+        let depth = max_depth.min(10);
         let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE callers(depth, caller_id, caller_name, confidence, file_id) AS (
-                SELECT 0, e.src_id, s.name, e.confidence, e.file_id
+            "WITH RECURSIVE callers(depth, caller_id, caller_name, confidence, sym_file_id) AS (
+                SELECT 0, e.src_id, s.name, e.confidence, s.file_id
                 FROM edges e
                 JOIN symbols s ON s.id = e.src_id
                 WHERE e.dst_id = ?1 AND e.edge_kind = 'CALLS'
                 UNION ALL
-                SELECT callers.depth + 1, e.src_id, s.name, e.confidence, e.file_id
+                SELECT callers.depth + 1, e.src_id, s.name, e.confidence, s.file_id
                 FROM callers
                 JOIN edges e ON e.dst_id = callers.caller_id
                 JOIN symbols s ON s.id = e.src_id
                 WHERE e.edge_kind = 'CALLS' AND callers.depth < ?2
             )
-            SELECT DISTINCT caller_id, caller_name, confidence, file_id FROM callers WHERE depth > 0
+            SELECT DISTINCT caller_id, caller_name, confidence, sym_file_id FROM callers WHERE depth > 0
             ORDER BY depth
             LIMIT 10000"
         )?;
-        let rows = stmt.query_map(params![symbol_id, max_depth as i64], |row| {
+        let rows = stmt.query_map(params![symbol_id, depth as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         rows.collect()
     }
 
     /// Find all callees of a symbol (downstream impact).
+    /// `max_depth` is hard-capped at 10 to prevent pathological queries.
     pub fn get_callees(&self, symbol_id: i64, max_depth: usize) -> rusqlite::Result<Vec<(i64, String, f64, i64)>> {
+        let depth = max_depth.min(10);
         let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE callees(depth, callee_id, callee_name, confidence, file_id) AS (
-                SELECT 0, e.dst_id, s.name, e.confidence, e.file_id
+            "WITH RECURSIVE callees(depth, callee_id, callee_name, confidence, sym_file_id) AS (
+                SELECT 0, e.dst_id, s.name, e.confidence, s.file_id
                 FROM edges e
                 JOIN symbols s ON s.id = e.dst_id
                 WHERE e.src_id = ?1 AND e.edge_kind = 'CALLS'
                 UNION ALL
-                SELECT callees.depth + 1, e.dst_id, s.name, e.confidence, e.file_id
+                SELECT callees.depth + 1, e.dst_id, s.name, e.confidence, s.file_id
                 FROM callees
                 JOIN edges e ON e.src_id = callees.callee_id
                 JOIN symbols s ON s.id = e.dst_id
                 WHERE e.edge_kind = 'CALLS' AND callees.depth < ?2
             )
-            SELECT DISTINCT callee_id, callee_name, confidence, file_id FROM callees WHERE depth > 0
+            SELECT DISTINCT callee_id, callee_name, confidence, sym_file_id FROM callees WHERE depth > 0
             ORDER BY depth
             LIMIT 10000"
         )?;
-        let rows = stmt.query_map(params![symbol_id, max_depth as i64], |row| {
+        let rows = stmt.query_map(params![symbol_id, depth as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         rows.collect()

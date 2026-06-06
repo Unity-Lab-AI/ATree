@@ -12,12 +12,6 @@ impl LanguageProvider for YAMLProvider {
         r#"
 (block_mapping_pair key: (flow_node (plain_scalar (string_scalar) @name))) @definition.property
 (block_mapping_pair key: (flow_node (plain_scalar (integer_scalar) @name))) @definition.property
-(block_mapping_pair key: (flow_node (boolean_scalar) @name)) @definition.property
-(block_mapping_pair key: (flow_node (null_scalar) @name)) @definition.property
-(block_mapping_pair key: (block_scalar) @name) @definition.property
-(block_mapping_pair key: (flow_node) @name) @definition.property
-(flow_pair key: (flow_node (plain_scalar (string_scalar) @name))) @definition.property
-(flow_pair key: (flow_node) @name) @definition.property
-        "#
+"#
     }
 }

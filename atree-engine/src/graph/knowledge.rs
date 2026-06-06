@@ -356,6 +356,10 @@ impl KnowledgeGraph {
     ///
     /// Loads all symbols as nodes and all edges as relationships.
     /// Symbol IDs are converted from i64 (SQLite) to String (NodeId).
+    ///
+    /// **Memory note:** This loads the entire graph into memory. For large
+    /// indexes (>100K symbols), consider using SQLite recursive CTEs directly
+    /// instead of building the in-memory graph.
     pub fn from_store(store: &crate::store::GraphStore) -> rusqlite::Result<Self> {
         let mut graph = Self::new();
 

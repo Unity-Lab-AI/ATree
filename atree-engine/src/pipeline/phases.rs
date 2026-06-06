@@ -65,19 +65,39 @@ impl PipelinePhase for CrossFilePhase {
             }
         };
 
-        // Batch-insert all parsed files in a single transaction.
-        // This is the key performance win: ~50K individual auto-committed INSERTs
-        // become 1 transaction. For a 10K-file repo this is the difference between
-        // ~30 seconds and ~2 seconds of SQLite write time.
-        perf_timer!("SQLite batch insert");
-        let global_symbol_id_map = match store.insert_all_files_batch(
-            &parsed_files_guard,
-            ctx.repo_label.as_deref(),
-        ) {
-            Ok(map) => map,
-            Err(e) => {
-                eprintln!("[cross_file] Warning: batch insert failed: {}", e);
-                FxHashMap::default()
+        // Build the global symbol ID map. If the incremental path already
+        // inserted data, load symbol IDs from the DB. Otherwise batch-insert.
+        let global_symbol_id_map = if store.count_files().unwrap_or(0) > 0 {
+            perf_timer!("SQLite ID map (incremental)");
+            let mut map = rustc_hash::FxHashMap::default();
+            // Load all symbols from DB and match them to in-memory parsed files
+            // by (file_path, symbol_name, line) tuple.
+            if let Ok(db_symbols) = store.get_all_symbols() {
+                for db_sym in &db_symbols {
+                    // Find the matching in-memory symbol
+                    for pf in parsed_files_guard.iter() {
+                        if let Some(file) = store.get_file_by_id(db_sym.file_id).ok().flatten() {
+                            if file.path == pf.path {
+                                if let Some(mem_sym) = pf.symbols.iter()
+                                    .find(|s| s.name == db_sym.name && s.line == db_sym.line)
+                                {
+                                    map.insert(mem_sym.id, db_sym.id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        } else {
+            perf_timer!("SQLite batch insert");
+            match store.insert_all_files_batch(&parsed_files_guard, ctx.repo_label.as_deref()) {
+                Ok(map) => map,
+                Err(e) => {
+                    eprintln!("[cross_file] Warning: batch insert failed: {}", e);
+                    rustc_hash::FxHashMap::default()
+                }
             }
         };
         let resolved_imports: usize = parsed_files_guard.iter().map(|f| f.imports.len()).sum();
@@ -257,6 +277,27 @@ impl PipelinePhase for CrossFilePhase {
         }
 
         let resolved_calls = sr_stats.resolved_sites;
+
+        // ── Call Resolution (populate calls.resolved_symbol_id) ────────────────
+        // The scope resolution pipeline emits GraphEdges directly to the edges table,
+        // but the calls table's resolved_symbol_id is never populated during cold indexing.
+        // The ResolutionEngine handles this: it walks all unresolved calls, resolves them
+        // against the symbol table (same-file → import-scoped → receiver → global fallback),
+        // and writes back resolved_symbol_id + confidence to the calls table.
+        perf_timer!("Call resolution (ResolutionEngine)");
+        let call_resolver = crate::resolver::ResolutionEngine::new(&store);
+        match call_resolver {
+            Ok(engine) => {
+                match engine.run_full_resolution() {
+                    Ok(stats) => {
+                        eprintln!("[cross_file] Resolution: {} calls, {} imports, {} MRO, {} defines",
+                            stats.calls_resolved, stats.imports_resolved, stats.mro_edges, stats.defines_edges);
+                    }
+                    Err(e) => eprintln!("[cross_file] Warning: call resolution failed: {}", e),
+                }
+            }
+            Err(e) => eprintln!("[cross_file] Warning: failed to build resolution engine: {}", e),
+        }
 
         // ── Pattern Mining + Constraint Synthesis (Layers 2-3) ────────────────
         // Mine patterns from committed evidence, synthesize constraints.

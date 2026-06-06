@@ -227,12 +227,21 @@ pub fn store_processes(
     result: &ProcessDetectionResult,
 ) -> rusqlite::Result<usize> {
     let mut count = 0;
+    // Ensure a placeholder file exists for process/community nodes (file_id must reference files(id)).
+    let placeholder_file_id: i64 = store.conn().query_row(
+        "INSERT OR IGNORE INTO files (path, hash, language, mtime, indexed_at, repo_label)
+         VALUES ('__process_placeholder__', 0, 'Unknown', 0, 0, NULL)
+         ON CONFLICT(path) DO UPDATE SET path=path
+         RETURNING id",
+        [], |r| r.get(0),
+    ).unwrap_or(1);
+
     for process in &result.processes {
         let process_node_id = process_node_id(&process.id);
-        // Insert the process node itself.
-        store.insert_symbol(&crate::store::SymbolRecord {
+        // Insert the process node itself with explicit ID.
+        store.insert_symbol_with_id(&crate::store::SymbolRecord {
             id: process_node_id,
-            file_id: 0,
+            file_id: placeholder_file_id,
             name: process.heuristic_label.clone(),
             qualified_name: process.label.clone(),
             kind: "Process".to_string(),

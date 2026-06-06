@@ -70,6 +70,11 @@ macro_rules! assert_herit {
 #[test] fn golden_dart_methods() { let f = fixture!("../tests/fixtures/dart/service.dart", "dart"); assert_sym!(f, "findById", "save", "log", "index", "show", "render", "formatName"); }
 #[test] fn golden_dart_calls() { let f = fixture!("../tests/fixtures/dart/service.dart", "dart"); let calls: Vec<&str> = f.calls.iter().map(|c| c.callee_name.as_str()).collect(); assert!(!calls.is_empty(), "Dart should extract calls"); assert!(calls.contains(&"print") || calls.contains(&"render") || calls.contains(&"findById"), "Dart calls should contain render/findIds/print, got: {:?}", calls); }
 #[test] fn golden_bash_symbols() { let f = fixture!("../tests/fixtures/bash/deploy.sh", "sh"); assert_sym!(f, "log_message", "check_prerequisites", "deploy", "rollback", "main"); }
+#[test] fn golden_javascript_symbols() { let f = fixture!("../tests/fixtures/javascript/service.js", "js"); assert_sym!(f, "UserService", "UserRepository", "Logger", "createApp"); }
+#[test] fn golden_javascript_calls() { let f = fixture!("../tests/fixtures/javascript/service.js", "js"); let calls: Vec<&str> = f.calls.iter().map(|c| c.callee_name.as_str()).collect(); assert!(!calls.is_empty(), "JavaScript should extract calls, got: {:?}", calls); }
+#[test] fn golden_tsx_symbols() { let f = fixture!("../tests/fixtures/tsx/Component.tsx", "tsx"); assert_sym!(f, "UserRepository", "Logger", "UserService"); }
+#[test] fn golden_json_symbols() { let f = fixture!("../tests/fixtures/json/config.json", "json"); assert!(!f.symbols.is_empty(), "JSON should extract symbols from object keys"); }
+#[test] fn golden_yaml_symbols() { let f = fixture!("../tests/fixtures/yaml/config.yaml", "yaml"); assert!(!f.symbols.is_empty(), "YAML should extract symbols from mapping keys"); assert_sym!(f, "database", "logging", "server"); }
 
 #[test] fn golden_type_bindings_extracted_all_languages() {
     for (p, e, name) in &[
@@ -101,6 +106,10 @@ macro_rules! assert_herit {
         ("../tests/fixtures/swift/Service.swift", "swift", "Swift", vec!["User", "UserService", "Repository", "Logger"]),
         ("../tests/fixtures/dart/service.dart", "dart", "Dart", vec!["User", "UserService", "Repository", "Logger"]),
         ("../tests/fixtures/bash/deploy.sh", "sh", "Bash", vec!["deploy", "rollback", "main", "log_message"]),
+        ("../tests/fixtures/javascript/service.js", "js", "JavaScript", vec!["UserService", "UserRepository", "Logger", "createApp"]),
+        ("../tests/fixtures/tsx/Component.tsx", "tsx", "TSX", vec!["UserRepository", "Logger", "UserService"]),
+        ("../tests/fixtures/json/config.json", "json", "JSON", vec!["database"]),
+        ("../tests/fixtures/yaml/config.yaml", "yaml", "YAML", vec!["database", "logging", "server"]),
     ] {
         let f = parse(&fs::read_to_string(p).unwrap(), e);
         assert!(!f.symbols.is_empty(), "{}: no symbols", name);
@@ -108,3 +117,5 @@ macro_rules! assert_herit {
         for s in syms { assert!(n.contains(s), "{}: '{}' not found in {:?}", name, s, n); }
     }
 }
+
+

@@ -1258,14 +1258,51 @@ pub fn build_graph_incremental(
             }
 
             // Insert heritage
+            if !file.heritage.is_empty() {
+            }
             for her in &file.heritage {
-                let child_id = file.symbols.iter()
-                    .position(|s| s.name == her.class_name || her.class_name.is_empty())
+                let child_idx = if !her.class_name.is_empty() {
+                    file.symbols.iter().position(|s| s.name == her.class_name)
+                } else {
+                    // Find the nearest class/struct/interface symbol at or before this line.
+                    file.symbols.iter()
+                        .enumerate()
+                        .filter(|(_, s)| {
+                            matches!(s.kind,
+                                crate::lang::CaptureTag::DefinitionClass |
+                                crate::lang::CaptureTag::DefinitionStruct |
+                                crate::lang::CaptureTag::DefinitionInterface |
+                                crate::lang::CaptureTag::DefinitionEnum |
+                                crate::lang::CaptureTag::DefinitionTrait)
+                        })
+                        .filter(|(_, s)| s.line <= her.line)
+                        .max_by_key(|(_, s)| s.line)
+                        .map(|(idx, _)| idx)
+                };
+                let child_id = child_idx
                     .and_then(|idx| file.symbols.get(idx).and_then(|s| global_symbol_id_map.get(&s.id).copied()))
                     .unwrap_or(0);
+                // Resolve parent name to symbol ID from already-indexed symbols.
+                // Prefer same-file parent, then any indexed symbol with matching name.
+                let parent_id: Option<i64> = if child_id > 0 {
+                    // Try same-file symbols first
+                    let same_file_parent = file.symbols.iter()
+                        .find(|s| s.name == her.target_name && s.id as i64 != child_id)
+                        .and_then(|s| global_symbol_id_map.get(&s.id).copied());
+                    if same_file_parent.is_some() {
+                        same_file_parent
+                    } else {
+                        // Fall back to any indexed symbol with matching name
+                        store.get_symbols_by_name(&her.target_name)
+                            .ok()
+                            .and_then(|syms| syms.first().map(|s| s.id))
+                    }
+                } else {
+                    None
+                };
                 store.insert_heritage(&HeritageRecord {
                     id: 0, file_id, child_symbol_id: child_id,
-                    parent_symbol_id: None,
+                    parent_symbol_id: parent_id,
                     parent_name: her.target_name.clone(),
                     heritage_kind: format!("{:?}", her.heritage_kind),
                     confidence: her.confidence.score(),
@@ -4931,6 +4968,99 @@ def main():
 
         // Should only parse the Python file
         assert!(result.parsed_files[0].path.ends_with("main.py"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn call_resolution_populates_resolved_symbol_id() {
+        // Verify that after indexing, calls.resolved_symbol_id is populated
+        // for same-file and cross-file call resolution.
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_callres_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+
+        // File A defines a function
+        fs::write(tmp.join("a.py"), r#"
+def helper():
+    return "helper"
+
+def caller():
+    return helper()  # same-file call
+"#).unwrap();
+
+        // File B imports and calls it
+        fs::write(tmp.join("b.py"), r#"
+from a import helper
+
+def indirect_caller():
+    return helper()  # cross-file call via import
+"#).unwrap();
+
+        let db_path = tmp.join("test.sqlite");
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 1000,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            db_path: Some(db_path.clone()),
+            incremental: false,
+            semantic: true,
+            ..Default::default()
+        };
+        let result = build_graph(&opts).unwrap();
+
+        // Should have parsed both files
+        assert!(result.parsed_files.len() >= 2, "Should parse both files");
+
+        // Should have symbols: helper, caller, indirect_caller
+        assert!(result.store_stats.symbols >= 3, "Should have at least 3 symbols, got {}", result.store_stats.symbols);
+
+        // Should have calls: helper() in caller, helper() in indirect_caller
+        assert!(result.store_stats.calls >= 2, "Should have at least 2 calls, got {}", result.store_stats.calls);
+
+        // KEY CHECK: some calls should be resolved
+        let store = crate::store::GraphStore::open(&db_path).unwrap();
+        let total_calls: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM calls", [], |r| r.get(0)
+        ).unwrap();
+        let resolved_calls: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM calls WHERE resolved_symbol_id IS NOT NULL", [], |r| r.get(0)
+        ).unwrap();
+        assert!(resolved_calls > 0,
+            "Expected some resolved calls, got {}/{}", resolved_calls, total_calls);
+
+        // Should have CALLS edges in the edges table
+        let calls_edges: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'CALLS' AND src_id != dst_id",
+            [], |r| r.get(0)
+        ).unwrap();
+        assert!(calls_edges > 0,
+            "Expected non-self-loop CALLS edges, got {}", calls_edges);
+
+        // Self-loops should be rare (< 10% of CALLS edges)
+        let self_loops: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'CALLS' AND src_id = dst_id",
+            [], |r| r.get(0)
+        ).unwrap();
+        let total_calls_edges: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM edges WHERE edge_kind = 'CALLS'",
+            [], |r| r.get(0)
+        ).unwrap();
+        if total_calls_edges > 0 {
+            let self_loop_pct = self_loops as f64 / total_calls_edges as f64;
+            assert!(self_loop_pct < 0.1,
+                "Self-loops should be < 10% of CALLS edges, got {}/{} ({:.1}%)",
+                self_loops, total_calls_edges, self_loop_pct * 100.0);
+        }
 
         fs::remove_dir_all(&tmp).ok();
     }

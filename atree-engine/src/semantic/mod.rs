@@ -23,7 +23,8 @@ use crate::syntax::RawCapture;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
     ExactLocal,       // direct local symbol in same scope
-    ExactImport,      // resolved via explicit import
+    ExactImport,      // resolved via explicit import (callee matches import name)
+    ImportScoped,     // resolved via import's target file (callee found in imported module)
     ExactExport,      // resolved via re-export chain
     AnnotationInferred, // from type annotation (e.g., `x: Foo`)
     ConstructorInferred, // from `new Foo()` or `Foo()`
@@ -38,6 +39,7 @@ impl Confidence {
         match self {
             Confidence::ExactLocal => 1.0,
             Confidence::ExactImport => 0.95,
+            Confidence::ImportScoped => 0.90,
             Confidence::ExactExport => 0.95,
             Confidence::AnnotationInferred => 0.85,
             Confidence::ConstructorInferred => 0.80,

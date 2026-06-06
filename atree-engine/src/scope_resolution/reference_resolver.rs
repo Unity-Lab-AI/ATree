@@ -270,6 +270,11 @@ pub fn emit_reference_index_edges(
             ReferenceKind::TypeReference | ReferenceKind::ImportUse => "USES",
         };
 
+        // Skip self-loops: a symbol should not call itself.
+        if source_id == target_id {
+            continue;
+        }
+
         // Don't emit duplicates.
         let already = edges.iter().any(|e| {
             e.edge_type == edge_type && e.source_id == source_id && e.target_id == target_id
@@ -326,10 +331,24 @@ fn resolve_scope_caller(scope_str: &str, indexes: &ScopeResolutionIndexes) -> Op
             return None;
         }
         let scope = indexes.scopes_by_id.get(&current)?;
-        for sym in indexes.symbols_by_id.values() {
-            if sym.scope_id == Some(current) {
-                return Some(sym.id);
-            }
+        // Collect candidate symbols in this scope.
+        let candidates: Vec<u64> = indexes.symbols_by_id.values()
+            .filter(|sym| sym.scope_id == Some(current))
+            .map(|sym| sym.id)
+            .collect();
+        if !candidates.is_empty() {
+            // Prefer callable symbols (Function, Method, Constructor) — these are
+            // the actual callers in a call graph. Fall back to any symbol if no
+            // callable exists (e.g., top-level module scope).
+            let callable = candidates.iter().find(|&&id| {
+                indexes.symbols_by_id.get(&id).map_or(false, |s| {
+                    matches!(s.kind,
+                        crate::lang::CaptureTag::DefinitionFunction |
+                        crate::lang::CaptureTag::DefinitionMethod |
+                        crate::lang::CaptureTag::DefinitionConstructor)
+                })
+            });
+            return Some(*callable.unwrap_or(&candidates[0]));
         }
         current = scope.parent_id?;
     }
@@ -441,6 +460,11 @@ pub fn build_reference_index_and_resolve(
                 Some(id) => id,
                 None => continue,
             };
+
+            // Skip self-loops: a symbol should not call itself.
+            if source_id == target_id {
+                continue;
+            }
 
             let edge_type = match site.kind {
                 crate::scope_resolution::ReferenceKind::Call => "CALLS",

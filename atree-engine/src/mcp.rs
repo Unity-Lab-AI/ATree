@@ -12,6 +12,8 @@
 //!    Used for: `query`, `context`, `evidence_path`, `explain_symbol`,
 //!    `trace_call_path`, `impact`.
 
+#![allow(dead_code)] // validate methods used by CLI subprocess path
+
 use rmcp::{
     model::*,
     ServerHandler,
@@ -22,6 +24,20 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 // validate_cypher_query is used by CypherInput::validate() below via crate::store::
+
+// ── MCP response size limit ────────────────────────────────────────────────
+// Cap responses at 50KB to prevent MCP client token exhaustion.
+const MAX_RESPONSE_BYTES: usize = 50_000;
+
+/// Truncate a response string to MAX_RESPONSE_BYTES, appending a notice.
+fn truncate_response(mut s: String) -> String {
+    if s.len() > MAX_RESPONSE_BYTES {
+        let suffix = format!("\n\n[Output truncated at {}KB. Use more specific queries to narrow results.]", MAX_RESPONSE_BYTES / 1024);
+        s.truncate(MAX_RESPONSE_BYTES - suffix.len());
+        s.push_str(&suffix);
+    }
+    s
+}
 
 // =====================================================================
 // Tool Input Types
@@ -49,6 +65,14 @@ impl QueryInput {
     }
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ContextInput { pub name: Option<String>, pub kind: Option<String>, #[serde(default)] pub include_content: bool }
+impl ContextInput {
+    fn validate(&self) -> Result<(), String> {
+        match &self.name {
+            Some(n) if !n.trim().is_empty() => Ok(()),
+            _ => Err("name must be a non-empty string".to_string()),
+        }
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ImpactInput { pub target: String, pub direction: String, pub kind: Option<String>, #[serde(default = "dd")] pub max_depth: u32 }
 impl ImpactInput {
     fn validate(&self) -> Result<(), String> {
@@ -91,32 +115,113 @@ impl CypherInput {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct GroupListInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct GroupSyncInput { pub name: String }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ExplainInput { pub symbol: String }
+impl ExplainInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() {
+            return Err("symbol must be a non-empty string".to_string());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct EntrypointsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct TracePathInput { pub from: String, pub to: String }
+impl TracePathInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.from.trim().is_empty() {
+            return Err("'from' must be a non-empty string".to_string());
+        }
+        if self.to.trim().is_empty() {
+            return Err("'to' must be a non-empty string".to_string());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct PublicApiInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct AffectedTestsInput { pub symbol: String }
+impl AffectedTestsInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() { return Err("symbol must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ValidationPlanInput { pub symbol: String }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ContractChangesInput { pub base_ref: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct BoundaryCheckInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ScopeViolationsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ConfigMapInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ImpactByKindInput { pub target: String, pub kind: String, pub direction: String }
+impl ImpactByKindInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.target.trim().is_empty() { return Err("target must be non-empty".to_string()); }
+        let valid = ["upstream", "downstream", "both"];
+        if !valid.contains(&self.direction.as_str()) {
+            return Err(format!("direction must be one of: {:?}", valid));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct SemanticDiffInput { pub base_ref: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct SideEffectsInput { pub symbol: String }
+impl SideEffectsInput {
+    #[allow(dead_code)]
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() { return Err("symbol must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ChangeCouplingInput { pub symbol: String }
+impl ChangeCouplingInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() { return Err("symbol must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ConcurrencyInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct EditScopeInput { pub symbol: String }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct IssueLocatorInput { pub issue_id: String }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DocsDriftInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct RenameSafetyInput { pub symbol_name: String, pub new_name: String }
+impl RenameSafetyInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol_name.trim().is_empty() { return Err("symbol_name must be non-empty".to_string()); }
+        if self.new_name.trim().is_empty() { return Err("new_name must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DeadCodeInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct HotspotsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ErrorTraceInput { pub symbol: String }
+impl ErrorTraceInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() { return Err("symbol must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ResourceLifecycleInput { pub symbol: String }
+impl ResourceLifecycleInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() { return Err("symbol must be non-empty".to_string()); }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DepCyclesInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct UncoveredInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ResolutionStatsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct EvidencePathInput { pub query: String, #[serde(default = "dd")] pub max_depth: u32, #[serde(default = "dbw")] pub beam_width: u32, #[serde(default = "dme")] pub max_evidence: u32, #[serde(default)] pub include_content: bool, pub task_context: Option<String>, pub goal: Option<String> }
+impl EvidencePathInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.query.trim().is_empty() {
+            return Err("query must not be empty".to_string());
+        }
+        if self.max_depth > 10 {
+            return Err("max_depth must be <= 10".to_string());
+        }
+        if self.beam_width > 20 {
+            return Err("beam_width must be <= 20".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GraphFocusInput { pub node_ids: Vec<String>, #[serde(default = "gfl")] pub label: String, #[serde(default = "gfs")] pub source: String, #[serde(default)] pub zoom: Option<f64>, #[serde(default = "gfd")] pub anim_duration_ms: Option<u64>, pub web_url: Option<String> }
@@ -190,7 +295,7 @@ impl ATreeMcpServer {
                 "atree exited with code {:?}\nstderr: {}", output.status.code(), stderr
             ), None));
         }
-        Ok(stdout)
+        Ok(truncate_response(stdout))
     }
 
     fn tool(name: &str, desc: &str, input_schema: serde_json::Value) -> Tool {
@@ -219,7 +324,7 @@ impl ATreeMcpServer {
                 };
                 out.push_str(&format!("  {}  {}  {}:{}  [{}]{}\n", method, path, file, line, framework, handler_str));
             }
-            Ok(out)
+            Ok(truncate_response(out))
         }
     }
 
@@ -235,38 +340,153 @@ impl ATreeMcpServer {
         // Build an enriched query from the raw query + task_context + goal.
         let enriched_query = build_enriched_query(&input.query, input.task_context.as_deref(), input.goal.as_deref());
 
-        // When include_content is true, increase the token budget to make
-        // room for code snippets (~80 tokens per snippet).
-        let token_budget = if input.include_content { 5000 } else { 3000 };
+        // Step 1: Find all indexed symbols matching the query terms.
+        // Split query into terms and search for each term across ALL symbols.
+        let query_terms: Vec<&str> = enriched_query.split_whitespace()
+            .filter(|s| s.len() >= 2)
+            .collect();
 
-        let evidence_config = crate::evidence_path::EvidenceConfig {
-            max_seeds: input.max_seeds as usize,
-            beam_width: 5,
-            max_depth: 4,
-            max_evidence: input.max_symbols as usize,
-            token_budget,
+        // Collect all matching symbols from both BM25 and term search.
+        let mut all_matched: rustc_hash::FxHashMap<i64, (String, String, usize, f64)> = rustc_hash::FxHashMap::default();
+
+        // BM25 search (ranked by relevance)
+        let search_config = crate::search::SearchConfig {
+            limit: input.max_seeds as usize,
             ..Default::default()
         };
+        if let Ok(bm25_hits) = crate::search::search(&store, &enriched_query, &search_config) {
+            for hit in &bm25_hits {
+                all_matched.insert(hit.node_id, (hit.name.clone(), hit.file_path.clone(), hit.line, hit.score));
+            }
+        }
 
-        // Format with or without code content.
-        let text = if input.include_content {
-            let bundle = crate::evidence_bundle::query_evidence_with_content(&store, &enriched_query, &evidence_config)
-                .map_err(|e| ErrorData::internal_error(format!("Evidence query failed: {}", e), None))?;
-            // Resolve repo root: db_path is typically <repo>/.atree/index.sqlite,
-            // so the repo root is the grandparent of the db file.
-            let repo_root = self.db_path.as_ref()
-                .and_then(|p| p.parent())           // <repo>/.atree/
-                .and_then(|p| p.parent())            // <repo>/
-                .unwrap_or_else(|| std::path::Path::new("."));
-            crate::evidence_bundle::format_bundle_with_content(&bundle, repo_root, 5)
-        } else {
-            let bundle = crate::evidence_bundle::query_evidence(&store, &enriched_query, &evidence_config)
-                .map_err(|e| ErrorData::internal_error(format!("Evidence query failed: {}", e), None))?;
-            crate::evidence_bundle::format_bundle_as_text(&bundle)
-        };
+        // Build file map using chunked loading to bound memory.
+        let mut file_map: rustc_hash::FxHashMap<i64, String> = rustc_hash::FxHashMap::default();
+        store.get_all_files_chunked(10_000, |chunk| {
+            for f in chunk {
+                file_map.insert(f.id, f.path.clone());
+            }
+            Ok(())
+        }).unwrap_or_default();
 
-        // Prepend context/goal as structured metadata.
-        let mut out = text;
+        // Search by query terms against all symbols using chunked loading.
+        // This avoids loading all symbols into memory at once for large indexes.
+        let query_terms_clone = query_terms.clone();
+        let file_map_ref = &file_map;
+        store.get_all_symbols_chunked(10_000, |chunk| {
+            for sym in chunk {
+                let name_lower = sym.name.to_lowercase();
+                let file_path = file_map_ref.get(&sym.file_id).cloned().unwrap_or_default();
+                let file_lower = file_path.to_lowercase();
+                let matched = query_terms_clone.iter().any(|term| {
+                    let t = term.to_lowercase();
+                    name_lower.contains(&t) || file_lower.contains(&t)
+                });
+                if matched && !all_matched.contains_key(&sym.id) {
+                    all_matched.insert(sym.id, (sym.name.clone(), file_path, sym.line, 0.0));
+                }
+            }
+            Ok(())
+        }).ok();
+
+        // Step 2: Find all processes that contain ANY matched symbol.
+        // Preload all symbols into a map for O(1) lookup (avoids N+1 queries).
+        // Uses chunked loading to bound memory for large indexes.
+        let mut sym_map: rustc_hash::FxHashMap<i64, (String, i64, usize)> = rustc_hash::FxHashMap::default();
+        store.get_all_symbols_chunked(10_000, |chunk| {
+            for s in chunk {
+                sym_map.insert(s.id, (s.name.clone(), s.file_id, s.line));
+            }
+            Ok(())
+        }).unwrap_or_default();
+
+        let mut process_hit_counts: rustc_hash::FxHashMap<i64, (String, usize)> = rustc_hash::FxHashMap::default();
+        let mut process_edges: rustc_hash::FxHashMap<i64, Vec<(i64, i64)>> = rustc_hash::FxHashMap::default();
+
+        // Load STEP_IN_PROCESS edges in chunks to bound memory.
+        // Only load edges of the relevant kind rather than all edges.
+        store.get_all_edges_chunked(10_000, |chunk| {
+            for edge in chunk {
+                if edge.edge_kind == "STEP_IN_PROCESS" {
+                    if let Some((_sym_name, _file_id, _line)) = sym_map.get(&edge.src_id) {
+                        let is_matched = all_matched.contains_key(&edge.src_id);
+                        if is_matched {
+                            process_hit_counts.entry(edge.dst_id).or_insert_with(|| {
+                                let pname = sym_map.get(&edge.dst_id).map(|(n, _, _)| n.clone()).unwrap_or_default();
+                                (pname, 0)
+                            }).1 += 1;
+                        }
+                        process_edges.entry(edge.dst_id).or_default().push((edge.src_id, edge.dst_id));
+                    }
+                }
+            }
+            Ok(())
+        }).ok();
+
+        // Collect process steps for hit processes using preloaded symbol map
+        let mut process_steps: rustc_hash::FxHashMap<i64, Vec<(String, String, usize)>> = rustc_hash::FxHashMap::default();
+        for (proc_id, edges) in &process_edges {
+            if !process_hit_counts.contains_key(proc_id) { continue; }
+            for (src_id, _dst_id) in edges {
+                if let Some((sym_name, file_id, line)) = sym_map.get(src_id) {
+                    let file_path = file_map.get(file_id).cloned().unwrap_or_default();
+                    process_steps.entry(*proc_id).or_default().push((sym_name.clone(), file_path, *line));
+                }
+            }
+        }
+
+        // Build ranked process list
+        let mut process_vec: Vec<(String, usize, usize, Vec<(String, String, usize)>)> = Vec::new();
+        for (proc_id, (name, hit_count)) in &process_hit_counts {
+            if *hit_count == 0 { continue; }
+            if let Some(steps) = process_steps.get(proc_id) {
+                process_vec.push((name.clone(), *hit_count, steps.len(), steps.clone()));
+            }
+        }
+        process_vec.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        process_vec.truncate(input.max_symbols as usize);
+
+        // Build matched symbols list (sorted by score)
+        let mut matched_list: Vec<(String, String, usize, f64)> = all_matched.values()
+            .map(|(n, f, l, s)| (n.clone(), f.clone(), *l, *s))
+            .collect();
+        matched_list.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Format output
+        let mut out = String::new();
+        out.push_str(&format!("Query: \"{}\" | Context: {}\n\n", enriched_query, input.task_context.as_deref().unwrap_or("none")));
+
+        if !process_vec.is_empty() {
+            out.push_str(&format!("── Execution Flows ({} processes) ──\n\n", process_vec.len()));
+            for (i, (proc_name, hit_count, _step_count, steps)) in process_vec.iter().take(5).enumerate() {
+                out.push_str(&format!("{}. [{}] ({} steps, {} matched)\n", i + 1, proc_name, steps.len(), hit_count));
+                for (sym_name, file_path, line) in steps.iter().take(8) {
+                    let short_file = file_path.rsplitn(2, '/').next().unwrap_or(file_path);
+                    let marker = if all_matched.values().any(|(n, f, l, _)| n == sym_name && f == file_path && *l == *line) { "★" } else { " " };
+                    out.push_str(&format!("   {} → {} ({}:{})\n", marker, sym_name, short_file, line));
+                }
+                if steps.len() > 8 {
+                    out.push_str(&format!("   ... and {} more steps\n", steps.len() - 8));
+                }
+                out.push('\n');
+            }
+        }
+
+        if !matched_list.is_empty() {
+            out.push_str(&format!("── Matched Symbols ({} hits) ──\n\n", matched_list.len()));
+            for (i, (name, file_path, line, score)) in matched_list.iter().take(10).enumerate() {
+                let short_file = file_path.rsplitn(2, '/').next().unwrap_or(file_path);
+                let score_str = if *score > 0.0 { format!(" [{:.1}]", score) } else { String::new() };
+                out.push_str(&format!("{}. {}{} ({}:{})\n", i + 1, name, score_str, short_file, line));
+            }
+            if matched_list.len() > 10 {
+                out.push_str(&format!("... and {} more\n", matched_list.len() - 10));
+            }
+        }
+
+        if process_vec.is_empty() && matched_list.is_empty() {
+            out.push_str(&format!("No results for '{}'\n", enriched_query));
+        }
         if input.task_context.is_some() || input.goal.is_some() {
             out = format!(
                 "Query: {}{}{}\n\n{}",
@@ -281,7 +501,7 @@ impl ATreeMcpServer {
             );
         }
 
-        Ok(out)
+        Ok(truncate_response(out))
     }
 
     /// Handle the `context` tool using evidence bundles.
@@ -330,7 +550,7 @@ impl ATreeMcpServer {
             }
         }
 
-        Ok(text)
+        Ok(truncate_response(text))
     }
 
     /// Handle the `evidence_path` tool using evidence bundles.
@@ -361,7 +581,7 @@ impl ATreeMcpServer {
             crate::evidence_bundle::format_bundle_as_text(&bundle)
         };
 
-        Ok(text)
+        Ok(truncate_response(text))
     }
 
     /// Handle the `explain_symbol` tool using evidence bundles.
@@ -394,7 +614,7 @@ impl ATreeMcpServer {
             text.push_str(&crate::evidence_bundle::format_bundle_as_text(&bundle));
         }
 
-        Ok(text)
+        Ok(truncate_response(text))
     }
 
     /// Handle the `impact` tool using in-process analysis.
@@ -417,7 +637,7 @@ impl ATreeMcpServer {
         let text = crate::evidence_bundle::impact_evidence(&store, &input.target, depth, &evidence_config, direction, kind)
             .map_err(|e| ErrorData::internal_error(format!("Impact analysis failed: {}", e), None))?;
 
-        Ok(text)
+        Ok(truncate_response(text))
     }
 
     /// Handle the `trace_call_path` tool using A* pathfinding.
@@ -436,7 +656,7 @@ impl ATreeMcpServer {
         let text = crate::evidence_bundle::trace_path_evidence(&store, &input.from, &input.to, &evidence_config)
             .map_err(|e| ErrorData::internal_error(format!("Trace path failed: {}", e), None))?;
 
-        Ok(text)
+        Ok(truncate_response(text))
     }
 
     /// Handle the `graph_focus` tool — POST to the ATree web server to shift visual focus.
@@ -532,21 +752,25 @@ impl ServerHandler for ATreeMcpServer {
                 "context" => {
                     let input: ContextInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                     self.handle_context_evidence(input)?
                 }
                 "evidence_path" => {
                     let input: EvidencePathInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                     self.handle_evidence_path_evidence(input)?
                 }
                 "explain_symbol" => {
                     let input: ExplainInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                     self.handle_explain_evidence(input)?
                 }
                 "trace_call_path" => {
                     let input: TracePathInput = serde_json::from_value(serde_json::Value::Object(args))
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
                     self.handle_trace_path_evidence(input)?
                 }
                 "impact" => {

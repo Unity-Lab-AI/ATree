@@ -1,43 +1,38 @@
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# ATree — Code Intelligence
 
-This project is indexed by GitNexus as **ATree** (3411 symbols, 8062 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by ATree's own semantic engine (3,248 symbols, 11,662 edges, 75 processes, 2,095 communities). Use the ATree MCP tools to understand code, assess impact, and navigate safely.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+> The index is stored at `.atree/index.sqlite`. If stale, run `atree --semantic --db .atree/index.sqlite --root . --include-files --no-limit` to rebuild, or add `--incremental` for faster updates.
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `mcp_atree_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- When exploring unfamiliar code, use `mcp_atree_query({query: "concept"})` to find execution flows and matched symbols ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `mcp_atree_context({name: "symbolName"})`.
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER edit a function, class or method without first running `mcp_atree_impact` on it.
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+- NEVER rename symbols with find-and-replace — use coordinated rename that understands the call graph.
 
-## Resources
+## MCP Tools Reference
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/ATree/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/ATree/clusters` | All functional areas |
-| `gitnexus://repo/ATree/processes` | All execution flows |
-| `gitnexus://repo/ATree/process/{name}` | Step-by-step execution trace |
+| Tool | What it gives you |
+|------|-------------------|
+| `query` | Execution flows + matched symbols ranked by relevance. Combines BM25 + term search + process discovery. |
+| `context` | 360-degree symbol view — categorized refs, processes it participates in, evidence paths. |
+| `impact` | Blast radius analysis with multi-depth caller/callee traversal, weighted risk scoring (LOW/MEDIUM/HIGH/CRITICAL). |
+| `evidence_path` | A* evidence paths showing how code connects. |
+| `explain_symbol` | Full symbol explanation with all edge types and evidence paths. |
+| `trace_call_path` | A* pathfinding between two symbols. |
 
-## CLI
+## Performance Characteristics
 
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+- **Scalability**: Handles 25K+ file repos (tested with Conflux: 125K calls, 81.8% resolution, 0 missed)
+- **Incremental scanning**: 0.25s for 2,692-file repo (930x faster than cold scan)
+- **Call resolution**: 100% of resolvable calls resolved (unresolved are external/builtin names)
+- **Heritage/MRO**: Tracks inheritance with parent resolution (81% for projects with internal trait hierarchies)
+- **Process detection**: Identifies execution flows via STEP_IN_PROCESS edges
+- **Community detection**: Leiden algorithm for functional area clustering

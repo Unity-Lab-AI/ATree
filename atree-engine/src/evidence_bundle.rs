@@ -678,9 +678,11 @@ pub fn impact_evidence(
     let d1_callees = if show_downstream { store.get_callees(sym.id, 1).unwrap_or_default() } else { Vec::new() };
     let d2_callees = if show_downstream { store.get_callees(sym.id, 2).unwrap_or_default() } else { Vec::new() };
 
-    // Resolve caller/callee file paths using the KnowledgeGraph.
-    let resolve_file = |fid: i64| -> String {
-        graph.resolve_symbol(&format!("sym:{}", fid))
+    // Resolve file_id to path using the KnowledgeGraph's file node index.
+    // The CTE returns s.file_id (the file containing the caller/callee symbol),
+    // so we look up the file node directly.
+    let resolve_file = |file_id: i64| -> String {
+        graph.resolve_symbol(&format!("file:{}", file_id))
             .map(|(_, _, f, _)| f.to_string())
             .unwrap_or_else(|| "?".to_string())
     };

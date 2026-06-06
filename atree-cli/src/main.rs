@@ -247,7 +247,7 @@ impl Default for Args {
             db_path: None,
             incremental: false,
             embeddings: false,
-            graph_phases: false,
+            graph_phases: true,
             query: None,
             group: None,
             mcp_server: false,

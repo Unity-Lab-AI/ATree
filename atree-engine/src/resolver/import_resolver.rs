@@ -14,6 +14,31 @@ pub fn resolve_import(
     all_files: &[String],
     lang: LanguageId,
 ) -> Option<(String, f64)> {
+    // Handle grouped imports: `use crate::store::{A, B, C}` → try each item
+    if let Some((prefix, rest)) = import_source.split_once("::") {
+        if let Some(group_start) = rest.find('{') {
+            if let Some(group_end) = rest.rfind('}') {
+                let module_prefix = &rest[..group_start];
+                let items_str = &rest[group_start + 1..group_end];
+                let base_path = if module_prefix.is_empty() {
+                    prefix.to_string()
+                } else {
+                    format!("{}::{}", prefix, module_prefix.trim_end_matches("::"))
+                };
+                // Try each item in the group
+                for item in items_str.split(',') {
+                    let item = item.trim();
+                    if item.is_empty() { continue; }
+                    let full_path = format!("{}::{}", base_path, item);
+                    if let Some(result) = resolve_import(&full_path, from_file, all_files, lang) {
+                        return Some(result);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+
     match lang {
         LanguageId::Python => resolve_python_import(import_source, from_file, all_files),
         LanguageId::Rust => resolve_rust_import(import_source, from_file, all_files),
@@ -130,15 +155,9 @@ fn resolve_rust_import(
 
     // `use crate::...` — resolve from crate root
     if let Some(path) = cleaned.strip_prefix("crate::") {
-        // strip "crate::"
-        let file_path = rust_path_to_file(path);
-        if let Some(m) = find_file_in_list(&file_path, all_files) {
-            return Some((m, 0.95));
-        }
-        // Try as module/mod.rs
-        let mod_rs = format!("{}/mod.rs", path.replace("::", "/"));
-        if let Some(m) = find_file_in_list(&mod_rs, all_files) {
-            return Some((m, 0.95));
+        let candidates = rust_path_to_candidates(path);
+        if let Some((m, conf)) = find_rust_file(&candidates, all_files) {
+            return Some((m, conf));
         }
     }
 
@@ -150,10 +169,12 @@ fn resolve_rust_import(
         let parent_dir = Path::new(&from_dir).parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        // strip "super::"
-        let file_path = format!("{}/{}", parent_dir, rust_path_to_file(path));
-        if let Some(m) = find_file_in_list(&file_path, all_files) {
-            return Some((m, 0.95));
+        let candidates = rust_path_to_candidates(path);
+        for candidate in &candidates {
+            let file_path = format!("{}/{}", parent_dir, candidate);
+            if let Some(m) = find_file_in_list(&file_path, all_files) {
+                return Some((m, 0.95));
+            }
         }
     }
 
@@ -162,32 +183,65 @@ fn resolve_rust_import(
         let from_dir = Path::new(from_file).parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        // strip "self::"
-        let file_path = format!("{}/{}", from_dir, rust_path_to_file(path));
-        if let Some(m) = find_file_in_list(&file_path, all_files) {
-            return Some((m, 0.95));
+        let candidates = rust_path_to_candidates(path);
+        for candidate in &candidates {
+            let file_path = format!("{}/{}", from_dir, candidate);
+            if let Some(m) = find_file_in_list(&file_path, all_files) {
+                return Some((m, 0.95));
+            }
         }
     }
 
     // Bare `use X::Y` — could be crate root or external
     if !cleaned.starts_with("crate::") && !cleaned.starts_with("super::") && !cleaned.starts_with("self::") {
-        let file_path = rust_path_to_file(cleaned);
-        if let Some(m) = find_file_in_list(&file_path, all_files) {
-            return Some((m, 0.85));
+        let candidates = rust_path_to_candidates(cleaned);
+        if let Some((m, conf)) = find_rust_file(&candidates, all_files) {
+            return Some((m, conf * 0.85));
         }
     }
 
     None
 }
 
-fn rust_path_to_file(path: &str) -> String {
+/// Convert a Rust module path (e.g., "store::store::GraphStore") to candidate file paths.
+/// Returns candidates in order of likelihood.
+/// For `a::b::C`, tries:
+///   1. `a/b/C.rs`      — C is a submodule
+///   2. `a/b.rs`        — C is defined in b.rs
+///   3. `a/b/mod.rs`    — C is re-exported from b/mod.rs
+/// Also tries with common src prefixes (src/, lib/).
+fn rust_path_to_candidates(path: &str) -> Vec<String> {
     let parts: Vec<&str> = path.split("::").collect();
+    let mut candidates = Vec::new();
+
     if parts.len() == 1 {
-        format!("{}.rs", parts[0])
-    } else {
-        let module_path = parts[..parts.len() - 1].join("/");
-        format!("{}/{}.rs", module_path, parts.last().unwrap())
+        candidates.push(format!("{}.rs", parts[0]));
+        return candidates;
     }
+
+    let module_path = parts[..parts.len() - 1].join("/");
+    let last = parts.last().unwrap();
+
+    // C is a submodule: a/b/C.rs
+    candidates.push(format!("{}/{}.rs", module_path, last));
+    // C is defined in b.rs: a/b.rs
+    candidates.push(format!("{}.rs", module_path));
+    // C is re-exported from b/mod.rs: a/b/mod.rs
+    candidates.push(format!("{}/mod.rs", module_path));
+
+    candidates
+}
+
+/// Find the first matching file from candidates in the file list.
+fn find_rust_file(candidates: &[String], all_files: &[String]) -> Option<(String, f64)> {
+    for (i, candidate) in candidates.iter().enumerate() {
+        if let Some(m) = find_file_in_list(candidate, all_files) {
+            // First candidate gets highest confidence
+            let conf = 1.0 - (i as f64 * 0.05);
+            return Some((m, conf));
+        }
+    }
+    None
 }
 
 /// TypeScript/JavaScript import resolution.

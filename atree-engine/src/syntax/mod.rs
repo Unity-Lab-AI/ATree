@@ -19,7 +19,12 @@ impl SyntaxEngine {
     pub fn set_language_for(&mut self, provider: &dyn LanguageProvider) {
         let _ = self.parser.set_language(&provider.tree_sitter_language());
         // Pre-compile the query once per language.
-        self.cached_query = Query::new(&provider.tree_sitter_language(), provider.query()).ok();
+        self.cached_query = Query::new(&provider.tree_sitter_language(), provider.query())
+            .map_err(|e| {
+                tracing::debug!(lang = ?provider.id(), error = %e, "Query compilation failed for language");
+                e
+            })
+            .ok();
     }
 
     /// Parse content using the already-configured language.
