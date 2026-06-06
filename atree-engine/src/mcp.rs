@@ -108,7 +108,6 @@ impl CypherInput {
     }
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct RouteMapInput { pub route: Option<String> }
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ShapeCheckInput { pub route: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ToolMapInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ApiImpactInput { pub route: Option<String>, pub file: Option<String> }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct VerifyInput { #[serde(default = "dvt")] pub verify_type: String, pub command: Option<String> }
@@ -188,7 +187,6 @@ impl RenameSafetyInput {
         Ok(())
     }
 }
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DeadCodeInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct HotspotsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ErrorTraceInput { pub symbol: String }
 impl ErrorTraceInput {
@@ -206,6 +204,20 @@ impl ResourceLifecycleInput {
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DepCyclesInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct UncoveredInput {}
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DeadCodeInput { pub filter: Option<String> }
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct DataFlowInput { pub symbol: String, #[serde(default = "dd")] pub max_depth: u32, pub direction: Option<String> }
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ShapeCheckInput { pub route: Option<String> }
+impl ShapeCheckInput {
+    fn validate(&self) -> Result<(), String> { Ok(()) }
+}
+impl DataFlowInput {
+    fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() {
+            return Err("symbol must be non-empty".to_string());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct ResolutionStatsInput {}
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)] pub struct EvidencePathInput { pub query: String, #[serde(default = "dd")] pub max_depth: u32, #[serde(default = "dbw")] pub beam_width: u32, #[serde(default = "dme")] pub max_evidence: u32, #[serde(default)] pub include_content: bool, pub task_context: Option<String>, pub goal: Option<String> }
 impl EvidencePathInput {
@@ -726,6 +738,110 @@ impl ATreeMcpServer {
             ), None))
         }
     }
+
+    /// Handle `data_flow_trace` tool — in-process data flow tracing.
+    fn handle_data_flow_trace(&self, args: serde_json::Map<String, serde_json::Value>) -> Result<String, ErrorData> {
+        let input: DataFlowInput = serde_json::from_value(serde_json::Value::Object(args))
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+        input.validate().map_err(|e| ErrorData::invalid_params(e, None))?;
+        let store = self.open_store()?;
+        let syms = store.get_symbols_by_name(&input.symbol)
+            .map_err(|e| ErrorData::internal_error(format!("Symbol lookup failed: {}", e), None))?;
+        let sym_id = syms.first().map(|s| s.id).ok_or_else(|| {
+            ErrorData::invalid_params(format!("Symbol '{}' not found", input.symbol), None)
+        })?;
+        let max_depth = input.max_depth as i64;
+        let dir = input.direction.as_deref().unwrap_or("forward");
+        let mut out = format!("Data flow for '{}' ({}):\n\n", input.symbol, sym_id);
+        match dir {
+            "backward" => {
+                let chain = store.trace_data_flow_backward(sym_id, max_depth)
+                    .map_err(|e| ErrorData::internal_error(format!("Trace failed: {}", e), None))?;
+                if chain.is_empty() {
+                    out.push_str("  No incoming data flows found.");
+                } else {
+                    for (src_id, kind, depth) in &chain {
+                        let src_name = store.get_all_symbols().ok()
+                            .and_then(|all| all.iter().find(|s| s.id == *src_id).map(|s| s.name.clone()))
+                            .unwrap_or_else(|| format!("sym:{}", src_id));
+                        out.push_str(&format!("  d={}: [{}] ← {}\n", depth, kind, src_name));
+                    }
+                }
+            }
+            _ => {
+                let chain = store.trace_data_flow_forward(sym_id, max_depth)
+                    .map_err(|e| ErrorData::internal_error(format!("Trace failed: {}", e), None))?;
+                if chain.is_empty() {
+                    out.push_str("  No outgoing data flows found. Run data flow analysis during indexing first.");
+                } else {
+                    for (dst_id, kind, depth) in &chain {
+                        let dst_syms = store.get_all_symbols().ok()
+                            .and_then(|all| all.iter().find(|s| s.id == *dst_id).map(|s| s.name.clone()))
+                            .unwrap_or_else(|| format!("sym:{}", dst_id));
+                        out.push_str(&format!("  d={}: [{}] → {}\n", depth, kind, dst_syms));
+                    }
+                }
+            }
+        }
+        Ok(truncate_response(out))
+    }
+
+    /// Handle `dead_code_candidates` tool — in-process dead code detection.
+    fn handle_dead_code_candidates(&self, args: serde_json::Map<String, serde_json::Value>) -> Result<String, ErrorData> {
+        let input: DeadCodeInput = serde_json::from_value(serde_json::Value::Object(args))
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+        let store = self.open_store()?;
+        let candidates = store.get_dead_code_candidates()
+            .map_err(|e| ErrorData::internal_error(format!("Query failed: {}", e), None))?;
+        let filter = input.filter.as_deref().unwrap_or("");
+        let filtered: Vec<_> = if filter.is_empty() {
+            candidates
+        } else {
+            candidates.into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&filter.to_lowercase()))
+                .collect()
+        };
+        if filtered.is_empty() {
+            Ok("No dead code candidates found. All non-exported symbols are reachable.".to_string())
+        } else {
+            let mut out = format!("{} dead code candidate(s):\n\n", filtered.len());
+            for sym in &filtered {
+                let file = store.get_file_by_id(sym.file_id).ok().flatten()
+                    .map(|f| f.path.clone())
+                    .unwrap_or_else(|| "?".to_string());
+                out.push_str(&format!("  {} {} [{}:{}]\n", sym.kind, sym.name, file, sym.line));
+            }
+            Ok(truncate_response(out))
+        }
+    }
+
+    /// Handle `dependency_cycle_detector` tool — in-process call graph cycle detection.
+    fn handle_dependency_cycles(&self) -> Result<String, ErrorData> {
+        let store = self.open_store()?;
+        let cycles = store.detect_call_cycles(32)
+            .map_err(|e| ErrorData::internal_error(format!("Cycle detection failed: {}", e), None))?;
+        if cycles.is_empty() {
+            Ok("No call graph cycles detected.".to_string())
+        } else {
+            let sccs = store.detect_call_sccs().unwrap_or_default();
+            let mut out = format!("{} cycle(s) detected in call graph:\n\n", cycles.len());
+            if !sccs.is_empty() {
+                for (i, scc) in sccs.iter().enumerate() {
+                    let names: Vec<String> = scc.iter()
+                        .map(|id| store.get_all_symbols().ok()
+                            .and_then(|all| all.iter().find(|s| s.id == *id).map(|s| s.name.clone()))
+                            .unwrap_or_else(|| format!("{}", id)))
+                        .collect();
+                    out.push_str(&format!("  SCC {}: {}\n", i + 1, names.join(" → ")));
+                }
+            } else {
+                for (a, b) in &cycles {
+                    out.push_str(&format!("  {} ↔ {}\n", a, b));
+                }
+            }
+            Ok(truncate_response(out))
+        }
+    }
 }
 
 // =====================================================================
@@ -788,6 +904,22 @@ impl ServerHandler for ATreeMcpServer {
                         .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
                     self.handle_route_map_evidence(input)?
                 }
+                "data_flow_trace" => {
+                    self.handle_data_flow_trace(args)?
+                }
+                "shape_check" => {
+                    let input: ShapeCheckInput = serde_json::from_value(serde_json::Value::Object(args))
+                        .map_err(|e| ErrorData::invalid_params(format!("Invalid input: {}", e), None))?;
+                    let mut a = vec!["query", "shape-check"];
+                    if let Some(ref r) = input.route { a.push(r); }
+                    return Ok(CallToolResult::success(vec![Content::text(self.run_atree(&a)?)]));
+                }
+                "dead_code_candidates" => {
+                    self.handle_dead_code_candidates(args)?
+                }
+                "dependency_cycle_detector" => {
+                    self.handle_dependency_cycles()?
+                }
                 // Fall through to CLI subprocess for all other tools.
                 _ => {
                     return self.call_tool_cli(request.name.as_ref(), args, db);
@@ -821,7 +953,6 @@ impl ServerHandler for ATreeMcpServer {
             Self::tool("rename", "Multi-file coordinated rename using the knowledge graph.", schema_for!(RenameInput)),
             Self::tool("cypher", "Execute a raw Cypher-like query against the code knowledge graph.", schema_for!(CypherInput)),
             Self::tool("route_map", "Show API route mappings.", schema_for!(RouteMapInput)),
-            Self::tool("shape_check", "Check response shapes for API routes.", schema_for!(ShapeCheckInput)),
             Self::tool("tool_map", "Show tool-like symbols in the codebase.", schema_for!(ToolMapInput)),
             Self::tool("api_impact", "Pre-change impact report for an API route handler.", schema_for!(ApiImpactInput)),
             Self::tool("verify", "Run project verification: tests, linter, type-checker.", schema_for!(VerifyInput)),
@@ -858,6 +989,8 @@ impl ServerHandler for ATreeMcpServer {
             Self::tool("pattern_mine", "Mine recurring patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion × stability. Returns patterns with evidence IDs and composite scores. Use for: 'what call patterns are common', 'show architectural motifs', 'find recurring import-declaration-call chains'.", schema_for!(PatternMineInput)),
             Self::tool("constraint_check", "Synthesize and check constraints from evidence patterns. Detects forbidden transitions (evidence contradictions), required properties (stable pattern components), and architectural violations. Returns active constraints with confidence and violation counts. Use for: 'what rules emerge from the codebase', 'check if symbol X violates constraints', 'show architectural invariants'.", schema_for!(ConstraintCheckInput)),
             Self::tool("graph_focus", "Shift the visual graph focus to specific nodes in real-time. Triggers a smooth camera animation on the ATree web UI and highlights the target nodes. Use after query/context/impact to show the agent what it found visually.", schema_for!(GraphFocusInput)),
+            Self::tool("data_flow_trace", "Trace data flow for a symbol — where values come from and where they go. Tracks assignments, parameter passing, returns, and property access. Returns a chain of (symbol_id, flow_kind, depth) showing value propagation.", schema_for!(DataFlowInput)),
+            Self::tool("shape_check", "Check response shapes for API routes — detect mismatches between what a route returns and what consumers expect.", schema_for!(ShapeCheckInput)),
         ];
         Ok(ListToolsResult { tools, next_cursor: None, meta: None })
     }

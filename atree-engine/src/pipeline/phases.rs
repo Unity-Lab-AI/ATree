@@ -299,6 +299,36 @@ impl PipelinePhase for CrossFilePhase {
             Err(e) => eprintln!("[cross_file] Warning: failed to build resolution engine: {}", e),
         }
 
+        // ── Data Flow Analysis (value propagation tracking) ───────────────────
+        // Extract data flow edges from assignments, parameter passing, returns,
+        // and property access patterns. This complements the call graph with
+        // a value-flow graph: "where does this variable's value come from/go to?"
+        perf_timer!("Data flow analysis");
+        {
+            let mut total_flows = 0usize;
+
+            // Build a map from file_id → parsed_file for quick lookup
+            let all_files = store.get_all_files().unwrap_or_default();
+            for file_rec in &all_files {
+                let file_id = file_rec.id;
+                // Find the matching parsed file
+                if let Some(pf) = parsed_files_guard.iter().find(|pf| {
+                    file_rec.path.ends_with(&pf.path) || pf.path == file_rec.path
+                }) {
+                    let file_symbols = store.get_symbols_by_file(file_id).unwrap_or_default();
+                    match crate::data_flow::extract_and_store_flows(
+                        &store, file_id,
+                        &pf.assignments, &pf.calls, &pf.type_bindings,
+                        &file_symbols, &global_symbol_id_map,
+                    ) {
+                        Ok(count) => total_flows += count,
+                        Err(e) => eprintln!("[cross_file] Warning: data flow for {}: {}", pf.path, e),
+                    }
+                }
+            }
+            eprintln!("[cross_file] Data flows: {} edges extracted", total_flows);
+        }
+
         // ── Pattern Mining + Constraint Synthesis (Layers 2-3) ────────────────
         // Mine patterns from committed evidence, synthesize constraints.
         (ctx.on_progress)(PipelineProgress {

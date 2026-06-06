@@ -107,6 +107,20 @@ pub fn begin_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transa
         })
 }
 
+/// A data flow edge: value flows from src to dst.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataFlowRecord {
+    pub id: i64,
+    pub file_id: i64,
+    pub src_symbol_id: i64,
+    pub dst_symbol_id: i64,
+    pub flow_kind: String, // 'assignment' | 'param_pass' | 'return' | 'property_read' | 'property_write'
+    pub var_name: String,
+    pub line: usize,
+    pub col: usize,
+    pub confidence: f64,
+}
+
 impl GraphStore {
     /// Open or create a graph store at the given path.
     ///
@@ -278,6 +292,11 @@ impl GraphStore {
             log::info!("Running schema migration: v6 -> v7 (missing indexes)");
             self.init_schema_v7()?;
             self.conn.execute_batch("PRAGMA user_version = 7;")?;
+        }
+        if current_version < 8 {
+            log::info!("Running schema migration: v7 -> v8 (data flow tracking)");
+            self.init_schema_v8()?;
+            self.conn.execute_batch("PRAGMA user_version = 8;")?;
         }
         Ok(())
     }
@@ -624,6 +643,235 @@ impl GraphStore {
             CREATE INDEX IF NOT EXISTS idx_comm_memberships_cid ON community_memberships(community_id);
         ")?;
         Ok(())
+    }
+
+    /// Add data flow tracking tables (migration v7 -> v8).
+    fn init_schema_v8(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS data_flows (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL REFERENCES files(id),
+                src_symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+                dst_symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+                flow_kind TEXT NOT NULL,  -- 'assignment', 'param_pass', 'return', 'property_read', 'property_write'
+                var_name TEXT NOT NULL DEFAULT '',
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_data_flows_src ON data_flows(src_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_data_flows_dst ON data_flows(dst_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_data_flows_file ON data_flows(file_id);
+        ")?;
+        Ok(())
+    }
+
+    // =================================================================
+    // Data flow (ACCESSES / data-flow tracking)
+    // =================================================================
+
+    /// Insert a data flow record.
+    pub fn insert_data_flow(&self, rec: &DataFlowRecord) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO data_flows (file_id, src_symbol_id, dst_symbol_id, flow_kind, var_name, line, col, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                rec.file_id, rec.src_symbol_id, rec.dst_symbol_id,
+                &rec.flow_kind, &rec.var_name, rec.line as i64, rec.col as i64,
+                rec.confidence,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Batch insert data flow records.
+    pub fn insert_data_flows_batch(&self, records: &[DataFlowRecord]) -> rusqlite::Result<usize> {
+        let tx = self.begin_transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO data_flows (file_id, src_symbol_id, dst_symbol_id, flow_kind, var_name, line, col, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            )?;
+            for rec in records {
+                if stmt.execute(params![
+                    rec.file_id, rec.src_symbol_id, rec.dst_symbol_id,
+                    &rec.flow_kind, &rec.var_name, rec.line as i64, rec.col as i64,
+                    rec.confidence,
+                ]).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Get all data flows for a symbol (as source).
+    pub fn get_data_flows_from(&self, symbol_id: i64) -> rusqlite::Result<Vec<DataFlowRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, src_symbol_id, dst_symbol_id, flow_kind, var_name, line, col, confidence
+             FROM data_flows WHERE src_symbol_id = ?1"
+        )?;
+        let rows = stmt.query_map([symbol_id], |row| {
+            Ok(DataFlowRecord {
+                id: row.get(0)?, file_id: row.get(1)?,
+                src_symbol_id: row.get(2)?, dst_symbol_id: row.get(3)?,
+                flow_kind: row.get(4)?, var_name: row.get(5)?,
+                line: row.get::<_, i64>(6)? as usize,
+                col: row.get::<_, i64>(7)? as usize,
+                confidence: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Get all data flows for a symbol (as destination).
+    pub fn get_data_flows_to(&self, symbol_id: i64) -> rusqlite::Result<Vec<DataFlowRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, src_symbol_id, dst_symbol_id, flow_kind, var_name, line, col, confidence
+             FROM data_flows WHERE dst_symbol_id = ?1"
+        )?;
+        let rows = stmt.query_map([symbol_id], |row| {
+            Ok(DataFlowRecord {
+                id: row.get(0)?, file_id: row.get(1)?,
+                src_symbol_id: row.get(2)?, dst_symbol_id: row.get(3)?,
+                flow_kind: row.get(4)?, var_name: row.get(5)?,
+                line: row.get::<_, i64>(6)? as usize,
+                col: row.get::<_, i64>(7)? as usize,
+                confidence: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Trace the full data flow chain from a symbol (forward traversal).
+    /// Uses recursive CTE for efficient graph walk.
+    pub fn trace_data_flow_forward(&self, symbol_id: i64, max_depth: i64) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE flow_chain(dst_id, flow_kind, depth) AS (
+                 SELECT dst_symbol_id, flow_kind, 1
+                 FROM data_flows WHERE src_symbol_id = ?1
+                 UNION ALL
+                 SELECT df.dst_symbol_id, df.flow_kind, fc.depth + 1
+                 FROM data_flows df
+                 JOIN flow_chain fc ON df.src_symbol_id = fc.dst_id
+                 WHERE fc.depth < ?2
+             )
+             SELECT dst_id, flow_kind, depth FROM flow_chain ORDER BY depth"
+        )?;
+        let rows = stmt.query_map(params![symbol_id, max_depth], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Trace the full data flow chain to a symbol (backward traversal).
+    /// Uses recursive CTE for efficient graph walk.
+    pub fn trace_data_flow_backward(&self, symbol_id: i64, max_depth: i64) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE flow_chain(src_id, flow_kind, depth) AS (
+                 SELECT src_symbol_id, flow_kind, 1
+                 FROM data_flows WHERE dst_symbol_id = ?1
+                 UNION ALL
+                 SELECT df.src_symbol_id, df.flow_kind, fc.depth + 1
+                 FROM data_flows df
+                 JOIN flow_chain fc ON df.dst_symbol_id = fc.src_id
+                 WHERE fc.depth < ?2
+             )
+             SELECT src_id, flow_kind, depth FROM flow_chain ORDER BY depth"
+        )?;
+        let rows = stmt.query_map(params![symbol_id, max_depth], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Get symbols with no incoming call edges and no incoming import edges (dead code candidates).
+    pub fn get_dead_code_candidates(&self) -> rusqlite::Result<Vec<SymbolRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, s.line, s.col,
+                    s.is_exported, s.scope_id, s.owner_symbol_id
+             FROM symbols s
+             WHERE s.kind IN ('Function', 'Method', 'Class', 'Struct', 'Interface', 'Enum', 'Trait')
+             AND s.is_exported = 0
+             AND s.id NOT IN (SELECT DISTINCT dst_id FROM edges WHERE edge_kind = 'CALLS')
+             AND s.id NOT IN (SELECT DISTINCT symbol_id FROM exports)
+             ORDER BY s.name"
+        )?;
+        let rows = stmt.query_map([], Self::map_symbol_row)?;
+        rows.collect()
+    }
+
+    /// Detect call graph cycles using recursive CTE.
+    /// Returns cycles as vectors of symbol IDs forming the cycle.
+    pub fn detect_call_cycles(&self, max_depth: i64) -> rusqlite::Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE call_chain(src_id, dst_id, depth) AS (
+                 SELECT e.src_id, e.dst_id, 1
+                 FROM edges e
+                 WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id
+                 UNION ALL
+                 SELECT cc.src_id, e.dst_id, cc.depth + 1
+                 FROM call_chain cc
+                 JOIN edges e ON e.src_id = cc.dst_id
+                 WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id AND cc.depth < ?1
+             )
+             SELECT DISTINCT src_id, dst_id FROM call_chain WHERE src_id = dst_id"
+        )?;
+        let rows = stmt.query_map([max_depth], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Find strongly connected components in the call graph (actual cycles with members).
+    /// Returns each SCC as a list of participating symbol IDs.
+    pub fn detect_call_sccs(&self) -> rusqlite::Result<Vec<Vec<i64>>> {
+        // Find all edges that participate in cycles
+        let cycle_edges: Vec<(i64, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "WITH RECURSIVE call_chain(src_id, dst_id, depth) AS (
+                     SELECT e.src_id, e.dst_id, 1
+                     FROM edges e
+                     WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id
+                     UNION ALL
+                     SELECT cc.src_id, e.dst_id, cc.depth + 1
+                     FROM call_chain cc
+                     JOIN edges e ON e.src_id = cc.dst_id
+                     WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id AND cc.depth < 32
+                 )
+                 SELECT DISTINCT LEAST(src_id, dst_id), GREATEST(src_id, dst_id)
+                 FROM call_chain WHERE src_id = dst_id AND src_id != dst_id"
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        // For simplicity, return pairs — full Tarjan's would need application-level algo
+        Ok(cycle_edges.into_iter().map(|(a, b)| vec![a, b]).collect())
+    }
+
+    /// Add ACCESSES edges (field/property read/write tracking) to the edges table.
+    /// reason: 'read' | 'write'
+    pub fn insert_access_edge(&self, src_id: i64, dst_id: i64, reason: &str, confidence: f64, file_id: i64, line: i64) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edges (src_id, dst_id, edge_kind, confidence, file_id, line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![src_id, dst_id, format!("ACCESSES_{}", reason), confidence, file_id, line],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all ACCESSES edges for a symbol (both reads and writes).
+    pub fn get_accesses(&self, symbol_id: i64) -> rusqlite::Result<Vec<(i64, String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_id, edge_kind, confidence FROM edges
+             WHERE dst_id = ?1 AND edge_kind LIKE 'ACCESSES%'"
+        )?;
+        let rows = stmt.query_map([symbol_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?))
+        })?;
+        rows.collect()
     }
 
     // =================================================================

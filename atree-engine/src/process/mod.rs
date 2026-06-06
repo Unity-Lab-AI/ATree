@@ -116,22 +116,50 @@ pub fn detect_processes(
         }
     }
 
-    // Step 1: Find entry points — symbols that are called but don't call anyone in the same file
-    // (simplified: symbols with callees but no callers within the indexed set)
+    // Step 1: Find entry points using multiple heuristics
     let mut entry_points: Vec<i64> = Vec::new();
+
+    // Heuristic 1: Top-level functions — callees but no callers in the indexed set
     for sym in &all_symbols {
         let has_callees = forward_adj.get(&sym.id).map(|v| !v.is_empty()).unwrap_or(false);
         let has_callers = reverse_adj.get(&sym.id).map(|v| !v.is_empty()).unwrap_or(false);
-
-        // Entry point: has callees but few/no callers (top-level functions)
         if has_callees && !has_callers {
             entry_points.push(sym.id);
         }
     }
 
-    // Also consider exported functions with callees as entry points
+    // Heuristic 2: Exported functions with callees
     for sym in &all_symbols {
         if sym.is_exported {
+            let has_callees = forward_adj.get(&sym.id).map(|v| !v.is_empty()).unwrap_or(false);
+            if has_callees && !entry_points.contains(&sym.id) {
+                entry_points.push(sym.id);
+            }
+        }
+    }
+
+    // Heuristic 3: API route handlers — functions that handle HTTP routes
+    // These are natural entry points since they're called by the framework, not by user code
+    let route_rows = store.conn().prepare(
+        "SELECT handler_symbol_id FROM routes WHERE handler_symbol_id IS NOT NULL"
+    ).and_then(|mut stmt| {
+        stmt.query_map([], |row| row.get::<_, i64>(0))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    }).unwrap_or_default();
+    for handler_id in route_rows {
+        if !entry_points.contains(&handler_id) {
+            entry_points.push(handler_id);
+        }
+    }
+
+    // Heuristic 4: Event handlers — functions with common event handler naming patterns
+    // (onX, handleX, processX) that have callees but may have callers
+    for sym in &all_symbols {
+        let name = symbol_names.get(&sym.id).map(|s| s.as_str()).unwrap_or("");
+        let is_event_handler = name.starts_with("on") && name.len() > 2
+            || name.starts_with("handle") && name.len() > 6
+            || name.starts_with("process") && name.len() > 7;
+        if is_event_handler {
             let has_callees = forward_adj.get(&sym.id).map(|v| !v.is_empty()).unwrap_or(false);
             if has_callees && !entry_points.contains(&sym.id) {
                 entry_points.push(sym.id);
