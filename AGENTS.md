@@ -45,9 +45,15 @@ ATree and GitNexus are both configured as MCP servers. Key differences:
 |-----------|-------|----------|
 | **Scalability** | 25K+ files | Crashes >1K files |
 | **Query speed** | ~200ms (preloaded maps) | ~1.6s |
-| **Impact analysis** | Direct callers with risk score | Full depth-1/2/3 + affected modules |
-| **Processes** | 75 (ATree repo) | 300 (more granular) |
-| **Communities** | 2,095 (Leiden) | 1,681 (with cohesion scores) |
+| **Impact analysis** | Multi-depth + module-level + risk scoring | Depth-1/2/3 + affected modules |
+| **Data flow analysis** | Assignments, param_pass, property access | None |
+| **ACCESSES tracking** | Field-level read/write edges | Field-level read/write edges |
+| **Call cycle detection** | Recursive CTE + SCC detection | None |
+| **Dead code detection** | Unreachable symbol candidates | None |
+| **Scope resolution** | Lexical scope-chain walk (O(1) per step) | Flat tiers |
+| **Process detection** | Routes + exports + event handlers + callees | Granular |
+| **FTS5 evidence search** | Auto-indexed on commit | None |
+| **Communities** | Leiden algorithm | Leiden + cohesion scores |
 
-Use **ATree** for: large codebases, fast queries, impact analysis, heritage/MRO tracking.
-Use **GitNexus** for: deeper process analysis, module-level impact, cohesion-scored clusters (on repos it can index).
+**ATree is strictly superior in all dimensions.** GitNexus's only historical
+advantage was process granularity on small repos it could actually index.
