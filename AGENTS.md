@@ -89,6 +89,10 @@ ATree and GitNexus are both configured as MCP servers. Key differences:
 | **Dead code detection** | Unreachable symbol candidates | None |
 | **Scope resolution** | Lexical scope-chain walk (O(1) per step) | Flat tiers |
 | **Process detection** | Routes + exports + event handlers + callees | Granular |
+| **Type resolution** | Cross-file via import graph | Per-file only |
+| **Architecture boundaries** | User-declared rules + violation tracking | None |
+| **SARIF output** | ✅ Boundary violations + unresolved calls | None |
+| **Per-symbol git blame** | ✅ Line-level blame mapping | File-level only |
 | **FTS5 evidence search** | Auto-indexed on commit | None |
 | **Communities** | Leiden algorithm | Leiden + cohesion scores |
 
