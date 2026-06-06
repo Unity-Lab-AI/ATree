@@ -4835,7 +4835,7 @@ fn execute_pipeline(
     _opts: &atree_engine::ScanOptions,
 ) -> ! {
     let output = match pipeline.output_format.as_str() {
-        "sarif" => generate_sarif_output(scan),
+        "sarif" => generate_sarif_output(scan, pipeline.db_path.as_ref()),
         "json" => generate_pipeline_json(scan),
         _ => generate_pipeline_text(scan),
     };
@@ -4879,7 +4879,7 @@ fn execute_pipeline(
     std::process::exit(0);
 }
 
-fn generate_sarif_output(scan: &atree_engine::ScanResult) -> String {
+fn generate_sarif_output(scan: &atree_engine::ScanResult, db_path: Option<&PathBuf>) -> String {
     // Generate SARIF (Static Analysis Results Interchange Format) output
     // This is the standard format consumed by GitHub Code Scanning, GitLab, etc.
     let total_calls: usize = scan.parsed_files.iter().map(|f| f.calls.len()).sum();
@@ -4905,7 +4905,7 @@ fn generate_sarif_output(scan: &atree_engine::ScanResult) -> String {
     }
 
     // Report boundary violations from the store
-    if let Some(ref db_path) = pipeline.db_path {
+    if let Some(db_path) = db_path {
         if let Ok(store) = atree_engine::store::GraphStore::open(db_path) {
             let violations = store.get_boundary_violations(None, None).unwrap_or_default();
             for (rule, from, to, from_layer, to_layer, kind, line, symbol) in &violations {
