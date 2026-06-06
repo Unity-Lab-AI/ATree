@@ -154,6 +154,11 @@ enum QueryCommand {
     EvidenceStats,
     /// Mine recurring patterns from the evidence graph. Returns motifs ranked by score.
     PatternMine { min_frequency: usize, max_patterns: usize },
+    /// Trace data flow for a symbol: where values come from and where they go.
+    /// Shows assignments, parameter passing, property access, and return flows.
+    DataFlowTrace { symbol: String, direction: String, depth: usize },
+    /// Show module-level impact: which files are affected when a symbol changes.
+    ModuleImpact { symbol: String, depth: usize },
     /// Run impact analysis on a pattern (all evidence participating in the pattern)
     PatternImpact { pattern_id: String },
     /// Check constraints synthesized from evidence patterns
@@ -914,6 +919,30 @@ fn parse_args() -> Args {
                     }
                     "db-stats" => {
                         args.query = Some(QueryCommand::DbStats);
+                    }
+                    "data-flow-trace" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query data-flow-trace' requires a symbol name{}", help());
+                            std::process::exit(2);
+                        }
+                        let symbol = cli_args[i].clone();
+                        let direction = cli_args.get(i+1).filter(|s| !s.starts_with("--")).cloned().unwrap_or_else(|| "forward".to_string());
+                        if !direction.starts_with("--") { i += 1; }
+                        let depth = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(5);
+                        if depth != 5 { i += 1; }
+                        args.query = Some(QueryCommand::DataFlowTrace { symbol, direction, depth });
+                    }
+                    "module-impact" => {
+                        i += 1;
+                        if i >= cli_args.len() {
+                            eprintln!("Error: 'query module-impact' requires a symbol name{}", help());
+                            std::process::exit(2);
+                        }
+                        let symbol = cli_args[i].clone();
+                        let depth = cli_args.get(i+1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(3);
+                        if depth != 3 { i += 1; }
+                        args.query = Some(QueryCommand::ModuleImpact { symbol, depth });
                     }
                     other => {
                         eprintln!("Error: unknown query subcommand '{}'. Run 'atree query --help' for full list.", other);
@@ -4242,6 +4271,54 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 println!("Constraints (confidence >= {}):", min_confidence);
                 for (name, kind, conf) in &constraints {
                     println!("  {:<40} {:<25} {:.2}", name, kind, conf);
+                }
+            }
+        }
+        QueryCommand::DataFlowTrace { symbol, direction, depth } => {
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e); std::process::exit(1);
+            });
+            if syms.is_empty() {
+                eprintln!("Symbol '{}' not found.", symbol);
+                std::process::exit(1);
+            }
+            for sym in &syms {
+                println!("Data flow for {} ({}) [dir={}, depth={}]:", sym.name, sym.id, direction, depth);
+                let chain = match direction.as_str() {
+                    "backward" => store.trace_data_flow_backward(sym.id, *depth as i64),
+                    _ => store.trace_data_flow_forward(sym.id, *depth as i64),
+                }.unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e); std::process::exit(1);
+                });
+                if chain.is_empty() {
+                    println!("  (no data flows found)");
+                }
+                for (other_id, kind, d) in &chain {
+                    let name = store.get_all_symbols().ok()
+                        .and_then(|all| all.iter().find(|s| s.id == *other_id).map(|s| s.name.clone()))
+                        .unwrap_or_else(|| format!("sym:{}", other_id));
+                    println!("  d={}: [{}] {} {}", d, kind, if direction == "backward" { "←" } else { "→" }, name);
+                }
+            }
+        }
+        QueryCommand::ModuleImpact { symbol, depth } => {
+            let syms = store.get_symbols_by_name(symbol).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e); std::process::exit(1);
+            });
+            if syms.is_empty() {
+                eprintln!("Symbol '{}' not found.", symbol);
+                std::process::exit(1);
+            }
+            for sym in &syms {
+                println!("Module impact for {} ({}) [depth={}]:", sym.name, sym.id, depth);
+                let impact = store.get_module_impact(sym.id, *depth as i64).unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e); std::process::exit(1);
+                });
+                if impact.is_empty() {
+                    println!("  (no cross-file impact)");
+                }
+                for (src, dst, kind, weight) in &impact {
+                    println!("  {} → {}  [{}] (weight={})", src, dst, kind, weight);
                 }
             }
         }
