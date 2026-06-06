@@ -223,6 +223,28 @@ impl PipelinePhase for CrossFilePhase {
             }
         }
 
+        // ── Cross-file type resolution ──────────────────────────────────────
+        // Build a CrossFileTypeResolver that links type environments across files
+        // using the import graph. This enables resolving `this.repo.find()` where
+        // `repo` is typed as `UserRepository` imported from another file.
+        perf_timer!("Cross-file type resolution");
+        {
+            use rustc_hash::FxHashMap;
+            let mut file_id_to_path: FxHashMap<u64, String> = FxHashMap::default();
+            let mut path_to_file_id: FxHashMap<String, u64> = FxHashMap::default();
+            for pf in parsed_files_guard.iter() {
+                file_id_to_path.insert(pf.id, pf.path.clone());
+                path_to_file_id.insert(pf.path.clone(), pf.id);
+            }
+            let cross_resolver = crate::type_env::build_cross_file_resolver(
+                &parsed_files_guard, &file_id_to_path, &path_to_file_id,
+            );
+            let cross_type_resolved = cross_resolver.resolve_all(&parsed_files_guard);
+            if cross_type_resolved > 0 {
+                tracing::info!(cross_type_resolved, "Cross-file type resolutions");
+            }
+        }
+
         // Drop the lock before scope resolution, which needs &mut.
         drop(parsed_files_guard);
 

@@ -4904,6 +4904,28 @@ fn generate_sarif_output(scan: &atree_engine::ScanResult) -> String {
         }));
     }
 
+    // Report boundary violations from the store
+    if let Some(ref db_path) = pipeline.db_path {
+        if let Ok(store) = atree_engine::store::GraphStore::open(db_path) {
+            let violations = store.get_boundary_violations(None, None).unwrap_or_default();
+            for (rule, from, to, from_layer, to_layer, kind, line, symbol) in &violations {
+                results.push(serde_json::json!({
+                    "ruleId": format!("atree/boundary-{}", rule),
+                    "level": "error",
+                    "message": {
+                        "text": format!("Architecture boundary violation: {} ({} → {}) at {}:{}", symbol, from_layer, to_layer, from, line)
+                    },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": from },
+                            "region": { "startLine": line }
+                        }
+                    }]
+                }));
+            }
+        }
+    }
+
     let sarif = serde_json::json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -4924,6 +4946,12 @@ fn generate_sarif_output(scan: &atree_engine::ScanResult) -> String {
                             "id": "atree/impact-hotspot",
                             "shortDescription": { "text": "High-impact code change" },
                             "fullDescription": { "text": "A symbol with many dependents that may cause widespread breakage" },
+                            "defaultConfiguration": { "level": "error" }
+                        },
+                        {
+                            "id": "atree/boundary-violation",
+                            "shortDescription": { "text": "Architecture boundary violation" },
+                            "fullDescription": { "text": "A cross-file call or import that violates declared architecture layer boundaries" },
                             "defaultConfiguration": { "level": "error" }
                         }
                     ]

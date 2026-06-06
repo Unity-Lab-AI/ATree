@@ -335,7 +335,41 @@ impl CrossFileTypeResolver {
 
         None
     }
+
+    /// Resolve all cross-file calls in the parsed files.
+    /// For each call with a receiver, try to resolve the receiver's type and
+    /// then find the method on that type in the imported file.
+    /// Returns the number of successful cross-file resolutions.
+    pub fn resolve_all(&self, parsed_files: &[ParsedFile]) -> usize {
+        let mut resolved = 0;
+        for parsed in parsed_files {
+            for call in &parsed.calls {
+                if call.resolved_symbol_id.is_some() {
+                    continue; // already resolved
+                }
+                if let Some(ref receiver) = call.receiver {
+                    if let Some(env) = self.envs.get(&parsed.id) {
+                        if let Some(receiver_type) = env.lookup(
+                            receiver, call.caller_scope_id, &parsed.scopes, &parsed.symbols
+                        ) {
+                            if let Some((target_file_id, _)) = self.resolve_method(
+                                &receiver_type, &call.callee_name, parsed.id
+                            ) {
+                                resolved += 1;
+                                tracing::debug!(
+                                    "Cross-file type resolution: {}.{} → {} (type={})",
+                                    receiver, call.callee_name, target_file_id, receiver_type
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resolved
+    }
 }
+
 
 /// Build a CrossFileTypeResolver from parsed files and their imports.
 /// This is the main entry point for cross-file type resolution.

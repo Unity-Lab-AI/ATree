@@ -923,6 +923,41 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// Get per-symbol git blame: maps a symbol's line range to the most recent
+    /// commit that touched each line. Returns (line, commit_hash, author, timestamp).
+    /// Only works if blame_lines has been populated (via git-blame command or full indexing).
+    pub fn get_symbol_blame(&self, symbol_id: i64) -> rusqlite::Result<Vec<(i64, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bl.line_number, bl.commit_hash, bl.author_name, bl.last_changed_at
+             FROM blame_lines bl
+             JOIN symbols s ON s.file_id = bl.file_id
+             WHERE s.id = ?1
+             AND bl.line_number BETWEEN s.line AND s.line + 100
+             ORDER BY bl.line_number"
+        )?;
+        let rows = stmt.query_map([symbol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Get the primary author for a symbol (who touched it most recently).
+    pub fn get_symbol_primary_author(&self, symbol_id: i64) -> rusqlite::Result<Option<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bl.author_name, bl.author_email, bl.last_changed_at
+             FROM blame_lines bl
+             JOIN symbols s ON s.file_id = bl.file_id
+             WHERE s.id = ?1
+             AND bl.line_number = s.line
+             ORDER BY bl.last_changed_at DESC
+             LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map([symbol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.next().transpose()
+    }
+
     /// Get all ACCESSES edges for a symbol (both reads and writes).
     pub fn get_accesses(&self, symbol_id: i64) -> rusqlite::Result<Vec<(i64, String, f64)>> {
         let mut stmt = self.conn.prepare(
