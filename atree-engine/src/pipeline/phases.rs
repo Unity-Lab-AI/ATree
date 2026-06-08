@@ -65,39 +65,31 @@ impl PipelinePhase for CrossFilePhase {
             }
         };
 
-        // Build the global symbol ID map. If the incremental path already
-        // inserted data, load symbol IDs from the DB. Otherwise batch-insert.
-        let global_symbol_id_map = if store.count_files().unwrap_or(0) > 0 {
-            perf_timer!("SQLite ID map (incremental)");
-            let mut map = rustc_hash::FxHashMap::default();
-            // Load all symbols from DB and match them to in-memory parsed files
-            // by (file_path, symbol_name, line) tuple.
-            if let Ok(db_symbols) = store.get_all_symbols() {
-                for db_sym in &db_symbols {
-                    // Find the matching in-memory symbol
-                    for pf in parsed_files_guard.iter() {
-                        if let Some(file) = store.get_file_by_id(db_sym.file_id).ok().flatten() {
-                            if file.path == pf.path {
-                                if let Some(mem_sym) = pf.symbols.iter()
-                                    .find(|s| s.name == db_sym.name && s.line == db_sym.line)
-                                {
-                                    map.insert(mem_sym.id, db_sym.id);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        let conn = store.conn();
+
+        // Delete old data for all files being re-indexed to prevent duplicates
+        // and ensure visibility/edge data stays in sync with the latest parse.
+        for pf in parsed_files_guard.iter() {
+            let file_id: i64 = conn.query_row(
+                "SELECT id FROM files WHERE path = ?1", [&pf.path], |r| r.get(0)
+            ).unwrap_or(0);
+            if file_id > 0 {
+                let _ = conn.execute("DELETE FROM exports WHERE file_id = ?1", [file_id]);
+                let _ = conn.execute("DELETE FROM calls WHERE file_id = ?1", [file_id]);
+                let _ = conn.execute("DELETE FROM heritage WHERE file_id = ?1", [file_id]);
+                let _ = conn.execute("DELETE FROM imports WHERE file_id = ?1", [file_id]);
+                let _ = conn.execute("DELETE FROM edges WHERE src_id IN (SELECT id FROM symbols WHERE file_id = ?1) OR dst_id IN (SELECT id FROM symbols WHERE file_id = ?1)", [file_id]);
+                let _ = conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id]);
             }
-            map
-        } else {
-            perf_timer!("SQLite batch insert");
-            match store.insert_all_files_batch(&parsed_files_guard, ctx.repo_label.as_deref()) {
-                Ok(map) => map,
-                Err(e) => {
-                    eprintln!("[cross_file] Warning: batch insert failed: {}", e);
-                    rustc_hash::FxHashMap::default()
-                }
+        }
+
+        // Batch-insert all parsed files (old data cleaned above).
+        perf_timer!("SQLite batch insert");
+        let global_symbol_id_map = match store.insert_all_files_batch(&parsed_files_guard, ctx.repo_label.as_deref()) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!("[cross_file] Warning: batch insert failed: {}", e);
+                rustc_hash::FxHashMap::default()
             }
         };
         let resolved_imports: usize = parsed_files_guard.iter().map(|f| f.imports.len()).sum();

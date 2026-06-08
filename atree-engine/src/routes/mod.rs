@@ -9,6 +9,18 @@
 //! Ported from GitNexus's route-extractors/ but using tree-sitter instead of regex.
 
 use serde::{Serialize, Deserialize};
+use std::sync::OnceLock;
+
+static NEXTJS_APP_ROUTER_RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
+static NEXTJS_PAGES_ROUTER_RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
+
+fn nextjs_app_router_re() -> &'static Option<regex::Regex> {
+    NEXTJS_APP_ROUTER_RE.get_or_init(|| regex::Regex::new(r"app/(.+?)/route\.(ts|js|tsx|jsx)$").ok())
+}
+
+fn nextjs_pages_router_re() -> &'static Option<regex::Regex> {
+    NEXTJS_PAGES_ROUTER_RE.get_or_init(|| regex::Regex::new(r"pages/(api\/.+?)\.(ts|js|tsx|jsx)$").ok())
+}
 
 /// A detected API route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,44 +44,42 @@ pub fn detect_routes_from_path(file_path: &str) -> Vec<Route> {
     let normalized = file_path.replace('\\', "/");
 
     // Next.js App Router: app/api/**/route.ts
-    if let Some(captures) = regex::Regex::new(r"app/(.+?)/route\.(ts|js|tsx|jsx)$")
-        .ok()
-        .and_then(|re| re.captures(&normalized))
-    {
-        let route_path = captures.get(1).map(|m| m.as_str()).unwrap_or("");
-        // Strip route groups: (admin), (marketing) etc.
-        let cleaned = route_path
-            .replace("/(", "/")
-            .replace(")/", "")
-            .replace(['(', ')'], "");
-        if cleaned.starts_with("api/") || cleaned == "api" {
-            routes.push(Route {
-                method: "ANY".to_string(),
-                path: format!("/{}", cleaned),
-                file_path: file_path.to_string(),
-                framework: "nextjs-app".to_string(),
-                line: 0,
-            });
+    if let Some(re) = nextjs_app_router_re() {
+        if let Some(captures) = re.captures(&normalized) {
+            let route_path = captures.get(1).map(|m| m.as_str()).unwrap_or("");
+            // Strip route groups: (admin), (marketing) etc.
+            let cleaned = route_path
+                .replace("/(", "/")
+                .replace(")/", "")
+                .replace(['(', ')'], "");
+            if cleaned.starts_with("api/") || cleaned == "api" {
+                routes.push(Route {
+                    method: "ANY".to_string(),
+                    path: format!("/{}", cleaned),
+                    file_path: file_path.to_string(),
+                    framework: "nextjs-app".to_string(),
+                    line: 0,
+                });
+            }
         }
     }
 
     // Next.js Pages Router: pages/api/**/*.ts
-    if let Some(captures) = regex::Regex::new(r"pages/(api\/.+?)\.(ts|js|tsx|jsx)$")
-        .ok()
-        .and_then(|re| re.captures(&normalized))
-    {
-        let mut path = format!(
-            "/{}",
-            captures.get(1).map(|m| m.as_str()).unwrap_or("")
-        );
-        path = path.replace("/index", "");
-        routes.push(Route {
-            method: "ANY".to_string(),
-            path,
-            file_path: file_path.to_string(),
-            framework: "nextjs-pages".to_string(),
-            line: 0,
-        });
+    if let Some(re) = nextjs_pages_router_re() {
+        if let Some(captures) = re.captures(&normalized) {
+            let mut path = format!(
+                "/{}",
+                captures.get(1).map(|m| m.as_str()).unwrap_or("")
+            );
+            path = path.replace("/index", "");
+            routes.push(Route {
+                method: "ANY".to_string(),
+                path,
+                file_path: file_path.to_string(),
+                framework: "nextjs-pages".to_string(),
+                line: 0,
+            });
+        }
     }
 
     routes
@@ -208,7 +218,8 @@ fn walk_python_routes(
     if node.kind() == "decorated_definition" {
         // Look for decorators on function definitions
         for i in 0..node.child_count() {
-            let child = node.child(i as u32).unwrap();
+            let child = node.child(i as u32)
+                .expect("child index must be valid (checked by child_count)");
             if child.kind() == "decorator" {
                 if let Some(route) = parse_python_route_decorator(child, content, file_path, http_methods, node) {
                     routes.push(route);

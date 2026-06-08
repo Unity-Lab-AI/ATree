@@ -1632,10 +1632,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             if target.is_empty() {
                 // Show all route handlers and their callee counts
                 let mut stmt = match conn.prepare(
-                    "SELECT s.name, s.file_path, s.line,
+                    "SELECT s.name, f.path, s.line,
                             COUNT(DISTINCT c.id) as callee_count,
                             COUNT(DISTINCT e_dst.id) as caller_count
                      FROM symbols s
+                     JOIN files f ON f.id = s.file_id
                      LEFT JOIN calls c ON c.caller_scope_id = s.id
                      LEFT JOIN edges e_src ON e_src.src_id = s.id AND e_src.edge_kind = 'ROUTE'
                      LEFT JOIN edges e_dst ON e_dst.dst_id = s.id
@@ -1665,11 +1666,12 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Solid: query edges table for actual tool/route/handler edges,
             // plus symbols that define tools via known patterns.
             let mut stmt = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, e.edge_kind
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, e.edge_kind
                  FROM edges e
                  JOIN symbols s ON s.id = e.dst_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE e.edge_kind IN ('HANDLES_ROUTE', 'ROUTE', 'HANDLES_TOOL', 'HANDLES_ENDPOINT')
-                 ORDER BY s.file_path, s.line"
+                 ORDER BY f.path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let edge_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -1679,8 +1681,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Also find symbols that are tools/handlers/endpoints by their role in the call graph:
             // symbols that are called by route handlers or that call into I/O layers
             let mut stmt2 = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'CALLS_IO' as role
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, 'CALLS_IO' as role
                  FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  JOIN calls c ON c.caller_scope_id = s.id
                  WHERE s.kind IN ('Function', 'Method')
                  AND c.callee_name IN (
@@ -1693,7 +1696,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      SELECT DISTINCT dst_id FROM edges
                      WHERE edge_kind IN ('HANDLES_ROUTE', 'ROUTE', 'HANDLES_TOOL')
                  )
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let io_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -1860,7 +1863,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Get all exported symbols across all repos
             let mut stmt = match conn.prepare(
-                "SELECT e.exported_name, s.file_path, s.name, s.kind, f.repo_label
+                "SELECT e.exported_name, f.path, s.name, s.kind, f.repo_label
                  FROM exports e
                  JOIN symbols s ON s.id = e.symbol_id
                  JOIN files f ON f.id = s.file_id
@@ -1958,10 +1961,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
         QueryCommand::FindEntrypoints => {
             let conn = store.conn();
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.file_path, s.line FROM symbols s
+                "SELECT s.name, s.kind, f.path, s.line FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE s.is_exported = 1
                  AND s.kind IN ('Function', 'Method', 'Class')
-                 ORDER BY s.file_path, s.line LIMIT 100"
+                 ORDER BY f.path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2037,11 +2041,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             let conn = store.conn();
             let sql = match module {
                 Some(m) => format!(
-                    "SELECT s.name, s.kind, s.file_path, s.line FROM symbols s
-                     WHERE s.is_exported = 1 AND s.file_path LIKE '%{}%'
-                     ORDER BY s.file_path, s.line", m),
-                None => "SELECT s.name, s.kind, s.file_path, s.line FROM symbols s
-                         WHERE s.is_exported = 1 ORDER BY s.file_path, s.line LIMIT 200".to_string(),
+                    "SELECT s.name, s.kind, f.path, s.line FROM symbols s
+                     JOIN files f ON f.id = s.file_id
+                     WHERE s.is_exported = 1 AND f.path LIKE '%{}%'
+                     ORDER BY f.path, s.line", m),
+                None => "SELECT s.name, s.kind, f.path, s.line FROM symbols s
+                         JOIN files f ON f.id = s.file_id
+                         WHERE s.is_exported = 1 ORDER BY f.path, s.line LIMIT 200".to_string(),
             };
             let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let rows = query_collect(&mut stmt, |row| Ok((
@@ -2066,9 +2072,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Strategy 2: SQL query — find all test-like symbols that transitively call this symbol
             // via the calls table, regardless of file path
             let mut stmt = match conn.prepare(
-                "SELECT DISTINCT s.name, s.file_path, s.line, 'CALLS_DIRECTLY' as how
+                "SELECT DISTINCT s.name, f.path, s.line, 'CALLS_DIRECTLY' as how
                  FROM calls c
                  JOIN symbols s ON s.id = c.caller_scope_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE c.resolved_symbol_id = ?1
                  AND c.resolved_symbol_id IS NOT NULL
                  AND (
@@ -2077,7 +2084,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      OR s.name LIKE 'test_%' OR s.name LIKE 'it_%'
                      OR s.name LIKE '%_test_%' OR s.name LIKE '%describe%'
                  )
-                 ORDER BY s.file_path, s.line"
+                 ORDER BY f.path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let sql_tests: Vec<_> = query_collect_params(&mut stmt, [sym.id], |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2283,8 +2290,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Get current public API surface
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.qualified_name, s.file_path, s.line
-                 FROM symbols s WHERE s.is_exported = 1
+                "SELECT s.name, s.kind, s.qualified_name, f.path, s.line
+                 FROM symbols s
+                 JOIN files f ON f.id = s.file_id
+                 WHERE s.is_exported = 1
                  ORDER BY s.qualified_name"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let current_public: Vec<(String, String, String, String, i64)> = query_collect(&mut stmt, |row| Ok((
@@ -2528,10 +2537,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 1: Non-exported symbols called from outside their file (existing logic, expanded)
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.file_path, s.line, s.kind FROM symbols s
+                "SELECT s.name, f.path, s.line, s.kind FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE s.is_exported = 0
                  AND s.kind IN ('Function', 'Method', 'Class')
-                 ORDER BY s.file_path, s.line"
+                 ORDER BY f.path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2567,7 +2577,8 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Java/Kotlin/C#/TS: private keyword (handled by is_exported)
             // But we can catch symbols with private naming that ARE exported
             let mut stmt2 = match conn.prepare(
-                "SELECT s.name, s.file_path, s.line, s.kind FROM symbols s
+                "SELECT s.name, f.path, s.line, s.kind FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE s.is_exported = 1
                  AND (
                      -- Python: exported but starts with _ (protected by convention)
@@ -2578,7 +2589,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      OR s.name LIKE '%Internal%' OR s.name LIKE '%Private%'
                  )
                  AND s.kind IN ('Function', 'Method', 'Class')
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let naming_violations: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2599,14 +2610,14 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             // Strategy 3: Cross-module private access — symbols in private modules (_prefix)
             // that are imported by public modules
             let mut stmt3 = match conn.prepare(
-                "SELECT s.name, s.file_path, s.line, i.source
+                "SELECT s.name, f.path, s.line, i.source
                  FROM imports i
                  JOIN symbols s ON s.file_id = i.file_id
                  JOIN files f ON f.id = i.file_id
                  WHERE i.source LIKE '%/_%'
                  AND i.source NOT LIKE '%/__pycache__%'
                  AND s.is_exported = 1
-                 ORDER BY s.file_path, s.line LIMIT 25"
+                 ORDER BY f.path, s.line LIMIT 25"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let private_imports: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2671,15 +2682,16 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 1: Keyword-based config symbols (expanded)
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.file_path, s.line, 'keyword' as detection_method
+                "SELECT s.name, s.kind, f.path, s.line, 'keyword' as detection_method
                  FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE (s.name LIKE '%config%' OR s.name LIKE '%env%' OR s.name LIKE '%setting%'
                         OR s.name LIKE '%feature%' OR s.name LIKE '%flag%' OR s.name LIKE '%var%'
                         OR s.name LIKE '%option%' OR s.name LIKE '%param%' OR s.name LIKE '%pref%'
                         OR s.name LIKE '%secret%' OR s.name LIKE '%token%' OR s.name LIKE '%key%'
                         OR s.name LIKE '%credential%' OR s.name LIKE '%password%' OR s.name LIKE '%api_key%')
                  AND s.kind IN ('Const', 'Variable', 'Static', 'Function', 'Struct', 'Class')
-                 ORDER BY s.file_path, s.line LIMIT 100"
+                 ORDER BY f.path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let keyword_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2688,9 +2700,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             )));
             // Strategy 2: Detect environment variable access patterns via calls table
             let mut stmt2 = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'env_access' as detection_method
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, 'env_access' as detection_method
                  FROM calls c
                  JOIN symbols s ON s.id = c.caller_scope_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE c.callee_name IN (
                      'env', 'var', 'set_var', 'remove_var', 'vars',
                      'env_var', 'get_env', 'set_env', 'read_env',
@@ -2699,7 +2712,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      'config', 'load_config', 'read_config', 'parse_config',
                      'from_str', 'from_env', 'try_from_env'
                  )
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let env_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -2709,9 +2722,10 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 3: Detect config file readers
             let mut stmt3 = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'config_reader' as detection_method
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, 'config_reader' as detection_method
                  FROM calls c
                  JOIN symbols s ON s.id = c.caller_scope_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE c.callee_name IN (
                      'read_to_string', 'read', 'open', 'File::open',
                      'from_reader', 'from_path', 'load', 'parse',
@@ -2720,7 +2734,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      'configparser', 'ConfigParser', 'load_dotenv'
                  )
                  AND s.name NOT LIKE '%test%' AND s.name NOT LIKE '%Test%'
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let reader_rows: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -3097,8 +3111,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 1: Keyword-based detection (expanded)
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.file_path, s.line, 'keyword' as detection_method
+                "SELECT s.name, s.kind, f.path, s.line, 'keyword' as detection_method
                  FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE (s.name LIKE '%lock%' OR s.name LIKE '%mutex%' OR s.name LIKE '%atomic%'
                         OR s.name LIKE '%thread%' OR s.name LIKE '%spawn%' OR s.name LIKE '%async%'
                         OR s.name LIKE '%await%' OR s.name LIKE '%channel%' OR s.name LIKE '%arc%'
@@ -3107,7 +3122,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                         OR s.name LIKE '%condvar%' OR s.name LIKE '%lazy_static%' OR s.name LIKE '%once_cell%'
                         OR s.name LIKE '%tokio%' OR s.name LIKE '%smol%' OR s.name LIKE '%executor%'
                         OR s.name LIKE '%worker%' OR s.name LIKE '%pool%' OR s.name LIKE '%queue%')
-                 ORDER BY s.file_path, s.line LIMIT 100"
+                 ORDER BY f.path, s.line LIMIT 100"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let keyword_rows: Vec<_> = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -3117,14 +3132,15 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 2: Detect async functions
             let mut stmt2 = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'async_call' as detection_method
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, 'async_call' as detection_method
                  FROM calls c
                  JOIN symbols s ON s.id = c.caller_scope_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE c.callee_name LIKE '%await%'
                     OR c.callee_name LIKE '%spawn%'
                     OR c.callee_name LIKE '%join%'
                     OR c.callee_name IN ('block_on', 'spawn_blocking', 'yield_now', 'sleep', 'timeout')
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let async_rows: Vec<_> = query_collect(&mut stmt2, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -3134,12 +3150,13 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Strategy 3: Detect shared-state patterns
             let mut stmt3 = match conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file_path, s.line, 'shared_state' as detection_method
+                "SELECT DISTINCT s.name, s.kind, f.path, s.line, 'shared_state' as detection_method
                  FROM calls c
                  JOIN symbols s ON s.id = c.caller_scope_id
+                 JOIN files f ON f.id = s.file_id
                  WHERE c.callee_name IN ('Arc', 'Rc', 'Mutex', 'RwLock', 'Cell', 'RefCell',
                      'lock', 'read', 'write', 'try_lock', 'get_mut')
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let shared_rows: Vec<_> = query_collect(&mut stmt3, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,
@@ -3209,9 +3226,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
 
             // Get all exported symbols
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.qualified_name, s.file_path, s.line, s.id
-                 FROM symbols s WHERE s.is_exported = 1
-                 ORDER BY s.file_path, s.line"
+                "SELECT s.name, s.kind, s.qualified_name, f.path, s.line, s.id
+                 FROM symbols s
+                 JOIN files f ON f.id = s.file_id
+                 WHERE s.is_exported = 1
+                 ORDER BY f.path, s.line"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let exported: Vec<(String, String, String, String, i64, i64)> = query_collect(&mut stmt, |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
@@ -3338,8 +3357,9 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             println!("Ownership hotspots (symbols with most dependents):");
             let conn = store.conn();
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.file_path, s.line, COUNT(c.id) as ref_count
+                "SELECT s.name, s.kind, f.path, s.line, COUNT(c.id) as ref_count
                  FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  LEFT JOIN calls c ON c.resolved_symbol_id = s.id
                  GROUP BY s.id
                  HAVING ref_count > 0
@@ -3830,7 +3850,8 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
             println!("Uncovered symbols (no callers, not exported, not tested):");
             let conn = store.conn();
             let mut stmt = match conn.prepare(
-                "SELECT s.name, s.kind, s.file_path, s.line FROM symbols s
+                "SELECT s.name, s.kind, f.path, s.line FROM symbols s
+                 JOIN files f ON f.id = s.file_id
                  WHERE s.is_exported = 0
                  AND s.kind IN ('Function', 'Method', 'Class')
                  AND s.id NOT IN (SELECT DISTINCT resolved_symbol_id FROM calls WHERE resolved_symbol_id IS NOT NULL)
@@ -3838,11 +3859,11 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                      -- Symbols referenced from test files
                      SELECT DISTINCT c2.resolved_symbol_id
                      FROM calls c2
-                     JOIN files f ON f.id = c2.file_id
+                     JOIN files f2 ON f2.id = c2.file_id
                      WHERE c2.resolved_symbol_id IS NOT NULL
-                     AND (f.path LIKE '%test%' OR f.path LIKE '%spec%' OR f.path LIKE '%__tests__%')
+                     AND (f2.path LIKE '%test%' OR f2.path LIKE '%spec%' OR f2.path LIKE '%__tests__%')
                  )
-                 ORDER BY s.file_path, s.line LIMIT 50"
+                 ORDER BY f.path, s.line LIMIT 50"
             ) { Ok(s) => s, Err(e) => { log::error!("DB prepare failed: {}", e); std::process::exit(1); } };
             let rows = query_collect(&mut stmt, |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?,

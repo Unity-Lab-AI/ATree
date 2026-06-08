@@ -40,6 +40,9 @@ use crate::layout::{self, LayoutConfig};
 
 pub struct AppState {
     pub event_bus: Arc<RwLock<EventBus>>,
+    /// DB path for opening connections. Each handler gets its own connection
+    /// (rusqlite::Connection is not Send, so we can't share it across threads).
+    /// The store is opened once per request and reused within that request.
     pub db_path: Option<PathBuf>,
     pub repo_path: Option<String>,
     pub webhook_secret: Option<String>,
@@ -48,6 +51,10 @@ pub struct AppState {
     pub webhook_inflight: Arc<AtomicU64>,
     /// Timestamp of the last webhook request (unix seconds).
     pub webhook_last_ms: Arc<AtomicU64>,
+    /// Total webhook requests received (authenticated + unauthenticated).
+    pub webhook_requests_total: Arc<AtomicU64>,
+    /// Server start timestamp for uptime calculation.
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
@@ -59,7 +66,15 @@ impl AppState {
             webhook_secret: std::env::var("ATREE_WEBHOOK_SECRET").ok().filter(|s| !s.is_empty()),
             webhook_inflight: Arc::new(AtomicU64::new(0)),
             webhook_last_ms: Arc::new(AtomicU64::new(0)),
+            webhook_requests_total: Arc::new(AtomicU64::new(0)),
+            start_time: std::time::Instant::now(),
         }
+    }
+
+    /// Open a store connection for this request.
+    pub fn open_store(&self) -> Option<GraphStore> {
+        let path = self.db_path.as_ref()?;
+        GraphStore::open(path).ok()
     }
 
     /// Check and record a webhook rate limit call. Returns true if allowed.
@@ -80,11 +95,6 @@ impl AppState {
         }
         self.webhook_last_ms.store(now, Ordering::Relaxed);
         true
-    }
-
-    pub async fn open_store(&self) -> Option<GraphStore> {
-        let path = self.db_path.as_ref()?;
-        GraphStore::open(path).ok()
     }
 }
 
@@ -248,7 +258,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
-    let store = match state.open_store().await {
+    let store = match state.open_store() {
         Some(s) => s,
         None => return Json(StatsResponse { files: 0, symbols: 0, scopes: 0, imports: 0, calls: 0, edges: 0, resolved_calls: 0 }),
     };
@@ -265,7 +275,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
-    let (files, symbols, edges) = match state.open_store().await {
+    let (files, symbols, edges) = match state.open_store() {
         Some(store) => match store.stats() {
             Ok(s) => (s.files, s.symbols, s.edges),
             Err(e) => {
@@ -276,11 +286,11 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
         None => (0, 0, 0),
     };
     Json(MetricsResponse {
-        uptime_secs: 0,
+        uptime_secs: state.start_time.elapsed().as_secs(),
         index_files: files,
         index_symbols: symbols,
         index_edges: edges,
-        webhook_requests_total: 0,
+        webhook_requests_total: state.webhook_requests_total.load(Ordering::Relaxed),
         webhook_inflight: state.webhook_inflight.load(Ordering::Relaxed),
     })
 }
@@ -288,8 +298,9 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
 async fn search(State(state): State<Arc<AppState>>, Query(query): Query<SearchQuery>) -> Json<SearchResponse> {
     let q = query.q.trim().to_lowercase();
     if q.is_empty() { return Json(SearchResponse { results: vec![], total: 0 }); }
-    let store = match state.open_store().await { Some(s) => s, None => return Json(SearchResponse { results: vec![], total: 0 }) };
-    let symbols = match store.search_symbols(&q, query.limit) { Ok(s) => s, Err(_) => return Json(SearchResponse { results: vec![], total: 0 }) };
+    let store = match state.open_store() { Some(s) => s, None => return Json(SearchResponse { results: vec![], total: 0 }) };
+    let limit = query.limit.min(100);
+    let symbols = match store.search_symbols(&q, limit) { Ok(s) => s, Err(_) => return Json(SearchResponse { results: vec![], total: 0 }) };
     let total = symbols.len();
     Json(SearchResponse { results: symbols.into_iter().map(|sym| {
         let file_path = store.get_file_by_id(sym.file_id).ok().flatten().map(|f| f.path).unwrap_or_default();
@@ -305,8 +316,9 @@ pub struct SemanticSearchQuery { pub q: String, #[serde(default = "default_searc
 async fn semantic_search(State(state): State<Arc<AppState>>, Query(query): Query<SemanticSearchQuery>) -> axum::response::Response {
     let q = query.q.trim().to_lowercase();
     if q.is_empty() { return Json(serde_json::json!({"error": "Query is empty"})).into_response(); }
-    let store = match state.open_store().await { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available."}))).into_response() };
-    let matched_symbols = match store.search_symbols(&q, query.limit) { Ok(s) => s, Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Search failed"}))).into_response() };
+    let store = match state.open_store() { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available."}))).into_response() };
+    let limit = query.limit.min(100);
+    let matched_symbols = match store.search_symbols(&q, limit) { Ok(s) => s, Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Search failed"}))).into_response() };
     if matched_symbols.is_empty() { return Json(serde_json::json!({"layout": {"nodes": [], "edges": []}, "matched_symbols": [], "message": "No matching symbols found."})).into_response(); }
     let depth = query.depth.min(5);
     let mut all_symbol_ids: rustc_hash::FxHashSet<i64> = matched_symbols.iter().map(|s| s.id).collect();
@@ -324,18 +336,29 @@ async fn semantic_search(State(state): State<Arc<AppState>>, Query(query): Query
         if next.is_empty() { break; } frontier = next;
         if all_symbol_ids.len() > 500 { break; }
     }
-    let mut nodes = Vec::new();
+    // Batch-load symbols and their file paths instead of N+1 queries.
+    let all_ids_vec: Vec<i64> = all_symbol_ids.iter().copied().collect();
+    let syms = match store.get_symbols_by_ids(&all_ids_vec) {
+        Ok(syms) => syms,
+        Err(_) => vec![],
+    };
+    let symbol_map: rustc_hash::FxHashMap<i64, &atree_engine::store::SymbolRecord> =
+        syms.iter().map(|s| (s.id, s)).collect();
+    let all_file_ids: Vec<i64> = syms.iter().map(|s| s.file_id).collect();
+    let file_map: rustc_hash::FxHashMap<i64, String> = match store.get_files_by_ids(&all_file_ids) {
+        Ok(files) => files.into_iter().map(|f| (f.id, f.path)).collect(),
+        Err(_) => rustc_hash::FxHashMap::default(),
+    };
+    let mut nodes = Vec::with_capacity(syms.len());
     let mut loaded = rustc_hash::FxHashSet::default();
-    for sid in &all_symbol_ids {
-        if let Ok(Some(sym)) = store.get_symbol_by_id(*sid) {
-            let fp = store.get_file_by_id(sym.file_id).ok().flatten().map(|f| f.path).unwrap_or_default();
-            let mut props = rustc_hash::FxHashMap::default();
-            props.insert("name".to_string(), sym.name.clone()); props.insert("kind".to_string(), sym.kind.clone()); props.insert("qualified_name".to_string(), sym.qualified_name.clone()); props.insert("file_path".to_string(), fp); props.insert("line".to_string(), sym.line.to_string()); props.insert("col".to_string(), sym.col.to_string());
-            let is_match = matched_symbols.iter().any(|m| m.id == sym.id);
-            props.insert("is_match".to_string(), is_match.to_string());
-            nodes.push(atree_engine::graph::GraphNode { id: format!("sym:{}", sym.id), label: sym.kind.clone(), properties: props });
-            loaded.insert(*sid);
-        }
+    for sym in &syms {
+        let fp = file_map.get(&sym.file_id).cloned().unwrap_or_default();
+        let mut props = rustc_hash::FxHashMap::default();
+        props.insert("name".to_string(), sym.name.clone()); props.insert("kind".to_string(), sym.kind.clone()); props.insert("qualified_name".to_string(), sym.qualified_name.clone()); props.insert("file_path".to_string(), fp); props.insert("line".to_string(), sym.line.to_string()); props.insert("col".to_string(), sym.col.to_string());
+        let is_match = matched_symbols.iter().any(|m| m.id == sym.id);
+        props.insert("is_match".to_string(), is_match.to_string());
+        nodes.push(atree_engine::graph::GraphNode { id: format!("sym:{}", sym.id), label: sym.kind.clone(), properties: props });
+        loaded.insert(sym.id);
     }
     // Batch edge lookup for the final loaded set: single query instead of O(n).
     let mut edges = Vec::new();
@@ -360,7 +383,7 @@ async fn semantic_search(State(state): State<Arc<AppState>>, Query(query): Query
 }
 
 async fn node_detail(State(state): State<Arc<AppState>>, Path(node_id): Path<String>) -> Json<serde_json::Value> {
-    let store = match state.open_store().await { Some(s) => s, None => { return Json(serde_json::json!({"error": "No index"})); } };
+    let store = match state.open_store() { Some(s) => s, None => { return Json(serde_json::json!({"error": "No index"})); } };
     let (outgoing, incoming) = if let Some(id_str) = node_id.strip_prefix("sym:") {
         if let Ok(id) = id_str.parse::<i64>() {
             let edges = store.get_edges_for_node(id).unwrap_or_default();
@@ -373,9 +396,11 @@ async fn node_detail(State(state): State<Arc<AppState>>, Path(node_id): Path<Str
 }
 
 async fn graph_query(State(state): State<Arc<AppState>>, Json(input): Json<GraphQueryInput>) -> Json<QueryResponse> {
-    let store = match state.open_store().await { Some(s) => s, None => return Json(QueryResponse { text: "No index available".to_string(), node_ids: vec![], symbols_found: 0 }) };
+    let store = match state.open_store() { Some(s) => s, None => return Json(QueryResponse { text: "No index available".to_string(), node_ids: vec![], symbols_found: 0 }) };
     let enriched = if input.task_context.is_some() || input.goal.is_some() { format!("{}{}{}", input.query, input.task_context.as_ref().map(|c| format!(" | Context: {}", c)).unwrap_or_default(), input.goal.as_ref().map(|g| format!(" | Goal: {}", g)).unwrap_or_default()) } else { input.query.clone() };
-    let config = atree_engine::evidence_path::EvidenceConfig { max_seeds: 10, beam_width: 5, max_depth: input.max_depth, max_evidence: input.max_symbols, token_budget: 4000, ..Default::default() };
+    let max_depth = input.max_depth.min(10);
+    let max_symbols = input.max_symbols.min(100);
+    let config = atree_engine::evidence_path::EvidenceConfig { max_seeds: 10, beam_width: 5, max_depth, max_evidence: max_symbols, token_budget: 4000, ..Default::default() };
     match atree_engine::evidence_bundle::query_evidence(&store, &enriched, &config) {
         Ok(bundle) => {
             let text = atree_engine::evidence_bundle::format_bundle_as_text(&bundle);
@@ -424,8 +449,10 @@ async fn webhook_push(State(state): State<Arc<AppState>>, headers: HeaderMap, Js
     };
     if !equal {
         tracing::warn!("Webhook auth failed");
+        state.webhook_requests_total.fetch_add(1, Ordering::Relaxed);
         return (axum::http::StatusCode::UNAUTHORIZED, Json(WebhookResponse { ok: false, message: "Unauthorized".to_string(), reindex_queued: false })).into_response();
     }
+    state.webhook_requests_total.fetch_add(1, Ordering::Relaxed);
     if !state.check_webhook_rate_limit() {
         return (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(WebhookResponse { ok: false, message: "Rate limited: max 1 re-index per 60s".to_string(), reindex_queued: false })).into_response();
     }
@@ -468,7 +495,7 @@ async fn webhook_push(State(state): State<Arc<AppState>>, headers: HeaderMap, Js
 }
 
 async fn graph_layout(State(state): State<Arc<AppState>>, Query(query): Query<LayoutQuery>) -> axum::response::Response {
-    let store = match state.open_store().await { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
+    let store = match state.open_store() { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
 
     // Determine graph size class and default view.
     let graph_meta = store.get_all_graph_metadata().ok().flatten();
@@ -585,7 +612,7 @@ fn graph_layout_module(store: &atree_engine::store::GraphStore, query: &LayoutQu
 
 /// Graph overview — summary stats without loading all nodes.
 async fn graph_overview(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    let store = match state.open_store().await { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
+    let store = match state.open_store() { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
 
     let (files, symbols, edges) = match store.stats() {
         Ok(s) => (s.files, s.symbols, s.edges),
@@ -623,7 +650,7 @@ async fn graph_overview(State(state): State<Arc<AppState>>) -> axum::response::R
 
 /// Community graph — returns community-level clusters with their connections.
 async fn graph_communities(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    let store = match state.open_store().await { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
+    let store = match state.open_store() { Some(s) => s, None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No index available"}))).into_response() };
 
     let communities = match store.conn().prepare(
         "SELECT c.community_id, c.label, c.symbol_count, c.cohesion, c.modularity
@@ -682,6 +709,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .fallback_service(ServeDir::new("atree-web/static").append_index_html_on_directories(true))
         .with_state(state)
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(tower_http::trace::DefaultMakeSpan::new()
+                .level(tracing::Level::INFO))
+            .on_response(tower_http::trace::DefaultOnResponse::new()
+                .level(tracing::Level::INFO)))
         .layer(CorsLayer::new()
             .allow_origin(tower_http::cors::AllowOrigin::exact(
                 "http://localhost:3020".parse::<axum::http::HeaderValue>().expect("valid localhost origin")))

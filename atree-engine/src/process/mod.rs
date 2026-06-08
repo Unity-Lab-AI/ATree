@@ -197,7 +197,7 @@ pub fn detect_processes(
 
         // Build process label from entry and terminal
         let entry_name = symbol_names.get(entry_id).map(|s| s.as_str()).unwrap_or("unknown");
-        let terminal_id = *trace.last().unwrap();
+        let terminal_id = *trace.last().expect("trace must be non-empty");
         let terminal_name = symbol_names.get(&terminal_id).map(|s| s.as_str()).unwrap_or("unknown");
 
         let label = format!("{} → {}", entry_name, terminal_name);

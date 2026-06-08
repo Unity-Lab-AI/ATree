@@ -310,7 +310,8 @@ fn topological_sort<'a>(phases: &'a [&'a dyn PipelinePhase]) -> Result<Vec<&'a d
     while let Some(name) = queue.pop() {
         sorted.push(phase_map[name]);
         for dependent in reverse_deps.get(name).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let deg = in_degree.get_mut(dependent).unwrap();
+            let deg = in_degree.get_mut(dependent)
+                .expect("dependent must be in in_degree (all phases initialized)");
             *deg -= 1;
             if *deg == 0 { queue.push(dependent); }
         }

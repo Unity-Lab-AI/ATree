@@ -1489,19 +1489,22 @@ impl GraphStore {
         let mut edges = Vec::new();
 
         if !symbol_ids.is_empty() {
-            let placeholders = symbol_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
-                 FROM edges WHERE src_id IN ({0}) OR dst_id IN ({0})",
-                placeholders
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(symbol_ids.iter()), |row| Ok(EdgeRecord {
-                id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
-                edge_kind: row.get(3)?, confidence: row.get(4)?,
-                file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
-            }))?;
-            for row in rows { edges.push(row?); }
+            const IN_CHUNK_SIZE: usize = 500;
+            for chunk in symbol_ids.chunks(IN_CHUNK_SIZE) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
+                     FROM edges WHERE src_id IN ({0}) OR dst_id IN ({0})",
+                    placeholders
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok(EdgeRecord {
+                    id: row.get(0)?, src_id: row.get(1)?, dst_id: row.get(2)?,
+                    edge_kind: row.get(3)?, confidence: row.get(4)?,
+                    file_id: row.get(5)?, line: row.get::<_, i64>(6)? as usize,
+                }))?;
+                for row in rows { edges.push(row?); }
+            }
         }
 
         Ok((symbols, edges))
@@ -1561,6 +1564,10 @@ impl GraphStore {
             "INSERT INTO calls (file_id, caller_scope_id, callee_name, receiver, resolved_symbol_id, confidence, line, col)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         )?;
+        let mut export_stmt = tx.prepare(
+            "INSERT INTO exports (file_id, exported_name, symbol_id, is_default)
+             VALUES (?1, ?2, ?3, ?4)"
+        )?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1619,16 +1626,37 @@ impl GraphStore {
             for sym in &file.symbols {
                 let store_scope_id = sym.scope_id
                     .and_then(|sid| scope_id_map.get(scope_id_to_idx[&sid]).copied());
-                match symbol_stmt.execute(params![
-                    file_id, sym.name, sym.qualified_name,
+                let sym_params = rusqlite::params![
+                    file_id, &sym.name, &sym.qualified_name,
                     format!("{:?}", sym.kind),
                     sym.line as i64, sym.col as i64,
-                    if sym.is_exported { 1 } else { 0 },
+                    if sym.is_exported { 1i64 } else { 0i64 },
                     store_scope_id,
                     sym.owner_id.map(|v| v as i64),
-                ]) {
+                ];
+                match symbol_stmt.execute(sym_params) {
                     Ok(_) => { global_symbol_id_map.insert(sym.id, tx.last_insert_rowid()); }
                     Err(e) => { tracing::warn!(symbol = %sym.name, error = %e, "Batch symbol insert failed"); }
+                }
+            }
+
+            // Insert exports — from both explicit Export records and symbols with is_exported=true.
+            for exp in &file.exports {
+                if let Some(&sym_id) = global_symbol_id_map.get(&exp.symbol_id) {
+                    let _ = export_stmt.execute(params![
+                        file_id, exp.exported_name, sym_id,
+                        if exp.is_default { 1 } else { 0 },
+                    ]);
+                }
+            }
+            // Also populate exports from symbols marked is_exported=true.
+            for sym in &file.symbols {
+                if sym.is_exported {
+                    if let Some(&sym_id) = global_symbol_id_map.get(&sym.id) {
+                        let _ = export_stmt.execute(params![
+                            file_id, &sym.name, sym_id, 0i64,
+                        ]);
+                    }
                 }
             }
 
@@ -1702,6 +1730,7 @@ impl GraphStore {
         drop(heritage_stmt);
         drop(import_stmt);
         drop(call_stmt);
+        drop(export_stmt);
 
         tx.commit()?;
 
@@ -2100,22 +2129,51 @@ impl GraphStore {
         rows.next().transpose()
     }
 
+    /// Batch-load symbol records by IDs. Avoids N+1 queries when rendering graph layouts.
+    pub fn get_symbols_by_ids(&self, ids: &[i64]) -> rusqlite::Result<Vec<SymbolRecord>> {
+        if ids.is_empty() { return Ok(Vec::new()); }
+        const IN_CHUNK_SIZE: usize = 500;
+        let mut all_symbols = Vec::new();
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, file_id, name, qualified_name, kind, line, col, is_exported, scope_id, owner_symbol_id
+                 FROM symbols WHERE id IN ({})",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok(SymbolRecord {
+                id: row.get(0)?, file_id: row.get(1)?, name: row.get(2)?,
+                qualified_name: row.get(3)?, kind: row.get(4)?,
+                line: row.get::<_, i64>(5)? as usize, col: row.get::<_, i64>(6)? as usize,
+                is_exported: row.get::<_, i64>(7)? != 0, scope_id: row.get(8)?, owner_symbol_id: row.get(9)?,
+            }))?;
+            for row in rows { all_symbols.push(row?); }
+        }
+        Ok(all_symbols)
+    }
+
     /// Batch-load file records by IDs. Avoids N+1 queries when rendering graph layouts.
     pub fn get_files_by_ids(&self, ids: &[i64]) -> rusqlite::Result<Vec<FileRecord>> {
         if ids.is_empty() { return Ok(Vec::new()); }
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, path, hash, language, mtime, indexed_at, repo_label FROM files WHERE id IN ({})", placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| Ok(FileRecord {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            hash: row.get::<_, i64>(2)? as u64,
-            language: row.get(3)?,
-            mtime: row.get::<_, i64>(4)?,
-            indexed_at: row.get::<_, i64>(5)?,
-            repo_label: row.get(6)?,
-        }))?;
-        rows.collect()
+        const IN_CHUNK_SIZE: usize = 500;
+        let mut all_files = Vec::new();
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id, path, hash, language, mtime, indexed_at, repo_label FROM files WHERE id IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                hash: row.get::<_, i64>(2)? as u64,
+                language: row.get(3)?,
+                mtime: row.get::<_, i64>(4)?,
+                indexed_at: row.get::<_, i64>(5)?,
+                repo_label: row.get(6)?,
+            }))?;
+            for row in rows { all_files.push(row?); }
+        }
+        Ok(all_files)
     }
 
     /// Batch-load edges for multiple symbol IDs. Returns all edges where either
@@ -2123,19 +2181,30 @@ impl GraphStore {
     pub fn get_edges_for_symbols(&self, symbol_ids: &rustc_hash::FxHashSet<i64>) -> rusqlite::Result<Vec<EdgeRecord>> {
         if symbol_ids.is_empty() { return Ok(Vec::new()); }
         let ids: Vec<i64> = symbol_ids.iter().copied().collect();
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id IN ({}) OR dst_id IN ({})", placeholders, placeholders);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter().chain(ids.iter())), |row| Ok(EdgeRecord {
-            id: row.get(0)?,
-            src_id: row.get(1)?,
-            dst_id: row.get(2)?,
-            edge_kind: row.get(3)?,
-            confidence: row.get(4)?,
-            file_id: row.get(5)?,
-            line: row.get::<_, i64>(6)? as usize,
-        }))?;
-        rows.collect()
+        const IN_CHUNK_SIZE: usize = 500;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut all_edges = Vec::new();
+        for chunk in ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line FROM edges WHERE src_id IN ({}) OR dst_id IN ({})", placeholders, placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())), |row| Ok(EdgeRecord {
+                id: row.get(0)?,
+                src_id: row.get(1)?,
+                dst_id: row.get(2)?,
+                edge_kind: row.get(3)?,
+                confidence: row.get(4)?,
+                file_id: row.get(5)?,
+                line: row.get::<_, i64>(6)? as usize,
+            }))?;
+            for row in rows {
+                let edge = row?;
+                if seen.insert(edge.id) {
+                    all_edges.push(edge);
+                }
+            }
+        }
+        Ok(all_edges)
     }
 
     /// Get all symbols across all files.
@@ -2576,27 +2645,41 @@ impl GraphStore {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Build a parameterized IN clause: "IN (?, ?, ?, ...)"
-        let placeholders: Vec<String> = node_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
-             FROM edges WHERE src_id IN ({}) OR dst_id IN ({})",
-            placeholders.join(","),
-            placeholders.join(","),
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(node_ids.iter().copied().chain(node_ids.iter().copied())), |row| {
-            Ok(EdgeRecord {
-                id: row.get(0)?,
-                src_id: row.get(1)?,
-                dst_id: row.get(2)?,
-                edge_kind: row.get(3)?,
-                confidence: row.get(4)?,
-                file_id: row.get(5)?,
-                line: row.get::<_, i64>(6)? as usize,
-            })
-        })?;
-        rows.collect()
+        // Chunk IN clauses to avoid excessive SQLite variable counts.
+        // Deduplicate by edge ID since OR queries may return the same edge
+        // from overlapping chunk boundaries (e.g., edge (500,501) matches
+        // both chunk [1..500] via src_id and chunk [501..1000] via dst_id).
+        const IN_CHUNK_SIZE: usize = 500;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut all_edges = Vec::new();
+        for chunk in node_ids.chunks(IN_CHUNK_SIZE) {
+            let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+            let sql = format!(
+                "SELECT id, src_id, dst_id, edge_kind, confidence, file_id, line
+                 FROM edges WHERE src_id IN ({}) OR dst_id IN ({})",
+                placeholders.join(","),
+                placeholders.join(","),
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied().chain(chunk.iter().copied())), |row| {
+                Ok(EdgeRecord {
+                    id: row.get(0)?,
+                    src_id: row.get(1)?,
+                    dst_id: row.get(2)?,
+                    edge_kind: row.get(3)?,
+                    confidence: row.get(4)?,
+                    file_id: row.get(5)?,
+                    line: row.get::<_, i64>(6)? as usize,
+                })
+            })?;
+            for row in rows {
+                let edge = row?;
+                if seen.insert(edge.id) {
+                    all_edges.push(edge);
+                }
+            }
+        }
+        Ok(all_edges)
     }
 
     /// Get all edges in the graph.
@@ -2902,5 +2985,59 @@ impl GraphStore {
             mapped.collect()
         };
         rows
+    }
+
+    /// Remove duplicate symbols caused by re-indexing. Keeps the symbol with the
+    /// lowest id for each (file_id, name, line) tuple. Also cleans up orphaned
+    /// calls, exports, imports, and heritage entries.
+    pub fn deduplicate_symbols(&self) -> rusqlite::Result<usize> {
+        let deleted: i64 = self.conn.query_row(
+            "WITH dups AS (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY file_id, name, line ORDER BY id) as rn
+                FROM symbols
+            )
+            SELECT COUNT(*) FROM dups WHERE rn > 1",
+            [],
+            |r| r.get(0),
+        )?;
+        if deleted > 0 {
+            self.conn.execute(
+                "DELETE FROM symbols WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (PARTITION BY file_id, name, line ORDER BY id) as rn
+                        FROM symbols
+                    ) WHERE rn > 1
+                )",
+                [],
+            )?;
+            log::info!("Deduplicated {} symbols", deleted);
+        }
+        Ok(deleted as usize)
+    }
+
+    /// Remove duplicate calls caused by re-indexing.
+    pub fn deduplicate_calls(&self) -> rusqlite::Result<usize> {
+        let deleted: i64 = self.conn.query_row(
+            "WITH dups AS (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY file_id, caller_scope_id, callee_name, line ORDER BY id) as rn
+                FROM calls
+            )
+            SELECT COUNT(*) FROM dups WHERE rn > 1",
+            [],
+            |r| r.get(0),
+        )?;
+        if deleted > 0 {
+            self.conn.execute(
+                "DELETE FROM calls WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (PARTITION BY file_id, caller_scope_id, callee_name, line ORDER BY id) as rn
+                        FROM calls
+                    ) WHERE rn > 1
+                )",
+                [],
+            )?;
+            log::info!("Deduplicated {} calls", deleted);
+        }
+        Ok(deleted as usize)
     }
 }

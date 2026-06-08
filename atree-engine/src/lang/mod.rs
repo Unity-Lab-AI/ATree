@@ -108,6 +108,67 @@ impl From<&str> for CaptureTag {
     }
 }
 
+impl CaptureTag {
+    pub fn is_definition(&self) -> bool {
+        matches!(self,
+            CaptureTag::DefinitionClass | CaptureTag::DefinitionFunction |
+            CaptureTag::DefinitionMethod | CaptureTag::DefinitionInterface |
+            CaptureTag::DefinitionEnum | CaptureTag::DefinitionStruct |
+            CaptureTag::DefinitionTrait | CaptureTag::DefinitionProperty |
+            CaptureTag::DefinitionVariable | CaptureTag::DefinitionConst |
+            CaptureTag::DefinitionModule | CaptureTag::DefinitionMacro |
+            CaptureTag::DefinitionNamespace | CaptureTag::DefinitionConstructor |
+            CaptureTag::DefinitionType | CaptureTag::DefinitionTypedef |
+            CaptureTag::DefinitionUnion | CaptureTag::DefinitionTemplate |
+            CaptureTag::DefinitionAnnotation | CaptureTag::DefinitionStatic |
+            CaptureTag::DefinitionImpl | CaptureTag::DefinitionRecord |
+            CaptureTag::DefinitionDelegate)
+    }
+}
+
+/// Detect visibility modifier by scanning source text at the start of a definition node.
+/// For Rust, the function_item node starts at `pub` (if present), so we check the
+/// node's own text. For other languages, we check the line prefix before the node.
+pub fn detect_visibility(content: &str, node: tree_sitter::Node) -> Option<String> {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte().min(content.len());
+
+    // The capture node is the @name sub-node (identifier), not the full definition node.
+    // We need to look at the text between the start of the line and the name node
+    // to find visibility keywords like `pub`, `export`, `public`, etc.
+    let name_start = node.start_byte();
+    let line_start_byte = name_start
+        .checked_sub(
+            content[..name_start]
+                .chars()
+                .rev()
+                .take_while(|&c| c != '\n')
+                .map(|c| c.len_utf8())
+                .sum::<usize>()
+        )
+        .unwrap_or(0);
+    let line_prefix = content.get(line_start_byte..name_start)?;
+    let prefix = line_prefix.trim();
+
+    // Split prefix into words and check if any word is a visibility keyword.
+    // This handles "pub async fn" (Rust), "export default function" (JS), etc.
+    static VISIBILITY_KEYWORDS: &[(&str, &str)] = &[
+        ("pub(crate)", "pub"), ("pub(super)", "pub"), ("pub", "pub"),
+        ("export", "export"), ("public", "public"),
+        ("protected", "protected"), ("private", "private"),
+        ("internal", "internal"), ("open", "open"),
+    ];
+    for word in prefix.split_whitespace() {
+        for &(keyword, normalized) in VISIBILITY_KEYWORDS {
+            if word == keyword {
+                return Some(normalized.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 pub trait LanguageProvider: Debug + Send + Sync {
     fn id(&self) -> LanguageId;
     fn extensions(&self) -> &'static [&'static str];

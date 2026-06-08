@@ -379,8 +379,11 @@ impl KnowledgeGraph {
             });
         }
 
-        // Load all symbols as nodes.
+        // Load all symbols as nodes. Build a file_id → path map to avoid N+1 queries.
         let symbols = store.get_all_symbols()?;
+        let file_map: rustc_hash::FxHashMap<i64, &str> = files.iter()
+            .map(|f| (f.id, f.path.as_str()))
+            .collect();
         for sym in &symbols {
             let node_id = format!("sym:{}", sym.id);
             let mut props = FxHashMap::default();
@@ -389,8 +392,8 @@ impl KnowledgeGraph {
             props.insert("qualified_name".to_string(), sym.qualified_name.clone());
             props.insert("line".to_string(), sym.line.to_string());
             props.insert("col".to_string(), sym.col.to_string());
-            if let Ok(Some(file)) = store.get_file_by_id(sym.file_id) {
-                props.insert("file_path".to_string(), file.path.clone());
+            if let Some(path) = file_map.get(&sym.file_id) {
+                props.insert("file_path".to_string(), path.to_string());
             }
             if let Some(scope_id) = sym.scope_id {
                 props.insert("scope_id".to_string(), scope_id.to_string());

@@ -29,6 +29,7 @@ pub mod server;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -40,20 +41,11 @@ use tokio::signal;
 /// * `port` — Port to listen on
 pub async fn run(db_path: PathBuf, repo_path: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let start_time = std::time::Instant::now();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), %port, "atree-web starting");
 
-    let webhook_secret = std::env::var("ATREE_WEBHOOK_SECRET").ok()
-        .filter(|s| !s.is_empty());
-    let state = Arc::new(server::AppState {
-        event_bus: Arc::new(tokio::sync::RwLock::new(events::EventBus::new())),
-        db_path: Some(db_path),
-        repo_path: Some(repo_path),
-        webhook_secret,
-        webhook_inflight: Arc::new(AtomicU64::new(0)),
-        webhook_last_ms: Arc::new(AtomicU64::new(0)),
-    });
+    let state = Arc::new(server::AppState::new(Some(db_path)));
 
+    let shutdown_start = state.start_time;
     let app = server::build_router(state);
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
@@ -61,7 +53,7 @@ pub async fn run(db_path: PathBuf, repo_path: String, port: u16) -> Result<(), B
     tracing::info!(%addr, "ATree web server listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(start_time))
+        .with_graceful_shutdown(shutdown_signal(shutdown_start))
         .await?;
     Ok(())
 }
@@ -93,5 +85,3 @@ async fn shutdown_signal(start_time: std::time::Instant) {
 pub use events::{EventBus, GraphFocusEvent};
 pub use layout::{compute_layout, GraphLayout, LayoutConfig};
 pub use server::AppState;
-
-use std::sync::Arc;

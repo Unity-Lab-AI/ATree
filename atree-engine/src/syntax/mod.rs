@@ -1,7 +1,7 @@
 use streaming_iterator::StreamingIterator;
 use serde::{Serialize, Deserialize};
 use tree_sitter::{Parser, Query, QueryCursor, Node, Tree};
-use crate::lang::{LanguageProvider, CaptureTag};
+use crate::lang::{LanguageProvider, CaptureTag, detect_visibility};
 use crate::semantic::ScopeKind;
 
 pub struct SyntaxEngine {
@@ -78,6 +78,10 @@ pub struct RawCapture {
     /// For TypeAnnotation captures: the variable/parameter name being typed.
     /// When present, `name` holds the type text and `related_name` holds the binding target.
     pub related_name: Option<String>,
+    /// Visibility modifier detected from source text preceding the definition node.
+    /// Populated for definition captures by scanning the line for keywords like
+    /// pub, export, public, private, protected, internal, open.
+    pub visibility: Option<String>,
 }
 
 /// A type binding extracted from the AST: a variable/parameter and its type annotation.
@@ -175,7 +179,7 @@ impl SyntaxEngine {
                     .captures
                     .iter()
                     .find(|c| c.index as usize == name_idx)
-                    .unwrap();
+                    .expect("name capture must exist in match");
                 let name_text =
                     &content[name_capture.node.start_byte()..name_capture.node.end_byte()];
                 let name_range = name_capture.node.range();
@@ -210,6 +214,11 @@ impl SyntaxEngine {
                         } else {
                             (CallForm::Unknown, None)
                         };
+                        let visibility = if tag.is_definition() {
+                            detect_visibility(content, name_capture.node)
+                        } else {
+                            None
+                        };
                         captures.push(RawCapture {
                             tag: *tag,
                             name: name_text.to_string(),
@@ -217,22 +226,29 @@ impl SyntaxEngine {
                             call_form,
                             receiver,
                             related_name: None,
+                            visibility,
                         });
                     }
                 }
             } else {
                 // No @name capture — use the capture text directly
                 for &(idx, ref tag) in &semantic_captures {
-                    let c = m.captures.iter().find(|c| c.index as usize == idx).unwrap();
+                    let c = m.captures.iter().find(|c| c.index as usize == idx)
+                        .expect("semantic capture must exist in match");
                     let text = &content[c.node.start_byte()..c.node.end_byte()];
                     let key = (text.to_string(), c.node.start_byte(), c.node.end_byte(), idx);
                     if seen.insert(key) {
+                        let visibility = if tag.is_definition() {
+                            detect_visibility(content, c.node)
+                        } else {
+                            None
+                        };
                         captures.push(RawCapture {
                             tag: *tag,
                             name: text.to_string(),
                             range: c.node.range(),
                             call_form: CallForm::Unknown,
-                            receiver: None, related_name: None,
+                            receiver: None, related_name: None, visibility,
                         });
                     }
                 }

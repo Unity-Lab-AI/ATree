@@ -409,6 +409,7 @@ impl ParsedFile {
                         // Unique symbol ID: high 32 bits = file_id hash, low 32 bits = symbol index
                         // This ensures uniqueness within a file and across files
                         let sym_id = ((id & 0xFFFFFFFF) << 32) | (sym_idx as u64 & 0xFFFFFFFF);
+                        let is_exported = c.visibility.is_some();
                         symbols.push(Symbol {
                             id: sym_id,
                             name: c.name.clone(),
@@ -419,7 +420,7 @@ impl ParsedFile {
                             owner_id,
                             line,
                             col,
-                            is_exported: false,
+                            is_exported,
                         });
                         // If this is a class-like definition, mark it as the owner of its scope
                         if matches!(c.tag,

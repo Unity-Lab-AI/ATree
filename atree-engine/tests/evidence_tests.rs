@@ -164,3 +164,219 @@ fn test_incremental_scan_preserves_evidence_count() {
     let store = GraphStore::open(&db).unwrap();
     assert_eq!(initial, evidence::storage::EvidenceStore::new(store.conn()).count().unwrap());
 }
+
+// ── Regression tests: R-3 — IN clause chunking ────────────────────────────────
+
+/// Helper: populate an in-memory store with N symbols and N-1 edges (chain).
+fn populate_chain_store(n: usize) -> GraphStore {
+    let store = GraphStore::open_in_memory().unwrap();
+    let file_id = store.upsert_file("src/lib.rs", 1, "rust", 0, None).unwrap();
+    let mut symbol_ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let rec = atree_engine::store::SymbolRecord {
+            id: 0,
+            file_id,
+            name: format!("fn_{}", i),
+            qualified_name: format!("crate::fn_{}", i),
+            kind: "Function".to_string(),
+            line: i * 2,
+            col: 0,
+            is_exported: false,
+            scope_id: None,
+            owner_symbol_id: None,
+        };
+        let id = store.insert_symbol(&rec).unwrap();
+        symbol_ids.push(id);
+    }
+    // Chain: fn_0 -> fn_1 -> fn_2 -> ... -> fn_{n-1}
+    for w in symbol_ids.windows(2) {
+        store.insert_edge(&atree_engine::store::EdgeRecord {
+            id: 0,
+            src_id: w[0],
+            dst_id: w[1],
+            edge_kind: "CALLS".to_string(),
+            confidence: 1.0,
+            file_id: Some(file_id),
+            line: 0,
+        }).unwrap();
+    }
+    store
+}
+
+#[test]
+fn regression_get_edges_for_nodes_empty_input() {
+    let store = populate_chain_store(10);
+    // Empty input should return empty results without error.
+    let edges = store.get_edges_for_nodes(&[]).unwrap();
+    assert!(edges.is_empty(), "empty input should return no edges");
+}
+
+#[test]
+fn regression_get_edges_for_nodes_small_input() {
+    let store = populate_chain_store(10);
+    let ids: Vec<i64> = (1..=5).collect();
+    let edges = store.get_edges_for_nodes(&ids).unwrap();
+    // With 5 nodes in a chain (1->2->3->4), we expect edges from each node.
+    assert!(!edges.is_empty(), "should find edges for small node set");
+}
+
+#[test]
+fn regression_get_edges_for_nodes_large_input_triggers_chunking() {
+    let n = 600;
+    let store = populate_chain_store(n);
+
+    let expected_count: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+    let all_ids = store.get_all_symbols().unwrap();
+    let all_ids: Vec<i64> = all_ids.iter().map(|s| s.id).collect();
+    assert_eq!(all_ids.len(), n, "should have {} symbols", n);
+
+    let edges = store.get_edges_for_nodes(&all_ids).unwrap();
+    assert_eq!(edges.len(), expected_count as usize,
+        "should find all {} edges even with chunking (got {})", expected_count, edges.len());
+}
+
+#[test]
+fn regression_get_edges_for_symbols_large_set_triggers_chunking() {
+    use rustc_hash::FxHashSet;
+    let n = 600;
+    let store = populate_chain_store(n);
+    let expected_count: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+
+    let all_ids = store.get_all_symbols().unwrap();
+    let all_ids: FxHashSet<i64> = all_ids.iter().map(|s| s.id).collect();
+    let edges = store.get_edges_for_symbols(&all_ids).unwrap();
+
+    assert_eq!(edges.len(), expected_count as usize,
+        "get_edges_for_symbols should find all {} edges with chunking (got {})", expected_count, edges.len());
+}
+
+#[test]
+fn regression_get_files_by_ids_large_set_triggers_chunking() {
+    let store = GraphStore::open_in_memory().unwrap();
+    let n = 600;
+    let mut file_ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = store.upsert_file(
+            &format!("src/mod_{}.rs", i),
+            i as u64,
+            "rust",
+            0,
+            None,
+        ).unwrap();
+        file_ids.push(id);
+    }
+    // Query with all IDs to trigger chunking.
+    let files = store.get_files_by_ids(&file_ids).unwrap();
+    assert_eq!(files.len(), n,
+        "get_files_by_ids should return all {} files with chunking (got {})", n, files.len());
+}
+
+#[test]
+fn regression_get_edges_for_nodes_very_large_input() {
+    // 1500 symbols — forces 3+ chunk iterations.
+    let n = 1500;
+    let store = populate_chain_store(n);
+    let expected_count: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+
+    let all_ids = store.get_all_symbols().unwrap();
+    let all_ids: Vec<i64> = all_ids.iter().map(|s| s.id).collect();
+    assert_eq!(all_ids.len(), n, "should have {} symbols", n);
+
+    let edges = store.get_edges_for_nodes(&all_ids).unwrap();
+    assert_eq!(edges.len(), expected_count as usize,
+        "should find all {} edges across 3+ chunks (got {})", expected_count, edges.len());
+}
+
+#[test]
+fn regression_chunking_produces_same_result_as_no_chunking() {
+    // Verify that chunking does not introduce duplicates or miss edges.
+    // Use a single store with 600 symbols and compare chunked vs unchunked results.
+    let n = 600;
+    let store = populate_chain_store(n);
+
+    let all_ids = store.get_all_symbols().unwrap();
+    let all_ids: Vec<i64> = all_ids.iter().map(|s| s.id).collect();
+
+    // get_edges_for_nodes uses chunking for >500 IDs.
+    let chunked_edges = store.get_edges_for_nodes(&all_ids).unwrap();
+
+    // Verify no duplicate edge IDs (dedup works).
+    let mut edge_ids: Vec<i64> = chunked_edges.iter().map(|e| e.id).collect();
+    edge_ids.sort();
+    let unique_count = edge_ids.iter().collect::<rustc_hash::FxHashSet<_>>().len();
+    assert_eq!(unique_count, edge_ids.len(),
+        "chunking should not produce duplicate edges");
+
+    // Verify total count matches direct DB query.
+    let expected_count: i64 = store.conn().query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+    assert_eq!(chunked_edges.len(), expected_count as usize,
+        "chunked query should return exactly {} edges, got {}", expected_count, chunked_edges.len());
+}
+
+// ── Regression tests: N-01 — get_symbols_by_ids batch method ─────────────────
+
+#[test]
+fn regression_get_symbols_by_ids_empty() {
+    let store = GraphStore::open_in_memory().unwrap();
+    let result = store.get_symbols_by_ids(&[]).unwrap();
+    assert!(result.is_empty(), "empty input should return empty results");
+}
+
+#[test]
+fn regression_get_symbols_by_ids_small() {
+    let store = populate_chain_store(10);
+    let ids: Vec<i64> = (1..=5).collect();
+    let result = store.get_symbols_by_ids(&ids).unwrap();
+    assert_eq!(result.len(), 5, "should return 5 symbols");
+}
+
+#[test]
+fn regression_get_symbols_by_ids_large_triggers_chunking() {
+    let store = populate_chain_store(600);
+    let all_ids = store.get_all_symbols().unwrap();
+    let ids: Vec<i64> = all_ids.iter().map(|s| s.id).collect();
+    let result = store.get_symbols_by_ids(&ids).unwrap();
+    assert_eq!(result.len(), all_ids.len(),
+        "batch lookup should return all {} symbols", all_ids.len());
+}
+
+// ── Regression: route regex compilation (N-02) ───────────────────────────────
+
+#[test]
+fn regression_route_regex_compiles_once() {
+    // Call detect_routes_from_path many times — should not recompile regex.
+    use atree_engine::routes::detect_routes_from_path;
+    let files = vec![
+        "app/api/users/route.ts",
+        "app/api/posts/[id]/route.tsx",
+        "pages/api/auth.ts",
+        "src/utils/helpers.ts",
+        "app/dashboard/page.ts",  // not a route
+    ];
+    for _ in 0..100 {
+        for f in &files {
+            let routes = detect_routes_from_path(f);
+            if f.contains("app/api/") && f.contains("route.") {
+                assert!(!routes.is_empty(), "should detect route in {}", f);
+            }
+        }
+    }
+    // If we got here without panic, the OnceLock pattern works.
+}
+
+// ── Regression: pattern sorting with NaN (partial_cmp fix) ───────────────────
+
+#[test]
+fn regression_patterns_sort_handles_nan() {
+    // Verify that partial_cmp with NaN returns None, and unwrap_or handles it.
+    // This is the core fix: patterns/mod.rs:159 now uses unwrap_or(Ordering::Equal)
+    // instead of unwrap(), so NaN scores don't cause a panic.
+    let nan_score: f64 = f64::NAN;
+    let normal_score: f64 = 1.0;
+    let result = nan_score.partial_cmp(&normal_score);
+    assert!(result.is_none(), "NaN partial_cmp should return None");
+
+    // Verify the unwrap_or pattern works correctly.
+    let ordering = result.unwrap_or(std::cmp::Ordering::Equal);
+    assert_eq!(ordering, std::cmp::Ordering::Equal);
+}

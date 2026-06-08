@@ -220,7 +220,7 @@ fn rust_path_to_candidates(path: &str) -> Vec<String> {
     }
 
     let module_path = parts[..parts.len() - 1].join("/");
-    let last = parts.last().unwrap();
+    let last = parts.last().expect("parts must be non-empty (checked above)");
 
     // C is a submodule: a/b/C.rs
     candidates.push(format!("{}/{}.rs", module_path, last));

@@ -156,7 +156,7 @@ pub fn mine_patterns(
     }
 
     // Sort by overall score descending.
-    patterns.sort_by(|a, b| b.score.overall.partial_cmp(&a.score.overall).unwrap());
+    patterns.sort_by(|a, b| b.score.overall.partial_cmp(&a.score.overall).unwrap_or(std::cmp::Ordering::Equal));
     patterns
 }
 

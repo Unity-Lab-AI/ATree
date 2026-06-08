@@ -62,7 +62,7 @@ pub fn c3_linearize(
             }
 
             // Switch to MERGE, push parents that need computing
-            let top = stack.last_mut().unwrap();
+            let top = stack.last_mut().expect("stack must be non-empty in MERGE state");
             top.1 = MERGE;
 
             let mut all_cached = true;

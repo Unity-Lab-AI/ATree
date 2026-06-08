@@ -286,12 +286,12 @@ fn extract_orm_regex(file_path: &str, content: &str, out: &mut Vec<ExtractedOrmQ
 
     if has_prisma {
         for cap in prisma_regex().captures_iter(content) {
-            let model = cap.get(1).unwrap().as_str();
+            let model = cap.get(1).expect("prisma regex group 1").as_str();
             if model.starts_with('$') {
                 continue;
             }
-            let method = cap.get(2).unwrap().as_str();
-            let offset = cap.get(0).unwrap().start();
+            let method = cap.get(2).expect("prisma regex group 2").as_str();
+            let offset = cap.get(0).expect("prisma regex group 0").start();
             out.push(ExtractedOrmQuery {
                 file_path: file_path.to_string(),
                 orm: "prisma".to_string(),
@@ -304,9 +304,9 @@ fn extract_orm_regex(file_path: &str, content: &str, out: &mut Vec<ExtractedOrmQ
 
     if has_supabase {
         for cap in supabase_regex().captures_iter(content) {
-            let model = cap.get(1).unwrap().as_str();
-            let method = cap.get(2).unwrap().as_str();
-            let offset = cap.get(0).unwrap().start();
+            let model = cap.get(1).expect("supabase regex group 1").as_str();
+            let method = cap.get(2).expect("supabase regex group 2").as_str();
+            let offset = cap.get(0).expect("supabase regex group 0").start();
             out.push(ExtractedOrmQuery {
                 file_path: file_path.to_string(),
                 orm: "supabase".to_string(),

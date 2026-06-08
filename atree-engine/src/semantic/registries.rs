@@ -431,7 +431,7 @@ fn ensure_candidate<'a>(
             tie_break: TieBreakKey::default(),
         });
     }
-    per_candidate.get_mut(&key).unwrap()
+    per_candidate.get_mut(&key).expect("key was just inserted")
 }
 
 // ── Step 1: lexical scope-chain walk ──────────────────────────────────────────

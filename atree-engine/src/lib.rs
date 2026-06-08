@@ -983,6 +983,10 @@ pub fn build_graph(opts: &ScanOptions) -> io::Result<ScanResult> {
         if let Ok(guard) = shared.store.lock() {
             if let Some(ref store) = *guard {
                 store.maintenance_or_warn();
+                // Deduplicate symbols and calls that may have been created by
+                // the incremental path + pipeline batch inserting the same files.
+                store.deduplicate_symbols().unwrap_or(0);
+                store.deduplicate_calls().unwrap_or(0);
             }
         }
 
@@ -1480,6 +1484,8 @@ pub fn build_graph_incremental(
         )?;
 
         // Build final stats
+        store.deduplicate_symbols().ok();
+        store.deduplicate_calls().ok();
         let store_stats = store.stats()
             .map_err(|e| io::Error::other(e.to_string()))?;
         let symbol_table = SymbolTable::from_store(&store)
@@ -5275,6 +5281,69 @@ def world():
             "SELECT COUNT(*) FROM edges", [], |r| r.get(0)
         ).unwrap();
         assert!(edge_count >= 1, "Expected edges to survive incremental re-index, got {}", edge_count);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn rust_async_fn_is_captured_and_marked_exported() {
+        // Verify that async functions are captured and pub visibility is detected
+        let tmp = std::env::temp_dir().join(format!(
+            "atree_async_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), r#"
+pub async fn exported_async() {}
+async fn private_async() {}
+pub fn exported_sync() {}
+fn private_sync() {}
+"#).unwrap();
+
+        let opts = ScanOptions {
+            root: tmp.clone(),
+            max_depth: 10,
+            max_nodes: 100,
+            include_files: true,
+            threads: 1,
+            tree_mode: false,
+            db_path: None,
+            incremental: false,
+            semantic: true,
+            ..Default::default()
+        };
+        let result = build_graph(&opts).unwrap();
+
+        let file = result.parsed_files.iter().find(|f| f.path.contains("lib.rs")).unwrap();
+
+        // All 4 functions should be captured
+        let exported_async = file.symbols.iter().find(|s| s.name == "exported_async");
+        let private_async = file.symbols.iter().find(|s| s.name == "private_async");
+        let exported_sync = file.symbols.iter().find(|s| s.name == "exported_sync");
+        let private_sync = file.symbols.iter().find(|s| s.name == "private_sync");
+
+        assert!(exported_async.is_some(), "exported_async should be captured");
+        assert!(private_async.is_some(), "private_async should be captured");
+        assert!(exported_sync.is_some(), "exported_sync should be captured");
+        assert!(private_sync.is_some(), "private_sync should be captured");
+
+        // Debug: print all symbols with their visibility
+        for s in &file.symbols {
+            eprintln!("DEBUG: symbol {} at line {} is_exported={}", s.name, s.line, s.is_exported);
+        }
+
+        // Pub functions should be marked exported
+        assert!(exported_async.unwrap().is_exported, "pub async fn should be exported");
+        assert!(exported_sync.unwrap().is_exported, "pub fn should be exported");
+
+        // Private functions should NOT be exported
+        assert!(!private_async.unwrap().is_exported, "async fn (no pub) should not be exported");
+        assert!(!private_sync.unwrap().is_exported, "fn (no pub) should not be exported");
 
         fs::remove_dir_all(&tmp).ok();
     }

@@ -231,6 +231,9 @@ impl EvidencePathInput {
         if self.beam_width > 20 {
             return Err("beam_width must be <= 20".to_string());
         }
+        if self.max_evidence > 100 {
+            return Err("max_evidence must be <= 100".to_string());
+        }
         Ok(())
     }
 }
