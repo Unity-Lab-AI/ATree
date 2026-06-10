@@ -68,7 +68,7 @@ The incremental path handles the heavy lifting; the pipeline adds community/proc
 | **Call resolution** | 42.7% (ATree), 81.8% (Conflux), 0 missed | Not published |
 | **Heritage/MRO** | 75 entries with parent tracking | Has heritage but no parent resolution for external traits |
 | **Processes** | 75 | 300 (more granular detection) |
-| **Communities** | 2,095 (Leiden algorithm) | 1,681 (with cohesion scores) |
+| **Communities** | 2,095 (Label Propagation) | 1,681 (Leiden + cohesion scores) |
 | **Impact analysis** | 35 direct callers, CRITICAL risk | 42 impacted with full depth-1/2/3 breakdown |
 | **Query tool** | BM25 + term search + process ranking; execution flows with step-by-step traces + matched symbols | BM25 + graph proximity; process-grouped results ranked by relevance |
 | **Query response** | ~200ms (preloaded symbol maps) | ~1.6s (BM25 + graph traversal) |

@@ -26,14 +26,14 @@ This project is indexed by ATree's own semantic engine (3,248 symbols, 11,662 ed
 | `impact` | Blast radius: multi-depth caller/callee + module-level impact + risk scoring. |
 | `data_flow_trace` | Value propagation chain: assignments, param_pass, property access. |
 | `dead_code_candidates` | Unreachable symbols with no callers/imports/exports. |
-| `dependency_cycle_detector` | Call graph cycles via recursive CTE + SCC detection. |
+| `dependency_cycle_detector` | Mutual call cycles via recursive CTE (pairwise, not full SCC). |
 | `evidence_path` | A* evidence paths showing how code connects. |
 | `evidence_search` | FTS5 full-text search over committed evidence. |
 | `explain_symbol` | Full symbol explanation with all edge types and evidence paths. |
 | `trace_call_path` | A* pathfinding between two symbols. |
 | `shape_check` | API route response shape validation. |
 | `pattern_mine` | Recurring evidence motifs ranked by frequency × dispersion. |
-| `constraint_check` | Architectural constraints synthesized from evidence. |
+| `constraint_check` | Pattern-derived constraints (RequiredProperty motifs). Architectural rules and access-control enforcement are not yet implemented. |
 | `architecture_boundary_check` | User-declared layer boundary violations (config-driven). |
 
 ## Architecture Boundary Enforcement
@@ -64,15 +64,15 @@ Violations are detected during indexing and exposed via:
 
 - **Scalability**: Handles 25K+ file repos (tested with Conflux: 125K calls, 81.8% resolution, 0 missed)
 - **Incremental scanning**: 0.25s for 2,692-file repo (930x faster than cold scan)
-- **Call resolution**: 100% of resolvable calls resolved via lexical scope-chain walk (O(1) per step)
+- **Call resolution**: 81.8% of call sites resolved on Conflux (2,692 files); lexical scope-chain walk with O(1) per-scope lookup
 - **Data flow analysis**: Tracks assignments, parameter passing, property access, returns
-- **Cycle detection**: Recursive CTE + SCC detection for call graph cycles
+- **Cycle detection**: Recursive CTE cycle detection (pairwise mutual calls)
 - **Heritage/MRO**: Tracks inheritance with parent resolution (81% for projects with internal trait hierarchies)
 - **Process detection**: Entry points from API routes + exports + event handlers + callees
 - **Type resolution**: Cross-file type inference via import graph + type environments
 - **Architecture boundaries**: User-declared layer rules with violation tracking
 - **FTS5 evidence search**: Auto-indexed on commit, cleaned up on incremental re-index
-- **Community detection**: Leiden algorithm for functional area clustering
+- **Community detection**: Label Propagation (LPA) for functional area clustering
 
 ## Comparison with GitNexus
 
@@ -85,18 +85,21 @@ ATree and GitNexus are both configured as MCP servers. Key differences:
 | **Impact analysis** | Multi-depth + module-level + risk scoring | Depth-1/2/3 + affected modules |
 | **Data flow analysis** | Assignments, param_pass, property access | None |
 | **ACCESSES tracking** | Field-level read/write edges | Field-level read/write edges |
-| **Call cycle detection** | Recursive CTE + SCC detection | None |
+| **Call cycle detection** | Recursive CTE cycle detection | None |
 | **Dead code detection** | Unreachable symbol candidates | None |
-| **Scope resolution** | Lexical scope-chain walk (O(1) per step) | Flat tiers |
+| **Scope resolution** | Lexical scope-chain walk; O(1) per-scope lookup | Flat tiers |
 | **Process detection** | Routes + exports + event handlers + callees | Granular |
 | **Type resolution** | Cross-file via import graph | Per-file only |
 | **Architecture boundaries** | User-declared rules + violation tracking | None |
 | **SARIF output** | ✅ Boundary violations + unresolved calls | None |
 | **Per-symbol git blame** | ✅ Line-level blame mapping | File-level only |
 | **FTS5 evidence search** | Auto-indexed on commit | None |
-| **Communities** | Leiden algorithm | Leiden + cohesion scores |
+| **Communities** | Label Propagation (LPA) | Leiden + cohesion scores |
 
-**ATree is strictly superior in all dimensions.** GitNexus cannot compete on
-scalability (crashes >1K files), data flow analysis, cycle detection, dead code
-detection, lexical scope resolution, FTS5 evidence search, architecture boundary
-enforcement, or cross-file type resolution.
+**ATree is superior for most production use cases**, particularly on repos larger
+than 1K files where GitNexus crashes. Key advantages: scalability (handles 25K+
+files), scan speed (13-15x faster cold), data flow analysis, architecture boundary
+enforcement, FTS5 evidence search, and per-symbol git blame. However, GitNexus
+has more granular process detection (300 processes vs ATree's 75) and reports
+cohesion scores on communities — ATree's Label Propagation does not compute
+cohesion scores.

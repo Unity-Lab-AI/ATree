@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Version** | `0.7.0-alpha` |
-| **Status** | Alpha — A\* filesystem tool and semantic engine with scope resolution, MCP server, and 40+ CLI/MCP query commands. |
+| **Status** | Alpha — A\* filesystem tool and semantic engine with scope resolution, MCP server, and 60+ CLI/MCP query commands. |
 | **Authors** | UnityAILab — Sponge, Alfreddo, Gee, Red, B-A-M-N |
 | **License** | MIT (see [LICENSE](LICENSE) and [NOTICE](NOTICE)) |
 | **Contact** | `contact@unityailab.com` |
@@ -545,7 +545,7 @@ atree mcp-server --db .atree/index.sqlite
 | `evidence_path` | A* + beam search evidence paths over the code graph |
 | `evidence_search` | Full-text search over committed evidence (FTS5). Searches raw content, normalized text, file paths, kinds, and tags. |
 | `pattern_mine` | Mine recurring patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion × stability. |
-| `constraint_check` | Synthesize and check constraints from evidence patterns. Detects forbidden transitions (evidence contradictions), required properties (stable pattern components), and architectural violations. |
+| `constraint_check` | Pattern-derived constraints (RequiredProperty motifs). ForbiddenTransition and ArchitecturalRule synthesis are not yet implemented. |
 | `explain_symbol` | Full symbol explanation with evidence paths |
 | `trace_call_path` | A* pathfinding between two symbols |
 
@@ -572,7 +572,7 @@ atree mcp-server --db .atree/index.sqlite
 ATree is a Cargo workspace with two packages:
 
 - **`atree-engine`** — the semantic code intelligence library. Tree-sitter extraction, scope resolution, git history analysis, A* evidence paths, SQLite persistence. Feature-flagged modules for embeddings and MCP.
-- **`atree-cli`** — the CLI binary. Filesystem scanning, 35+ query subcommands, JSON output, A* filesystem pathfinding. Thin wrapper over the engine.
+- **`atree-cli`** — the CLI binary. Filesystem scanning, 60+ query subcommands, JSON output, A* filesystem pathfinding. Thin wrapper over the engine.
 
 ## Parallel scanner
 

@@ -46,20 +46,16 @@ pub struct Pattern {
 pub struct PatternScore {
     pub frequency: usize,
     pub dispersion: f64,  // 0-1, fraction of files/modules covered
-    pub stability: f64,   // 0-1, consistency across observations
-    pub entropy: f64,     // 0-1, informational noise
-    pub overall: f64,     // composite: frequency × dispersion × stability × (1 - entropy)
+    pub overall: f64,     // composite: frequency_norm × dispersion
 }
 
 impl PatternScore {
-    pub fn compute(frequency: usize, dispersion: f64, stability: f64, entropy: f64) -> Self {
+    pub fn compute(frequency: usize, dispersion: f64) -> Self {
         let freq_norm = (frequency as f64).min(100.0) / 100.0; // normalize to [0, 1]
-        let overall = freq_norm * dispersion.max(0.0).min(1.0) * stability * (1.0 - entropy);
+        let overall = freq_norm * dispersion.max(0.0).min(1.0);
         Self {
             frequency,
             dispersion,
-            stability,
-            entropy,
             overall,
         }
     }
@@ -72,8 +68,6 @@ pub struct PatternMiningConfig {
     pub min_frequency: usize,
     /// Minimum dispersion (default: 0.1 = 10% of files).
     pub min_dispersion: f64,
-    /// Minimum stability (default: 0.5).
-    pub min_stability: f64,
 }
 
 impl Default for PatternMiningConfig {
@@ -81,7 +75,6 @@ impl Default for PatternMiningConfig {
         Self {
             min_frequency: 3,
             min_dispersion: 0.1,
-            min_stability: 0.5,
         }
     }
 }
@@ -134,13 +127,8 @@ pub fn mine_patterns(
             continue;
         }
 
-        // Stability: for now, assume 1.0 (no temporal data yet).
-        let stability = 1.0;
-        if stability < config.min_stability {
-            continue;
-        }
-
-        let score = PatternScore::compute(frequency, dispersion, stability, 0.0);
+        // Stability/entropy not computed — temporal analysis not yet implemented.
+        let score = PatternScore::compute(frequency, dispersion);
 
         patterns.push(Pattern {
             id: format!("pat_{:?}_{:?}", kind_a, kind_b).to_lowercase(),
@@ -238,7 +226,7 @@ mod tests {
             make_evidence(EvidenceKind::SymbolDeclaration, "c.rs", 10),
         ];
 
-        let config = PatternMiningConfig { min_frequency: 2, min_dispersion: 0.1, min_stability: 0.5 };
+        let config = PatternMiningConfig { min_frequency: 2, min_dispersion: 0.1 };
         let patterns = mine_patterns(&evidence, &config);
 
         // Should find Import→Declaration and Import→Call and Declaration→Call pairs.
@@ -253,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_pattern_score_computation() {
-        let score = PatternScore::compute(10, 0.5, 0.8, 0.1);
+        let score = PatternScore::compute(10, 0.5);
         assert_eq!(score.frequency, 10);
         assert!(score.overall > 0.0);
         assert!(score.overall <= 1.0);

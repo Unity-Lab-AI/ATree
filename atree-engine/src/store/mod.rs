@@ -852,9 +852,13 @@ impl GraphStore {
     }
 
     /// Find strongly connected components in the call graph (actual cycles with members).
-    /// Returns each SCC as a list of participating symbol IDs.
-    pub fn detect_call_sccs(&self) -> rusqlite::Result<Vec<Vec<i64>>> {
-        // Find all edges that participate in cycles
+    /// Find pairwise cycles in the call graph: pairs (a, b) where a→b and b→a
+    /// can be reached within depth 32 via CALLS edges.
+    ///
+    /// NOTE: This detects only 2-node cycles. Larger SCCs (e.g., a→b→c→a)
+    /// require Tarjan's algorithm, which is not implemented here.
+    pub fn detect_pairwise_cycles(&self) -> rusqlite::Result<Vec<Vec<i64>>> {
+        // Find cycle-participating pairs via recursive CTE
         let cycle_edges: Vec<(i64, i64)> = {
             let mut stmt = self.conn.prepare(
                 "WITH RECURSIVE call_chain(src_id, dst_id, depth) AS (
@@ -868,7 +872,7 @@ impl GraphStore {
                      WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id AND cc.depth < 32
                  )
                  SELECT DISTINCT LEAST(src_id, dst_id), GREATEST(src_id, dst_id)
-                 FROM call_chain WHERE src_id = dst_id AND src_id != dst_id"
+                 FROM call_chain WHERE src_id = dst_id"
             )?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?

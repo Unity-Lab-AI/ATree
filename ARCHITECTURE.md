@@ -9,7 +9,7 @@ ATree is a dual-product system: a filesystem scanner with A* pathfinding, and a 
 ```
 ATree (workspace)
 ├── atree-engine     — Core library: scanner, semantic engine, evidence system, SQLite store
-├── atree-cli        — CLI binary: 40+ query subcommands, evidence commands, MCP server mode
+├── atree-cli        — CLI binary: 60+ query subcommands, evidence commands, MCP server mode
 └── atree-web        — Web UI server: graph visualization, real-time SSE events
 ```
 
@@ -191,7 +191,7 @@ evidence/
 ### MCP Tools (Evidence / Patterns / Constraints)
 - `evidence_search` — FTS5 full-text search over evidence content (raw, normalized, file, kind, tags). Returns relevance-ranked results.
 - `pattern_mine` — Mine recurring evidence motifs (2-gram co-occurrence). Returns patterns ranked by frequency × dispersion × stability.
-- `constraint_check` — Synthesize constraints from evidence contradictions + stable patterns. Returns active constraints with confidence scores.
+- `constraint_check` — Synthesize RequiredProperty constraints from pattern motifs. ForbiddenTransition and ArchitecturalRule synthesis not yet implemented.
 
 ### FTS5 Evidence Index
 - Virtual table `evidence_fts` mirrors committed evidence fields (id, kind, raw, normalized, file, language, target_ref, tags).

@@ -826,16 +826,21 @@ impl ATreeMcpServer {
         if cycles.is_empty() {
             Ok("No call graph cycles detected.".to_string())
         } else {
-            let sccs = store.detect_call_sccs().unwrap_or_default();
-            let mut out = format!("{} cycle(s) detected in call graph:\n\n", cycles.len());
-            if !sccs.is_empty() {
-                for (i, scc) in sccs.iter().enumerate() {
-                    let names: Vec<String> = scc.iter()
+            let pairs = store.detect_pairwise_cycles().unwrap_or_default();
+            let mut out = format!(
+                "{} cycle(s) detected in call graph.\n\
+                 Note: detects cycles where a call path loops back to the original symbol.\n\
+                 Full SCC decomposition (Tarjan's algorithm) is not implemented.\n\n",
+                cycles.len()
+            );
+            if !pairs.is_empty() {
+                for (i, pair) in pairs.iter().enumerate() {
+                    let names: Vec<String> = pair.iter()
                         .map(|id| store.get_all_symbols().ok()
                             .and_then(|all| all.iter().find(|s| s.id == *id).map(|s| s.name.clone()))
                             .unwrap_or_else(|| format!("{}", id)))
                         .collect();
-                    out.push_str(&format!("  SCC {}: {}\n", i + 1, names.join(" → ")));
+                    out.push_str(&format!("  Pair {}: {} ↔ {}\n", i + 1, names[0], names.last().unwrap_or(&"?".to_string())));
                 }
             } else {
                 for (a, b) in &cycles {
@@ -984,13 +989,13 @@ impl ServerHandler for ATreeMcpServer {
             Self::tool("ownership_hotspots", "Find ownership hotspots — high fan-in/fan-out.", schema_for!(HotspotsInput)),
             Self::tool("error_path_trace", "Trace error paths from a symbol.", schema_for!(ErrorTraceInput)),
             Self::tool("resource_lifecycle_map", "Map resource lifecycle — allocation, usage, cleanup.", schema_for!(ResourceLifecycleInput)),
-            Self::tool("dependency_cycle_detector", "Detect dependency cycles in the call graph.", schema_for!(DepCyclesInput)),
+            Self::tool("dependency_cycle_detector", "Detect mutual call cycles (a→b→a) in the call graph via recursive CTE. Finds cycles where a call path loops back to the original symbol. Full SCC decomposition (Tarjan's algorithm) is not implemented.", schema_for!(DepCyclesInput)),
             Self::tool("find_uncovered_symbols", "Find symbols with no test coverage.", schema_for!(UncoveredInput)),
             Self::tool("resolution_stats", "Show resolution quality stats — call/import resolution rates per language, top unresolved patterns, and confidence distribution.", schema_for!(ResolutionStatsInput)),
             Self::tool("evidence_path", "Find evidence paths for a query using A* + beam search over the layered code graph. Returns token-bounded, confidence-ranked evidence paths.", schema_for!(EvidencePathInput)),
             Self::tool("evidence_search", "Full-text search over committed evidence. Searches raw content, normalized text, file paths, kinds, and tags using FTS5. Returns matching evidence with confidence scores and relevance ranks. Use for: 'find all function calls related to X', 'show evidence in file Y', 'high-confidence type relations'.", schema_for!(EvidenceSearchInput)),
-            Self::tool("pattern_mine", "Mine recurring patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion × stability. Returns patterns with evidence IDs and composite scores. Use for: 'what call patterns are common', 'show architectural motifs', 'find recurring import-declaration-call chains'.", schema_for!(PatternMineInput)),
-            Self::tool("constraint_check", "Synthesize and check constraints from evidence patterns. Detects forbidden transitions (evidence contradictions), required properties (stable pattern components), and architectural violations. Returns active constraints with confidence and violation counts. Use for: 'what rules emerge from the codebase', 'check if symbol X violates constraints', 'show architectural invariants'.", schema_for!(ConstraintCheckInput)),
+            Self::tool("pattern_mine", "Mine recurring 2-gram evidence patterns from the evidence graph. Extracts motifs (co-occurring evidence kinds) ranked by frequency × dispersion. Stability and entropy are not computed (no temporal analysis).", schema_for!(PatternMineInput)),
+            Self::tool("constraint_check", "Synthesize pattern-derived constraints (RequiredProperty motifs) from evidence. ForbiddenTransition, ArchitecturalRule, and AccessControl synthesis are not yet implemented.", schema_for!(ConstraintCheckInput)),
             Self::tool("graph_focus", "Shift the visual graph focus to specific nodes in real-time. Triggers a smooth camera animation on the ATree web UI and highlights the target nodes. Use after query/context/impact to show the agent what it found visually.", schema_for!(GraphFocusInput)),
             Self::tool("data_flow_trace", "Trace data flow for a symbol — where values come from and where they go. Tracks assignments, parameter passing, returns, and property access. Returns a chain of (symbol_id, flow_kind, depth) showing value propagation.", schema_for!(DataFlowInput)),
             Self::tool("shape_check", "Check response shapes for API routes — detect mismatches between what a route returns and what consumers expect.", schema_for!(ShapeCheckInput)),
@@ -1501,8 +1506,8 @@ impl ATreeMcpServer {
                     let mut out = format!("Evidence Search Results ({} matches):\n\n", results.len());
                     for rec in results {
                         out.push_str(&format!(
-                            "[{:.2}] {} {} @ {} (lang={})\n",
-                            rec.rank, rec.kind, rec.target_ref, rec.file, rec.language
+                            "[{:.2}] {} {} @ {} (lang={}, conf={:.2})\n",
+                            rec.rank, rec.kind, rec.target_ref, rec.file, rec.language, rec.confidence
                         ));
                     }
                     out
@@ -1558,7 +1563,6 @@ impl ATreeMcpServer {
                             "score": {
                                 "frequency": p.score.frequency,
                                 "dispersion": p.score.dispersion,
-                                "stability": p.score.stability,
                                 "overall": p.score.overall,
                             },
                             "evidence_count": p.evidence_ids.len(),
@@ -1611,6 +1615,11 @@ impl ATreeMcpServer {
                     "evidence_units": evidence.len(),
                     "patterns_mined": patterns.len(),
                     "violations": violations.len(),
+                    "implementation_notes": {
+                        "kinds_synthesized": ["RequiredProperty"],
+                        "kinds_not_implemented": ["ForbiddenTransition", "ArchitecturalRule", "AccessControl"],
+                        "note": "ForbiddenTransition requires contradiction edge population during indexing, which is not yet wired. ArchitecturalRule synthesis requires explicit boundary declarations."
+                    }
                 }).to_string()
             }
             unknown => {

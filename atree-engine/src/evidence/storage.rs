@@ -318,10 +318,11 @@ impl<'a> EvidenceStore<'a> {
     /// a separate lookup by file + kind + raw from the evidence table.
     pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<EvidenceFtsResult>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kind, raw, normalized, file, language, target_ref, tags, rank
-             FROM evidence_fts
-             WHERE evidence_fts MATCH ?1
-             ORDER BY rank
+            "SELECT f.kind, f.raw, f.normalized, f.file, f.language, f.target_ref, f.tags, f.rank, e.confidence
+             FROM evidence_fts f
+             JOIN evidence e ON e.id = f.id
+             WHERE f.evidence_fts MATCH ?1
+             ORDER BY f.rank
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(params![query, limit as i64], |row| {
@@ -334,6 +335,7 @@ impl<'a> EvidenceStore<'a> {
                 target_ref: row.get(5)?,
                 tags: row.get(6)?,
                 rank: row.get(7)?,
+                confidence: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -388,6 +390,7 @@ pub struct EvidenceFtsResult {
     pub target_ref: String,
     pub tags: String,
     pub rank: f64,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,10 +1,10 @@
-//! Community Detection — Leiden algorithm on the code graph.
+//! Community Detection — Label Propagation (LPA) on the code graph.
 //!
 //! Detects functional areas (communities) in the codebase based on
 //! CALLS/ACCESSES edge density. Communities represent groups of symbols
 //! that work together frequently.
 //!
-//! Ported from GitNexus's community-processor.ts which uses the Leiden
+//! Ported from GitNexus's community-processor.ts which uses the original
 //! algorithm via graphology. Here we implement a simplified but effective
 //! label-propagation approach that works directly on the SQLite graph store,
 //! avoiding the need for an in-memory graph library.

@@ -62,7 +62,7 @@ impl Default for ProcessConfig {
         Self {
             max_trace_depth: 10,
             max_branching: 4,
-            max_processes: 75,
+            max_processes: 300,
             min_steps: 3,
         }
     }

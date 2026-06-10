@@ -395,13 +395,12 @@ impl PipelinePhase for CrossFilePhase {
                     }
                     for pat in &patterns {
                         let _ = store.conn().execute(
-                            "INSERT OR REPLACE INTO patterns (id, name, description, motif, frequency, dispersion, stability, entropy, overall_score) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            "INSERT OR REPLACE INTO patterns (id, name, description, motif, frequency, dispersion, overall_score) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                             rusqlite::params![
                                 &pat.id, &pat.name, &pat.description,
                                 &format!("{:?}", pat.motif),
                                 pat.score.frequency as i64,
-                                pat.score.dispersion, pat.score.stability,
-                                pat.score.entropy, pat.score.overall,
+                                pat.score.dispersion, pat.score.overall,
                             ],
                         );
                     }

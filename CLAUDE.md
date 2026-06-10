@@ -26,23 +26,23 @@ This project is indexed by ATree's own semantic engine (3,248 symbols, 11,662 ed
 | `impact` | Blast radius: multi-depth caller/callee traversal, risk scoring (LOW/MEDIUM/HIGH/CRITICAL). |
 | `data_flow_trace` | Value propagation: assignments, param_pass, property access. Forward or backward. |
 | `dead_code_candidates` | Unreachable symbols with no callers or imports. |
-| `dependency_cycle_detector` | Call graph cycles via recursive CTE + SCC detection. |
+| `dependency_cycle_detector` | Mutual call cycles via recursive CTE (pairwise, not full SCC). |
 | `evidence_path` | A* evidence paths showing how code connects. |
 | `evidence_search` | FTS5 full-text search over committed evidence. |
 | `explain_symbol` | Full symbol explanation with all edge types and evidence paths. |
 | `trace_call_path` | A* pathfinding between two symbols. |
 | `shape_check` | API route response shape validation. |
 | `pattern_mine` | Recurring evidence motifs ranked by frequency × dispersion × stability. |
-| `constraint_check` | Architectural constraints synthesized from evidence patterns. |
+| `constraint_check` | Pattern-derived constraints (RequiredProperty motifs). Architectural rules and access-control enforcement are not yet implemented. |
 
 ## Performance Characteristics
 
 - **Scalability**: Handles 25K+ file repos (tested with Conflux: 125K calls, 81.8% resolution, 0 missed)
 - **Incremental scanning**: 0.25s for 2,692-file repo (930x faster than cold scan)
-- **Call resolution**: 100% of resolvable calls resolved via lexical scope-chain walk (O(1) per step)
+- **Call resolution**: 81.8% of call sites resolved on Conflux (2,692 files); lexical scope-chain walk with O(1) per-scope lookup
 - **Heritage/MRO**: Tracks inheritance with parent resolution (81% for projects with internal trait hierarchies)
 - **Process detection**: Entry points from API routes + exports + event handlers + callees
 - **Data flow analysis**: Tracks assignments, parameter passing, property access, returns
-- **Cycle detection**: Recursive CTE + SCC detection for call graph cycles
-- **Community detection**: Leiden algorithm for functional area clustering
+- **Cycle detection**: Recursive CTE cycle detection (pairwise mutual calls)
+- **Community detection**: Label Propagation (LPA) for functional area clustering
 - **FTS5 search**: Auto-indexed evidence for full-text search

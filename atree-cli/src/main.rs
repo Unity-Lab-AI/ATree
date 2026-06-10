@@ -4208,7 +4208,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 .map(|r| atree_engine::pipeline::phases::record_to_evidence(r.clone()))
                 .collect();
             let config = atree_engine::patterns::PatternMiningConfig {
-                min_frequency: *min_frequency, min_dispersion: 0.1, min_stability: 0.5,
+                min_frequency: *min_frequency, min_dispersion: 0.1,
             };
             let patterns = atree_engine::patterns::mine_patterns(&evidence, &config);
             let patterns: Vec<_> = patterns.into_iter().take(*max_patterns).collect();
@@ -4219,7 +4219,7 @@ fn execute_query(cmd: &QueryCommand, args: &Args, _scan: Option<&atree_engine::S
                 for p in &patterns {
                     println!("  [{}] {} — score={:.3}", p.id, p.name, p.score.overall);
                     println!("    {}", p.description);
-                    println!("    freq={}, disp={:.2}, stab={:.2}", p.score.frequency, p.score.dispersion, p.score.stability);
+                    println!("    freq={}, disp={:.2}", p.score.frequency, p.score.dispersion);
                 }
             }
         }

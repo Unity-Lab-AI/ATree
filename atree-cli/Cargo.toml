@@ -1,6 +1,6 @@
 [package]
 name = "atree"
-description = "CLI for the ATree semantic code intelligence engine. Fast parallel filesystem scan, multi-language symbol extraction, scope-aware resolution, git history analysis, and 55+ query subcommands."
+description = "CLI for the ATree semantic code intelligence engine. Fast parallel filesystem scan, multi-language symbol extraction, scope-aware resolution, git history analysis, and 60+ query subcommands."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
