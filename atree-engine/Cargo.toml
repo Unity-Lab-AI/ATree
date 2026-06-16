@@ -1,0 +1,62 @@
+[package]
+name = "atree-engine"
+description = "Semantic code intelligence engine: tree-sitter symbol extraction, scope resolution, git history analysis, A* evidence paths, and SQLite persistence. Use as a library in your own tools."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "../README.md"
+
+[dependencies]
+mimalloc.workspace = true
+rustc-hash.workspace = true
+crossbeam-deque.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+tree-sitter.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-php.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-kotlin.workspace = true
+tree-sitter-language.workspace = true
+streaming-iterator.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-yaml.workspace = true
+tree-sitter-dart.workspace = true
+tree-sitter-vue.workspace = true
+# tree-sitter-cobol.workspace = true  # disabled: broken lib target
+regex.workspace = true
+git2 = { workspace = true, optional = true }
+thiserror.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tracing.workspace = true
+
+# MCP server support (optional — only needed for AI agent integration)
+rmcp = { version = "1.7.0", features = ["server"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+schemars = { version = "1.0", optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+
+# Embeddings support (optional — requires ONNX runtime)
+fastembed = { version = "4.6.0", optional = true }
+
+[features]
+default = ["git"]
+perf = []
+git = ["dep:git2"]
+mcp = ["dep:rmcp", "dep:tokio", "dep:schemars", "dep:reqwest"]
+embeddings = ["dep:fastembed"]

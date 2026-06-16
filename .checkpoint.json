@@ -1,0 +1,50 @@
+{
+  "phase": "workspace-split-and-git-history",
+  "structure": {
+    "atree-engine": "Library crate — code intelligence engine",
+    "atree-cli": "Binary crate — CLI tool",
+    "workspace": "Cargo workspace with shared dependencies"
+  },
+  "features": {
+    "git_history": "Commits, file_commits, authors, co-change, blame (on-demand)",
+    "integrated_queries": "symbol-ownership, change-risk, find-experts, smart-co-change",
+    "workspace_split": "atree-engine (lib) + atree-cli (bin)",
+    "feature_flags": "git (default), embeddings, mcp, perf"
+  },
+  "benchmarks": {
+    "qwen-code": {
+      "files": 2555,
+      "symbols": 78763,
+      "calls": 241904,
+      "commits": 521,
+      "authors": 58,
+      "cold_scan_ms": 32000,
+      "gitnexus_s": 480,
+      "speedup": "~15x"
+    },
+    "anthropic-cookbook": {
+      "files": 158,
+      "symbols": 2719,
+      "calls": 4390,
+      "commits": 576,
+      "authors": 98,
+      "cold_scan_ms": 1600,
+      "gitnexus_s": 21.8,
+      "speedup": "~13x"
+    }
+  },
+  "stats": {
+    "tests_passing": 215,
+    "tests_failing": 0,
+    "cli_commands": 55,
+    "mcp_tools": 48
+  },
+  "authors": [
+    "UnityAILab <contact@unityailab.com>",
+    "Sponge <sponge@unityailab.com>",
+    "Alfreddo",
+    "Gee",
+    "Red",
+    "B-A-M-N"
+  ]
+}
