@@ -7,20 +7,21 @@
 //! ## Scoring Model ( minimum viable )
 //!
 //! ```text
-//! pattern_score = frequency × dispersion × stability × (1 - entropy)
+//! pattern_score = frequency_norm × dispersion
 //!
 //! where:
-//!   frequency:   how many times this motif appears
-//!   dispersion:  across how many files/modules (higher = more general)
-//!   stability:   how consistent the motif is across observations
-//!   entropy:     informational noise (lower = more precise pattern)
+//!   frequency_norm: min(frequency, 100) / 100  (capped and normalized to [0,1])
+//!   dispersion:     fraction of files containing the pattern (higher = more general)
 //! ```
+//!
+//! stability and entropy are reserved fields (temporal analysis not yet
+//! implemented) and are not included in score computation.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! EvidenceGraph → mine_patterns() → Pattern[]
-//!   → pattern.score = f(frequency, dispersion, stability, entropy)
+//!   → pattern.score = f(frequency, dispersion)
 //!   → PatternStore (SQLite)
 //! ```
 

@@ -13,6 +13,11 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+
+/// Maximum recursion depth for call-graph CTEs.
+/// SQLite's default expression depth limit is 1000; mutual recursion in real
+/// codebases is typically <10 levels. 20 is a safe practical cap.
+pub const MAX_CTE_DEPTH: i64 = 20;
 use serde::{Serialize, Deserialize};
 
 /// Maximum time to wait for the advisory file lock (seconds).
@@ -869,12 +874,12 @@ impl GraphStore {
                      SELECT cc.src_id, e.dst_id, cc.depth + 1
                      FROM call_chain cc
                      JOIN edges e ON e.src_id = cc.dst_id
-                     WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id AND cc.depth < 32
+                     WHERE e.edge_kind = 'CALLS' AND e.src_id != e.dst_id AND cc.depth < ?1
                  )
                  SELECT DISTINCT LEAST(src_id, dst_id), GREATEST(src_id, dst_id)
                  FROM call_chain WHERE src_id = dst_id"
             )?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let rows = stmt.query_map([MAX_CTE_DEPTH], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         // For simplicity, return pairs — full Tarjan's would need application-level algo

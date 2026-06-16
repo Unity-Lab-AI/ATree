@@ -821,7 +821,7 @@ impl ATreeMcpServer {
     /// Handle `dependency_cycle_detector` tool — in-process call graph cycle detection.
     fn handle_dependency_cycles(&self) -> Result<String, ErrorData> {
         let store = self.open_store()?;
-        let cycles = store.detect_call_cycles(32)
+        let cycles = store.detect_call_cycles(crate::store::MAX_CTE_DEPTH)
             .map_err(|e| ErrorData::internal_error(format!("Cycle detection failed: {}", e), None))?;
         if cycles.is_empty() {
             Ok("No call graph cycles detected.".to_string())
